@@ -22,11 +22,12 @@ ai_agent_DevOps/
 │   ├── main.py            # Точка входа FastAPI-приложения
 │   ├── config.py          # Загрузка конфигурации из .env
 │   ├── agent/
-│   │   ├── orchestrator.py  # Оркестрация шагов диагностики (заглушка)
+│   │   ├── orchestrator.py  # Оркестрация шагов диагностики (K8s -> контекст -> LLM -> RCA)
+│   │   ├── llm_client.py    # Реальный LLM-клиент (Qwen / OpenAI-совместимый API, ретраи tenacity)
 │   │   └── tools/
-│   │       ├── k8s_tools.py         # Инструменты Kubernetes (заглушка)
-│   │       ├── prometheus_tools.py  # Инструменты Prometheus (заглушка)
-│   │       └── logs_tools.py        # Инструменты логов (заглушка)
+│   │       ├── k8s_tools.py         # Инструменты Kubernetes
+│   │       ├── prometheus_tools.py  # Инструменты Prometheus
+│   │       └── logs_tools.py        # Инструменты логов
 │   └── utils/
 │       └── logger.py      # Базовое логирование
 └── tests/
