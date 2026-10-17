@@ -1,0 +1,35 @@
+# Репозиторий и история Git
+.git
+.gitignore
+
+# Python-мусор
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Виртуальные окружения
+.venv/
+venv/
+env/
+
+# Секреты — НЕ включать в образ (пробрасываются через --env-file / compose)
+.env
+.env.*
+!.env.example
+
+# Тесты и документация не нужны в runtime-образе
+tests/
+Dockerfile
+docker-compose.yml
+.dockerignore
+
+# IDE / ОС / логи
+.idea/
+.vscode/
+*.swp
+.DS_Store
+*.log
+logs/

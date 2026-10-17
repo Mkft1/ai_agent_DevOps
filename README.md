@@ -30,10 +30,15 @@ ai_agent_DevOps/
 │   │       └── logs_tools.py        # Инструменты логов
 │   └── utils/
 │       └── logger.py      # Базовое логирование
-└── tests/
+├── tests/
+├── Dockerfile             # многоступенчатый образ (builder + runtime, non-root)
+├── docker-compose.yml     # локальный запуск сервиса agent (порт 8000)
+└── .dockerignore          # .git/.env/tests/.venv/__pycache__ не попадают в образ
 ```
 
-## Быстрый старт
+## Запуск
+
+### Локально (без Docker)
 
 ```bash
 python -m venv .venv && source .venv/bin/activate
@@ -42,12 +47,50 @@ cp .env.example .env   # заполните переменные окружен�
 uvicorn src.main:app --reload
 ```
 
+### В Docker
+
+Сборка и запуск одним контейнером (секреты подгружаются только в рантайме, `.dockerignore` не пускает `.env` в образ):
+
+```bash
+cp .env.example .env                      # заполните QWEN_API_KEY / OPENAI_API_KEY и др.
+docker build -t ai-agent-devops .         # многоступенчатая сборка: builder + runtime
+docker run -d --name ai-agent \
+  -p 8000:8000 \
+  --env-file .env \
+  -v ~/.kube/config:/home/appuser/.kube/config:ro \
+  ai-agent-devops
+```
+
+### docker-compose (рекомендуемый локальный вариант)
+
+Поднимает сервис `agent` на порту 8000, подгружает `.env` и монтирует kubeconfig только для чтения:
+
+```bash
+docker compose up --build -d
+docker compose logs -f agent              # логи сервиса
+docker compose down                       # остановка
+```
+
 Проверка работоспособности:
 
 ```bash
 curl http://localhost:8000/health
 # {"status":"ok"}
 ```
+
+## Переменные окружения
+
+Все настройки читаются из `.env` (см. `.env.example`) через pydantic-settings. Ключи API храните только в `.env` — в репозиторий и в Docker-образ они не попадают.
+
+| Переменная        | По умолчанию                                   | Описание                                                        |
+|-------------------|------------------------------------------------|-----------------------------------------------------------------|
+| `KUBECONFIG_PATH` | `~/.kube/config`                               | Путь к kubeconfig для доступа к кластеру Kubernetes             |
+| `PROMETHEUS_URL`  | `http://localhost:9090`                        | Базовый URL Prometheus для запроса метрик                       |
+| `LOG_LEVEL`       | `INFO`                                         | Уровень логирования: DEBUG / INFO / WARNING / ERROR / CRITICAL  |
+| `OPENAI_API_KEY`  | —                                              | Ключ OpenAI (если используете OpenAI-совместимый API)           |
+| `QWEN_API_KEY`    | —                                              | Ключ Qwen/DashScope (приоритетнее `OPENAI_API_KEY`)             |
+| `LLM_BASE_URL`    | `https://dashscope.aliyuncs.com/compatible-mode` | Base URL LLM-API (OpenAI-совместимый: Qwen, vLLM, Ollama...)  |
+| `LLM_MODEL`       | `qwen-max`                                     | Имя модели LLM                                                  |
 
 ## API
 
