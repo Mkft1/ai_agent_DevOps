@@ -49,4 +49,30 @@ curl http://localhost:8000/health
 # {"status":"ok"}
 ```
 
-> Текущая версия — каркас проекта без бизнес-логики агента.
+## API
+
+| Метод | Путь        | Описание                                                        |
+|-------|-------------|-----------------------------------------------------------------|
+| GET   | `/health`   | Живость сервиса → `{"status": "ok"}`                            |
+| GET   | `/ready`    | Проверка доступности K8s API и Prometheus → 200 / 503           |
+| POST  | `/diagnose` | Приём инцидента и запуск диагностики через оркестратор          |
+
+Пример запроса:
+
+```bash
+curl -X POST http://localhost:8000/diagnose \
+  -H 'Content-Type: application/json' \
+  -d '{"namespace": "prod", "pod_name": "web-1", "description": "Pod restarts alert"}'
+# -> {"diagnosis": {root_cause, evidence, suggested_fix, severity, ...}, "report": "..."}
+```
+
+Swagger UI доступен на `/docs`. CORS открыт для всех origins (dev-режим).
+
+## Тесты
+
+```bash
+python -m pytest tests/ -v
+```
+
+> Текущая версия: каркас + инструменты K8s/Prometheus/логов + оркестратор с реальным
+> LLM-клиентом (Qwen/OpenAI-совместимый API) + HTTP-API.
