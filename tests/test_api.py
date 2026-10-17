@@ -18,7 +18,6 @@ from src.agent.orchestrator import (
 )
 from src.main import app, get_orchestrator
 
-
 SAMPLE_DIAGNOSIS = {
     "root_cause": "Pod OOMKilled: лимит памяти 128Mi недостаточен",
     "evidence": ["restarts=5", "memory_bytes ~ 130_000_000"],
