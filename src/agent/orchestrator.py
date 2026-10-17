@@ -19,9 +19,18 @@ from src.agent.llm_client import LLMClient
 from src.agent.tools.k8s_tools import K8sTools
 from src.agent.tools.logs_tools import LogsTools
 from src.agent.tools.prometheus_tools import PrometheusTools
+from src.config import Settings, get_settings
 from src.utils.logger import get_logger
 
 logger = get_logger(__name__)
+
+
+class NamespaceNotAllowedError(ValueError):
+    """Guardrail: namespace не входит в ALLOWED_NAMESPACES — диагностика запрещена."""
+
+
+# Количество строк лога по умолчанию (ограничивается MAX_LOG_LINES из конфига).
+DEFAULT_TAIL_LINES = 50
 
 # Системный промт senior SRE (по ТЗ).
 SYSTEM_PROMPT = (
@@ -136,6 +145,7 @@ class IncidentOrchestrator:
         prometheus_tools: PrometheusTools | None = None,
         logs_tools: LogsTools | None = None,
         llm_client: LLMClientProtocol | None = None,
+        settings: Settings | None = None,
     ) -> None:
         """Создать оркестратор.
 
@@ -147,6 +157,8 @@ class IncidentOrchestrator:
                 :class:`~src.agent.llm_client.LLMClient` (Qwen/OpenAI-совместимый
                 API из ``.env``). В тестах/оффлайне передавайте
                 :class:`LLMClientStub`.
+            settings: настройки приложения (guardrails); по умолчанию —
+                :func:`~src.config.get_settings` из ``.env``.
         """
         self.k8s = k8s_tools if k8s_tools is not None else K8sTools()
         self.prometheus = (
@@ -154,6 +166,45 @@ class IncidentOrchestrator:
         )
         self.logs = logs_tools if logs_tools is not None else LogsTools()
         self.llm = llm_client if llm_client is not None else LLMClient()
+        self.settings = settings if settings is not None else get_settings()
+
+    # ------------------------------------------------------------------
+    # Guardrails
+    # ------------------------------------------------------------------
+    def _check_namespace(self, namespace: str) -> None:
+        """Guardrail: разрешён ли namespace (ALLOWED_NAMESPACES из конфига).
+
+        Args:
+            namespace: запрашиваемый namespace инцидента.
+
+        Raises:
+            NamespaceNotAllowedError: если namespace не в списке разрешённых.
+        """
+        allowed = list(self.settings.allowed_namespaces or [])
+        if "*" in allowed:  # явный wildcard для отладки: разрешить всё
+            return
+        if namespace not in allowed:
+            logger.warning(
+                "Guardrail: namespace %r not in ALLOWED_NAMESPACES=%s",
+                namespace,
+                allowed,
+            )
+            raise NamespaceNotAllowedError(
+                f"Namespace '{namespace}' not allowed. "
+                f"Allowed namespaces: {allowed}"
+            )
+
+    def _clamp_tail_lines(self, tail_lines: int = DEFAULT_TAIL_LINES) -> int:
+        """Ограничить requested tail_lines значением MAX_LOG_LINES из конфига."""
+        max_lines = max(int(self.settings.max_log_lines), 1)
+        clamped = min(max(int(tail_lines), 1), max_lines)
+        if clamped != tail_lines:
+            logger.debug(
+                "Guardrail: tail_lines %s limited to MAX_LOG_LINES=%d",
+                tail_lines,
+                max_lines,
+            )
+        return clamped
 
     # ------------------------------------------------------------------
     # Основной цикл диагностики
@@ -178,10 +229,15 @@ class IncidentOrchestrator:
         if isinstance(incident, dict):
             incident = Incident.model_validate(incident)
 
+        # Guardrail 0: разрешённый namespace — до любых запросов к кластеру.
+        self._check_namespace(incident.namespace)
+
         warnings: list[str] = []
         context: dict[str, Any] = {
             "incident": incident.model_dump(),
         }
+        if not self.settings.enable_write_actions:
+            context["mode"] = "read-only"
 
         # a. Список подов в namespace.
         try:
@@ -254,15 +310,16 @@ class IncidentOrchestrator:
             if mem is None:
                 warnings.append(f"Memory-метрики по поду {target_pod} недоступны")
 
-            # d. Логи пода (tail 50 строк).
+            # d. Логи пода (tail, ограничен MAX_LOG_LINES из конфига).
+            tail_lines = self._clamp_tail_lines(DEFAULT_TAIL_LINES)
             try:
                 log_text = self.logs.get_pod_logs(
-                    namespace=incident.namespace, pod_name=target_pod, tail_lines=50
+                    namespace=incident.namespace, pod_name=target_pod, tail_lines=tail_lines
                 )
             except Exception as exc:
                 logger.error("get_pod_logs failed: %s", exc)
                 log_text = ""
-            context["pod_logs_tail_50"] = log_text
+            context["pod_logs_tail"] = log_text
             if not log_text:
                 warnings.append(f"Логи пода {target_pod} не получены")
         else:

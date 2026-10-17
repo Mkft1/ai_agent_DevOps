@@ -11,7 +11,11 @@ from unittest.mock import MagicMock, patch
 import pytest
 from fastapi.testclient import TestClient
 
-from src.agent.orchestrator import Diagnosis, IncidentOrchestrator
+from src.agent.orchestrator import (
+    Diagnosis,
+    IncidentOrchestrator,
+    NamespaceNotAllowedError,
+)
 from src.main import app, get_orchestrator
 
 
@@ -163,3 +167,24 @@ class TestCORSAndHandlers:
             resp = client.get("/health")
         assert resp.status_code == 500
         assert resp.json() == {"detail": "boom"}
+
+
+class TestGuardrailsAPI:
+    """Guardrail на HTTP-слое: запрещённый namespace -> 403 без вызова инструментов."""
+
+    def test_diagnose_disallowed_namespace_returns_403(self, client):
+        orch = MagicMock(spec=IncidentOrchestrator)
+        orch.diagnose.side_effect = NamespaceNotAllowedError(
+            "Namespace 'kube-system' not allowed."
+        )
+        app.dependency_overrides[get_orchestrator] = lambda: orch
+        try:
+            resp = client.post(
+                "/diagnose",
+                json={"namespace": "kube-system", "description": "d"},
+            )
+        finally:
+            app.dependency_overrides.pop(get_orchestrator, None)
+        assert resp.status_code == 403
+        assert "not allowed" in resp.json()["detail"]
+        orch.format_report.assert_not_called()

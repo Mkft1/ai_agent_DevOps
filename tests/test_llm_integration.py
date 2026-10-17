@@ -21,6 +21,7 @@ import pytest
 import requests
 
 from src.agent.llm_client import LLMClient, LLMError
+from src.config import Settings
 from src.agent.orchestrator import (
     SYSTEM_PROMPT,
     Diagnosis,
@@ -75,7 +76,12 @@ def make_orchestrator(llm: LLMClient) -> IncidentOrchestrator:
     logs_tools = MagicMock()
     logs_tools.get_pod_logs.return_value = "ERROR oom killed"
     return IncidentOrchestrator(
-        k8s_tools=k8s, prometheus_tools=prom, logs_tools=logs_tools, llm_client=llm
+        k8s_tools=k8s,
+        prometheus_tools=prom,
+        logs_tools=logs_tools,
+        llm_client=llm,
+        # Guardrails: в тестах разрешаем namespace, используемый в фикстурах.
+        settings=Settings(allowed_namespaces=["default", "prod"], _env_file=None),
     )
 
 
