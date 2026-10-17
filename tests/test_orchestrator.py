@@ -1,8 +1,8 @@
 """Unit-тесты IncidentOrchestrator: все инструменты и LLM под моками."""
 
-import pytest
 from unittest.mock import MagicMock
 
+import pytest
 
 from src.agent.orchestrator import (
     SYSTEM_PROMPT,

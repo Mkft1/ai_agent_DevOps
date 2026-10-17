@@ -1,0 +1,20 @@
+# Ruff configuration — pragmatic rules for a read-only diagnostic agent.
+# Run locally:  ruff check src tests scripts
+
+[project]
+name = "ai-agent-devops"
+requires-python = ">=3.12"
+
+[tool.ruff]
+target-version = "py312"
+line-length = 100
+extend-exclude = [".venv", "__pycache__", ".pytest_cache"]
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F", "I"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["src"]
+
+[tool.ruff.format]
+quote-style = "double"
