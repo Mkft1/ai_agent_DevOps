@@ -1,5 +1,6 @@
 """Unit-тесты IncidentOrchestrator: все инструменты и LLM под моками."""
 
+import pytest
 from unittest.mock import MagicMock
 
 
@@ -9,6 +10,13 @@ from src.agent.orchestrator import (
     Incident,
     IncidentOrchestrator,
     LLMClientStub,
+    NamespaceNotAllowedError,
+)
+from src.config import Settings
+
+# Тестовые настройки: разрешаем namespace'ы default/prod/monitoring (как в fixture).
+TEST_SETTINGS = Settings(
+    allowed_namespaces=["default", "prod", "monitoring"], _env_file=None
 )
 
 LLM_ANSWER = (
@@ -26,6 +34,7 @@ def make_orchestrator(
     mem=134_217_728,
     logs="2026-10-17 ERROR oom killed",
     llm_answer=LLM_ANSWER,
+    settings=TEST_SETTINGS,
 ):
     """Собрать оркестратор на моках вместо реальных клиентов."""
     k8s = MagicMock()
@@ -71,6 +80,7 @@ def make_orchestrator(
             prometheus_tools=prom,
             logs_tools=logs_tools,
             llm_client=llm,
+            settings=settings,
         ),
         k8s,
         prom,
@@ -121,7 +131,7 @@ class TestFullScenario:
             "cpu_cores": 0.25,
             "memory_bytes": 134_217_728,
         }
-        assert "oom killed" in context_arg["pod_logs_tail_50"]
+        assert "oom killed" in context_arg["pod_logs_tail"]
 
         # Сырые данные возвращены для отладки.
         assert result["raw_data"]["pods"][0]["name"] == "api-7d9f-x2kq"
@@ -294,3 +304,67 @@ class TestLLMClientStub:
         )
         assert isinstance(orch.llm, RealLLMClient)
         assert not isinstance(orch.llm, LLMClientStub)
+
+
+class TestGuardrails:
+    """Ограничения безопасности: ALLOWED_NAMESPACES, MAX_LOG_LINES, read-only."""
+
+    def test_disallowed_namespace_raises_before_any_calls(self):
+        """Namespace вне ALLOWED_NAMESPACES — ошибка, запросы не выполняются."""
+        orch, k8s, prom, logs_tools, llm = make_orchestrator()
+        with pytest.raises(NamespaceNotAllowedError, match="not allowed"):
+            orch.diagnose(
+                Incident(namespace="kube-system", pod_name="x", description="d")
+            )
+        # Ни один инструмент не был вызван.
+        k8s.get_pods.assert_not_called()
+        k8s.get_events.assert_not_called()
+        prom.get_pod_cpu_usage.assert_not_called()
+        logs_tools.get_pod_logs.assert_not_called()
+        llm.generate.assert_not_called()
+
+    def test_allowed_namespaces_come_from_settings(self):
+        """Список разрешённых namespace читается из конфига (не хардкод)."""
+        strict = Settings(allowed_namespaces=["only-me"], _env_file=None)
+        orch, *_ = make_orchestrator(settings=strict)
+        with pytest.raises(NamespaceNotAllowedError):
+            orch.diagnose(Incident(namespace="default", description="d"))
+        # В allow-списке — проходит.
+        result = orch.diagnose(Incident(namespace="only-me", description="d"))
+        assert "root_cause" in result
+
+    def test_tail_lines_clamped_to_max_log_lines(self):
+        """MAX_LOG_LINES ограничивает tail_lines логов (10 -> 5 при лимите 5)."""
+        limited = Settings(
+            allowed_namespaces=["default", "prod", "monitoring"],
+            max_log_lines=5,
+            _env_file=None,
+        )
+        orch, _, _, logs_tools, _ = make_orchestrator(settings=limited)
+        orch.diagnose(
+            Incident(
+                namespace="prod", pod_name="api-7d9f-x2kq", description="d"
+            )
+        )
+        kwargs = logs_tools.get_pod_logs.call_args.kwargs
+        assert kwargs["tail_lines"] == 5
+
+    def test_default_settings_limits(self):
+        """Дефолты конфига по ТЗ: default/200/False."""
+        s = Settings(_env_file=None)
+        assert s.allowed_namespaces == ["default"]
+        assert s.max_log_lines == 200
+        assert s.enable_write_actions is False
+
+    def test_read_only_mode_marked_in_context(self):
+        """При ENABLE_WRITE_ACTIONS=False контекст отмечает read-only режим."""
+        orch, _, _, _, llm = make_orchestrator()
+        orch.diagnose(Incident(namespace="default", description="d"))
+        context = llm.generate.call_args.kwargs["context"]
+        assert context["mode"] == "read-only"
+
+    def test_no_write_methods_on_orchestrator(self):
+        """Агент не имеет write-действий: нет delete/exec/apply методов."""
+        forbidden = ("delete", "exec", "apply", "patch", "scale", "restart")
+        methods = [m for m in dir(IncidentOrchestrator) if not m.startswith("__")]
+        assert not [m for m in methods if any(f in m.lower() for f in forbidden)]

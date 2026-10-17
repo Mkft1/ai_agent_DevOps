@@ -19,7 +19,12 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, ValidationError
 
-from src.agent.orchestrator import Diagnosis, Incident, IncidentOrchestrator
+from src.agent.orchestrator import (
+    Diagnosis,
+    Incident,
+    IncidentOrchestrator,
+    NamespaceNotAllowedError,
+)
 from src.config import Settings, get_settings
 from src.utils.logger import get_logger, setup_logging
 
@@ -183,6 +188,10 @@ def diagnose(
     incident = payload.to_incident()
     try:
         diagnosis_dict = orchestrator.diagnose(incident)
+    except NamespaceNotAllowedError as exc:
+        # Guardrail: запрещённый namespace — запрос не выполняется.
+        logger.warning("Guardrail rejected incident: %s", exc)
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
     except ValidationError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
     except Exception as exc:
