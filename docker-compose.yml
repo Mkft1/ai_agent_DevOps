@@ -1,0 +1,36 @@
+# Локальный запуск AI-агента диагностики инцидентов в Kubernetes.
+#
+# Использование:
+#   cp .env.example .env   # заполните ключи LLM и пути
+#   docker compose up --build
+#
+# Секреты (.env) монтируются/подгружаются только в рантайме и НЕ попадают в образ.
+
+services:
+  agent:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: ai-agent-devops:latest
+    container_name: ai-agent-devops
+    ports:
+      - "8000:8000"
+    env_file:
+      - .env                # KUBECONFIG_PATH, PROMETHEUS_URL, LOG_LEVEL, QWEN_API_KEY / OPENAI_API_KEY...
+    volumes:
+      # kubeconfig хоста (только для чтения) — нужен, если агент ходит в внешний кластер.
+      # Для in-cluster режима или при отсутствии файла закомментируйте строку ниже.
+      - ${KUBECONFIG:-~/.kube/config}:/home/appuser/.kube/config:ro
+    restart: unless-stopped
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import urllib.request as u; u.urlopen('http://127.0.0.1:8000/health', timeout=3).read()",
+        ]
+      interval: 30s
+      timeout: 5s
+      start_period: 10s
+      retries: 3

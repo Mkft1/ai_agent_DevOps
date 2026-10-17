@@ -31,6 +31,11 @@ class Settings(BaseSettings):
     llm_base_url: str = "https://dashscope.aliyuncs.com/compatible-mode"
     llm_model: str = "qwen-max"
 
+    @property
+    def llm_api_key(self) -> str | None:
+        """Ключ активного LLM-провайдера (Qwen приоритетнее, затем OpenAI)."""
+        return self.qwen_api_key or self.openai_api_key
+
 
 @lru_cache
 def get_settings() -> Settings:
