@@ -14,7 +14,7 @@ from src.agent.tools.k8s_tools import K8sTools
 @pytest.fixture
 def tools() -> K8sTools:
     """K8sTools без реального kubeconfig: конфиг и клиенты подменены моками."""
-    with patch("src.agent.tools.k8s_tools.kubernetes.config.load_kube_config") as load_cfg, \
+    with patch("src.agent.tools.k8s_tools.kubernetes.config.load_kube_config"), \
          patch("src.agent.tools.k8s_tools.kubernetes.client.CoreV1Api") as core_cls, \
          patch("src.agent.tools.k8s_tools.kubernetes.client.AppsV1Api") as apps_cls:
         instance = K8sTools(kubeconfig_path="/fake/kubeconfig")
