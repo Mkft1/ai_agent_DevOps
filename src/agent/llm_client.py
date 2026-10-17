@@ -72,7 +72,7 @@ class LLMClient:
         settings = get_settings()
         self.base_url = (base_url or settings.llm_base_url).rstrip("/")
         # Qwen предпочтительнее; fallback — OpenAI-совместимый ключ.
-        self.api_key = api_key or settings.qwen_api_key or settings.openai_api_key
+        self.api_key = api_key or settings.llm_api_key
         self.model = model or settings.llm_model
         self.timeout = timeout
         if not self.api_key:
