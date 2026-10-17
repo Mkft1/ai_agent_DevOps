@@ -2,18 +2,20 @@
 
 Инцидент -> сбор данных (K8s / Prometheus / логи) -> контекст -> LLM -> RCA.
 
-LLM-клиент на этом шаге — заглушка :class:`LLMClientStub`, чтобы не тратить
-токены; реальный API подключается заменой одного класса (тот же интерфейс
-``generate(prompt, context) -> str``).
+LLM: по умолчанию используется реальный клиент :class:`src.agent.llm_client.LLMClient`
+(Qwen / OpenAI-совместимый API, настройки из ``.env``). Для тестов и оффлайн-режима
+можно передать безтокенную заглушку :class:`LLMClientStub` — оба реализуют
+интерфейс ``generate(system_prompt=..., user_prompt=...) -> str``.
 """
 
 from __future__ import annotations
 
 import json
-from typing import Any, Protocol
+from typing import Any, Protocol, runtime_checkable
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ValidationError
 
+from src.agent.llm_client import LLMClient
 from src.agent.tools.k8s_tools import K8sTools
 from src.agent.tools.logs_tools import LogsTools
 from src.agent.tools.prometheus_tools import PrometheusTools
@@ -21,13 +23,16 @@ from src.utils.logger import get_logger
 
 logger = get_logger(__name__)
 
-# Системный промт SRE-эксперта (по ТЗ).
+# Системный промт senior SRE (по ТЗ).
 SYSTEM_PROMPT = (
-    "Ты — SRE-эксперт. Проанализируй данные и верни RCA в формате JSON: "
-    "{root_cause: str, evidence: list[str], suggested_fix: str, severity: str}"
+    "Ты — senior SRE. Тебе дан контекст инцидента в Kubernetes: метрики, логи, "
+    "события. Верни строго JSON без markdown-обёртки с полями: root_cause "
+    "(строка), evidence (массив строк), suggested_fix (строка), severity "
+    "(low/medium/high/critical). Если данных недостаточно, укажи это в "
+    "root_cause и поставь severity='unknown'."
 )
 
-SEVERITY_LEVELS = ("critical", "high", "medium", "low", "info")
+SEVERITY_LEVELS = ("critical", "high", "medium", "low", "info", "unknown")
 
 
 class Incident(BaseModel):
@@ -39,6 +44,19 @@ class Incident(BaseModel):
         default=None, description="Имя деплоймента (опционально)"
     )
     description: str = Field(default="", description="Текст алерта / описание")
+
+
+class DiagnosisPayload(BaseModel):
+    """Схема ответа LLM (валидируется до сборки итогового диагноза).
+
+    Поля соответствуют системному промту: root_cause / evidence /
+    suggested_fix / severity. Строгая проверка типов — через pydantic.
+    """
+
+    root_cause: str
+    evidence: list[str] = Field(default_factory=list)
+    suggested_fix: str = ""
+    severity: str = "unknown"
 
 
 class Diagnosis(BaseModel):
@@ -53,19 +71,26 @@ class Diagnosis(BaseModel):
     llm_response: str = ""
 
 
-class LLMClient(Protocol):
-    """Интерфейс LLM-клиента — позволяет подменить заглушку на реальный API."""
+@runtime_checkable
+class LLMClientProtocol(Protocol):
+    """Интерфейс LLM-клиента: заглушка и реальный API взаимозаменяемы."""
 
-    def generate(self, prompt: str, context: dict) -> str:  # pragma: no cover
+    def generate(
+        self,
+        prompt: str | None = None,
+        context: dict[str, Any] | None = None,
+        *,
+        system_prompt: str | None = None,
+        user_prompt: str | None = None,
+    ) -> str:  # pragma: no cover
         ...
 
 
 class LLMClientStub:
-    """Заглушка LLM: возвращает фиксированный JSON-ответ, токены не тратятся.
+    """Заглушка LLM: возвращает фиксированный JSON-ответ, токены не тратится.
 
-    Реализует интерфейс ``generate(prompt, context) -> str`` — на следующем
-    шаге достаточно написать класс с тем же методом (OpenAI/Qwen) и передать
-    его в ``IncidentOrchestrator(llm_client=...)``.
+    Используется в unit-тестах и оффлайн-режиме; интерфейс совпадает с
+    :class:`src.agent.llm_client.LLMClient`.
     """
 
     STUB_ANSWER = {
@@ -75,20 +100,29 @@ class LLMClientStub:
         "severity": "info",
     }
 
-    def generate(self, prompt: str, context: dict) -> str:
+    def generate(
+        self,
+        prompt: str | None = None,
+        context: dict[str, Any] | None = None,
+        *,
+        system_prompt: str | None = None,
+        user_prompt: str | None = None,
+    ) -> str:
         """Вернуть фиксированный JSON-ответ (эмулирует ответ LLM).
 
         Args:
-            prompt: пользовательский промт с контекстом диагностики.
+            prompt: единый промт (старый формат).
             context: структурированный контекст собранных данных.
+            system_prompt: системная роль (новый формат).
+            user_prompt: пользовательское сообщение (новый формат).
 
         Returns:
             Строка с JSON: root_cause / evidence / suggested_fix / severity.
         """
         logger.debug(
             "LLMClientStub.generate: prompt_len=%d, context_keys=%s",
-            len(prompt),
-            list(context.keys()),
+            len(prompt or user_prompt or ""),
+            list(context.keys()) if context else None,
         )
         return json.dumps(self.STUB_ANSWER, ensure_ascii=False)
 
@@ -101,7 +135,7 @@ class IncidentOrchestrator:
         k8s_tools: K8sTools | None = None,
         prometheus_tools: PrometheusTools | None = None,
         logs_tools: LogsTools | None = None,
-        llm_client: LLMClient | None = None,
+        llm_client: LLMClientProtocol | None = None,
     ) -> None:
         """Создать оркестратор.
 
@@ -109,14 +143,17 @@ class IncidentOrchestrator:
             k8s_tools: инструменты Kubernetes (по умолчанию — новый экземпляр).
             prometheus_tools: инструменты Prometheus.
             logs_tools: инструменты логов.
-            llm_client: LLM-клиент; по умолчанию — безтокенная заглушка.
+            llm_client: LLM-клиент; по умолчанию — реальный
+                :class:`~src.agent.llm_client.LLMClient` (Qwen/OpenAI-совместимый
+                API из ``.env``). В тестах/оффлайне передавайте
+                :class:`LLMClientStub`.
         """
         self.k8s = k8s_tools if k8s_tools is not None else K8sTools()
         self.prometheus = (
             prometheus_tools if prometheus_tools is not None else PrometheusTools()
         )
         self.logs = logs_tools if logs_tools is not None else LogsTools()
-        self.llm = llm_client if llm_client is not None else LLMClientStub()
+        self.llm = llm_client if llm_client is not None else LLMClient()
 
     # ------------------------------------------------------------------
     # Основной цикл диагностики
@@ -231,25 +268,25 @@ class IncidentOrchestrator:
         else:
             warnings.append("pod_name не указан и не выводится из incident — skip per-pod steps")
 
-        # e/f. Контекст -> LLM с системным промтом.
-        prompt = (
-            f"{SYSTEM_PROMPT}\n\n"
-            f"Данные диагностики:\n{json.dumps(context, ensure_ascii=False, default=str)}"
+        # e/f. Контекст -> LLM: системный промт отдельно, данные — в user-сообщении.
+        user_prompt = (
+            f"Данные диагностики:\n"
+            f"{json.dumps(context, ensure_ascii=False, default=str)}"
         )
+        llm_raw = ""
         try:
-            llm_raw = self.llm.generate(prompt=prompt, context=context)
+            diagnosis_dict, llm_raw = self._query_llm(context, user_prompt)
         except Exception as exc:
-            logger.error("LLM generate failed: %s", exc)
-            llm_raw = ""
+            logger.error("LLM step failed: %s", exc)
+            diagnosis_dict = {}
             warnings.append("LLM не ответил — RCA не сформирован")
 
-        # g. Парсинг ответа + сырые данные для отладки.
-        diagnosis = self._parse_llm_response(llm_raw)
+        # g. Результат LLM плюс сырые данные для отладки.
         result = Diagnosis(
-            root_cause=diagnosis.get("root_cause", ""),
-            evidence=list(diagnosis.get("evidence", []) or []),
-            suggested_fix=diagnosis.get("suggested_fix", ""),
-            severity=diagnosis.get("severity", "info"),
+            root_cause=diagnosis_dict.get("root_cause", ""),
+            evidence=list(diagnosis_dict.get("evidence", []) or []),
+            suggested_fix=diagnosis_dict.get("suggested_fix", ""),
+            severity=diagnosis_dict.get("severity", "info"),
             raw_data=context,
             warnings=warnings,
             llm_response=llm_raw,
@@ -261,27 +298,83 @@ class IncidentOrchestrator:
         )
         return result.model_dump()
 
+    # ------------------------------------------------------------------
+    # Взаимодействие с LLM: запрос, валидация, retry, fallback
+    # ------------------------------------------------------------------
+    def _query_llm(self, context: dict[str, Any], user_prompt: str) -> tuple[dict, str]:
+        """Спросить LLM и вернуть (валидный диагноз, сырой ответ).
+
+        Схема ТЗ: ответ валидируется pydantic-моделью :class:`DiagnosisPayload`;
+        если JSON невалиден — один повторный запрос с указанием ошибки; если и
+        повтор не помог — fallback-диагноз (данные собраны, но LLM не смог дать
+        корректный ответ).
+
+        Args:
+            context: собранный контекст (для совместимости со старым API клиента).
+            user_prompt: пользовательское сообщение с данными диагностики.
+
+        Returns:
+            Кортеж ``(diagnosis_dict, raw_response)``.
+
+        Raises:
+            Exception: если LLM-клиент недоступен (сеть/ключи) — обрабатывается
+                вызывающим ``diagnose``.
+        """
+        raw = self.llm.generate(
+            system_prompt=SYSTEM_PROMPT, user_prompt=user_prompt, context=context
+        )
+        payload, error = self._validate_llm_answer(raw)
+        if payload is not None:
+            return payload, raw
+
+        # Один retry: просим модель переделать ответ с учётом ошибки валидации.
+        logger.warning("LLM answer invalid (%s) — retrying once", error)
+        retry_prompt = (
+            f"{user_prompt}\n\n"
+            f"Твой предыдущий ответ не прошёл валидацию: {error}\n"
+            "Исправь ошибку и верни строго JSON без markdown-обёртки с полями "
+            "root_cause (str), evidence (list[str]), suggested_fix (str), "
+            "severity (low/medium/high/critical/unknown)."
+        )
+        raw2 = self.llm.generate(
+            system_prompt=SYSTEM_PROMPT, user_prompt=retry_prompt, context=context
+        )
+        payload2, error2 = self._validate_llm_answer(raw2)
+        if payload2 is not None:
+            return payload2, raw2
+
+        # Fallback: валидного ответа нет — возвращаем диагностируемый результат
+        # с пометкой, чтобы API/отчёт были честными перед оператором.
+        logger.error("LLM answer still invalid after retry: %s", error2)
+        fallback = {
+            "root_cause": (
+                "Не удалось получить валидный RCA от LLM: ответ не прошёл "
+                f"валидацию схемы ({error2}). Данные инцидента собраны — "
+                "требуется ручная проверка."
+            ),
+            "evidence": [f"Ошибка валидации: {error2}"],
+            "suggested_fix": "Проверить доступность/настройки LLM и повторить диагностику.",
+            "severity": "unknown",
+        }
+        return fallback, raw2
+
     @staticmethod
-    def _parse_llm_response(raw: str) -> dict:
-        """Извлечь JSON из ответа LLM (толерантно к markdown/поясняющему тексту)."""
-        if not raw:
-            return {}
-        text = raw.strip()
-        # Срезаем ```json ... ``` обёртки, если они есть.
-        if text.startswith("```"):
-            text = text.strip("`")
-            if text.startswith("json"):
-                text = text[4:]
-        start, end = text.find("{"), text.rfind("}")
-        if start == -1 or end == -1:
-            logger.warning("LLM response has no JSON object: %.200s", raw)
-            return {}
+    def _validate_llm_answer(raw: str) -> tuple[dict | None, str]:
+        """Распарсить и pydantic-валидировать ответ LLM.
+
+        Args:
+            raw: текст ответа модели.
+
+        Returns:
+            ``(payload_dict | None, error_message)`` — при успехе ошибка пустая.
+        """
+        data = LLMClient.parse_json_response(raw)
+        if not data:
+            return None, "JSON не найден в ответе или не разбился"
         try:
-            data = json.loads(text[start : end + 1])
-            return data if isinstance(data, dict) else {}
-        except json.JSONDecodeError as exc:
-            logger.warning("Failed to parse LLM JSON: %s", exc)
-            return {}
+            return DiagnosisPayload.model_validate(data).model_dump(), ""
+        except ValidationError as exc:
+            return None, str(exc.errors()[0].get("msg", exc)) if exc.errors() else str(exc)
 
     # ------------------------------------------------------------------
     # Отчёт для Slack/Telegram

@@ -4,6 +4,7 @@ from unittest.mock import MagicMock
 
 
 from src.agent.orchestrator import (
+    SYSTEM_PROMPT,
     Diagnosis,
     Incident,
     IncidentOrchestrator,
@@ -58,6 +59,8 @@ def make_orchestrator(
 
     llm = MagicMock()
     if llm_answer is not None:
+        # Первый вызов — основной, второй (если будет) — retry.
+        llm.generate.side_effect = None
         llm.generate.return_value = llm_answer
     else:
         llm.generate.side_effect = RuntimeError("LLM unavailable")
@@ -108,10 +111,11 @@ class TestFullScenario:
             namespace="prod", pod_name="api-7d9f-x2kq", tail_lines=50
         )
 
-        # Контекст собран и передан в LLM вместе с системным промтом.
-        prompt_arg = llm.generate.call_args.kwargs["prompt"]
-        assert "Ты — SRE-эксперт" in prompt_arg
-        context_arg = llm.generate.call_args.kwargs["context"]
+        # Контекст собран и передан в LLM; системный промт — отдельным сообщением.
+        call_kwargs = llm.generate.call_args.kwargs
+        assert call_kwargs["system_prompt"] == SYSTEM_PROMPT
+        assert "Данные диагностики" in call_kwargs["user_prompt"]
+        context_arg = call_kwargs["context"]
         assert context_arg["target_pod"]["restarts"] == 5
         assert context_arg["metrics"] == {
             "cpu_cores": 0.25,
@@ -204,13 +208,38 @@ class TestToolFailureScenario:
         assert result["severity"] == "info"
         assert any("LLM" in w for w in result["warnings"])
 
-    def test_broken_llm_json_is_tolerated(self):
-        orch, *_ = make_orchestrator(llm_answer="извините, я не смог ответить JSON")
+    def test_broken_llm_json_triggers_retry_and_fallback(self):
+        # Первый ответ — невалидный JSON, retry-ответ — валидный.
+        orch, *_, llm = make_orchestrator(
+            llm_answer="извините, я не смог ответить JSON"
+        )
+        good = (
+            '{"root_cause": "r", "evidence": ["e"], '
+            '"suggested_fix": "f", "severity": "low"}'
+        )
+        llm.generate.side_effect = [
+            "извините, я не смог ответить JSON",
+            good,
+        ]
         result = orch.diagnose(
             {"namespace": "prod", "pod_name": "api-7d9f-x2kq"}
         )
-        assert result["root_cause"] == ""
-        assert result["llm_response"] == "извините, я не смог ответить JSON"
+        assert llm.generate.call_count == 2
+        # В retry-промте передана ошибка валидации (по ТЗ).
+        retry_prompt = llm.generate.call_args_list[1].kwargs["user_prompt"]
+        assert "не прошёл валидацию" in retry_prompt
+        assert result["root_cause"] == "r"
+        assert result["llm_response"] == good
+
+    def test_invalid_json_after_retry_returns_fallback(self):
+        orch, *_, llm = make_orchestrator(llm_answer="не JSON совсем")
+        result = orch.diagnose(
+            {"namespace": "prod", "pod_name": "api-7d9f-x2kq"}
+        )
+        assert llm.generate.call_count == 2  # основной запрос + один retry
+        assert result["severity"] == "unknown"
+        assert "валидацию" in result["root_cause"]
+        Diagnosis.model_validate(result)  # fallback — тоже валидный диагноз
 
 
 class TestFormatReport:
@@ -252,10 +281,16 @@ class TestLLMClientStub:
         data = json.loads(raw)
         assert set(data) == {"root_cause", "evidence", "suggested_fix", "severity"}
 
-    def test_orchestrator_default_llm_is_stub(self):
+    def test_orchestrator_default_llm_is_real_client(self):
+        # По умолчанию оркестратор использует реальный LLMClient (Qwen API),
+        # а не заглушку; параметры берутся из config/.env.
+        from src.agent.llm_client import LLMClient as RealLLMClient
+
         orch = IncidentOrchestrator(
             k8s_tools=MagicMock(),
             prometheus_tools=MagicMock(),
             logs_tools=MagicMock(),
+            llm_client=RealLLMClient(api_key="test-key"),
         )
-        assert isinstance(orch.llm, LLMClientStub)
+        assert isinstance(orch.llm, RealLLMClient)
+        assert not isinstance(orch.llm, LLMClientStub)

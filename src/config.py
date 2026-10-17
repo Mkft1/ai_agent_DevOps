@@ -27,6 +27,10 @@ class Settings(BaseSettings):
     openai_api_key: str | None = None
     qwen_api_key: str | None = None
 
+    # LLM API (OpenAI-совместимый: Qwen/DashScope, OpenAI, vLLM, Ollama...)
+    llm_base_url: str = "https://dashscope.aliyuncs.com/compatible-mode"
+    llm_model: str = "qwen-max"
+
 
 @lru_cache
 def get_settings() -> Settings:
