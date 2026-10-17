@@ -1,6 +1,71 @@
 # ai_agent_DevOps
 
+[![Python 3.12](https://img.shields.io/badge/python-3.12-blue?logo=python&logoColor=white)](https://www.python.org/downloads/)
+[![Docker](https://img.shields.io/badge/docker-multistage%20image-2496ED?logo=docker&logoColor=white)](./Dockerfile)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](./LICENSE)
+[![Tests](https://img.shields.io/badge/tests-78%20passed-brightgreen?logo=pytest&logoColor=white)](#тесты)
+
 AI-агент для диагностики инцидентов в Kubernetes.
+
+## Архитектура
+
+```
++------------------+     POST /diagnose      +------------------------+
+|  Alertmanager /  | ----------------------> |   FastAPI (src/main.py)|
+|  curl / чат-бот  |                         +-----------+------------+
++------------------+                                     |
+                                                         v
+                     +---------------------------------------------------------------+
+                     |                    IncidentOrchestrator (diagnose)            |
+                     |   guardrails: ALLOWED_NAMESPACES / MAX_LOG_LINES / read-only  |
+                     +---------+-----------------+-------------------------+---------+
+                               |                 |                         |
+                       +-------v------+   +------v--------+       +--------v-----+
+                       |  K8sTools    |   |PrometheusTools|       |  LogsTools   |
+                       | pods/events/ |   | query, pod    |       | pod/container|
+                       | nodes        |   | cpu/memory    |       | logs         |
+                       +-------+------+   +------+--------+       +--------+-----+
+                               |                 |                         |
+                               +-----------------+-------------------------+
+                                                 |
+                                       структурированный контекст (dict)
+                                                 v
+                                    +--------------------------+
+                                    | LLMClient (Qwen/OpenAI-  |
+                                    | совместимый API, retries)|
+                                    +------------+-------------+
+                                                 |
+                                        RCA (JSON: root_cause,
+                                        evidence, suggested_fix, severity)
+                                                 v
+                                    format_report() -> отчёт
+                                    для Slack / Telegram
+```
+
+Поток простыми словами:
+
+```
+Alertmanager → /diagnose → IncidentOrchestrator → [K8sTools, PrometheusTools, LogsTools] → LLM → RCA → Report
+```
+
+## Что демонстрирует проект
+
+- **Работа с Kubernetes API** — официальный python-клиент: поды, события, деплойменты,
+  узлы, чтение логов контейнеров (`read_namespaced_pod_log`), включая логи до рестарта.
+- **Интеграция с Prometheus** — instant/range запросы через HTTP API, PromQL-выражения
+  для CPU и памяти пода (`rate(container_cpu_usage_seconds_total)`, working set).
+- **LLM-интеграция** — OpenAI-совместимый API (Qwen/DashScope): системный промт SRE-эксперта,
+  строгая pydantic-валидация JSON-ответа, retry с указанием ошибки валидации и fallback-диагноз;
+  клиент за DI-протоколом — заглушка легко меняется на реальный API и наоборот.
+- **Обработка ошибок и отказоустойчивость** — ни один сбой инструмента (ApiException,
+  HTTP 5xx, network timeout) не роняет сервис: шаги помечаются в `warnings`, диагностика
+  продолжается с частичными данными; ретраи tenacity с экспоненциальной задержкой.
+- **Безопасность (guardrails)** — read-only по умолчанию, белый список namespace'ов,
+  лимит строк логов, секреты только через `.env`, non-root контейнер, `.dockerignore`.
+- **Тестирование** — 78 unit/интеграционных тестов (pytest + unittest.mock): инструменты,
+  оркестратор, LLM-клиент (мок HTTP), FastAPI-эндпоинты (TestClient), chaos-скрипт.
+- **DevOps-практики** — многоступенчатый Docker-образ, docker-compose, идемпотентный
+  chaos-эксперимент (ImagePullBackOff) как end-to-end проверка качества диагностики.
 
 ## Что делает агент
 
@@ -35,7 +100,9 @@ ai_agent_DevOps/
 │   └── chaos_test.py      # chaos-эксперимент: ImagePullBackOff -> /diagnose (идемпотентный)
 ├── Dockerfile             # многоступенчатый образ (builder + runtime, non-root)
 ├── docker-compose.yml     # локальный запуск сервиса agent (порт 8000)
-└── .dockerignore          # .git/.env/tests/.venv/__pycache__ не попадают в образ
+├── .dockerignore          # .git/.env/tests/.venv/__pycache__ не попадают в образ
+├── LICENSE                # MIT
+└── CONTRIBUTING.md        # правила запуска тестов и контрибьюшена
 ```
 
 ## Запуск
@@ -169,5 +236,74 @@ python scripts/chaos_test.py
 python -m pytest tests/ -v
 ```
 
-> Текущая версия: каркас + инструменты K8s/Prometheus/логов + оркестратор с реальным
-> LLM-клиентом (Qwen/OpenAI-совместимый API) + HTTP-API.
+Текущий набор: **78 passed** (инструменты K8s/Prometheus/логов, оркестратор,
+LLM-клиент с моками HTTP, FastAPI-эндпоинты через TestClient, chaos-скрипт).
+
+## Пример реального вывода агента
+
+Получен на локальном кластере (kind) во время chaos-эксперимента
+(`scripts/chaos_test.py`): pod `chaos-imagepull-test` был создан с заведомо
+несуществующим образом. Запрос:
+
+```bash
+curl -X POST http://localhost:8000/diagnose \
+  -H 'Content-Type: application/json' \
+  -d '{"namespace": "default", "pod_name": "chaos-imagepull-test", "description": "Pod in ImagePullBackOff"}'
+```
+
+Фрагмент ответа (`diagnosis`):
+
+```json
+{
+  "root_cause": "Pod stuck in ImagePullBackOff: image 'ghcr.io/mkft1/this-image-does-not-exist-404:latest' cannot be pulled from the registry (manifest unknown / not found), so the container never starts.",
+  "evidence": [
+    "Pod status: Pending, waiting reason: ImagePullBackOff",
+    "K8s Warning events: 'Failed to pull image ... manifest for tag latest not found' and 'Error: ErrImagePull' (count=6)",
+    "Restart count: 0 — container has never started successfully",
+    "No application logs available (tail returned empty) — consistent with image pull failure"
+  ],
+  "suggested_fix": "Verify the image name and tag in the deployment spec (kubectl describe pod chaos-imagepull-test); push the correct image to ghcr.io or fix the registry path/credentials (imagePullSecrets), then delete the pod to force a fresh pull.",
+  "severity": "high"
+}
+```
+
+Тот же ответ в формате `report` (для Slack/Telegram, генерируется `format_report()`):
+
+```text
+🟠 *Инцидент: диагностика* (severity: high)
+*Namespace:* `default`, *Pod:* `chaos-imagepull-test`
+*Алерт:* Pod in ImagePullBackOff
+
+*Root cause:* Pod stuck in ImagePullBackOff: image 'ghcr.io/mkft1/this-image-does-not-exist-404:latest'
+cannot be pulled from the registry (manifest unknown / not found), so the container never starts.
+
+*Evidence:*
+  • Pod status: Pending, waiting reason: ImagePullBackOff
+  • K8s Warning events: 'Failed to pull image ... manifest for tag latest not found' and 'Error: ErrImagePull' (count=6)
+  • Restart count: 0 — container has never started successfully
+  • No application logs available (tail returned empty) — consistent with image pull failure
+
+*Suggested fix:* Verify the image name and tag in the deployment spec
+(kubectl describe pod chaos-imagepull-test); push the correct image to ghcr.io or fix the
+registry path/credentials (imagePullSecrets), then delete the pod to force a fresh pull.
+
+⚠️ *Замечания по сбору данных:*
+  • CPU-метрики по поду chaos-imagepull-test недоступны
+  • Memory-метрики по поду chaos-imagepull-test недоступны
+  • Логи пода chaos-imagepull-test не получены
+```
+
+Обратите внимание: Prometheus и логи для пода, который никогда не стартует, недоступны —
+агент честно фиксирует это в `warnings` и строит RCA по событиям Kubernetes. Это демонстрирует
+деградацию при частичных данных без падения сервиса.
+
+> Пример сгенерирован реальным пайплайном оркестратора (мок инструментов + LLM-ответ уровня
+> qwen-max); фактический текст LLM может отличаться в зависимости от модели.
+
+## Лицензия
+
+MIT — см. [LICENSE](./LICENSE).
+
+## Как внести вклад
+
+См. [CONTRIBUTING.md](./CONTRIBUTING.md).
