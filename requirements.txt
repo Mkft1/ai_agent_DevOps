@@ -1,0 +1,9 @@
+fastapi
+uvicorn
+kubernetes
+prometheus-api-client
+python-dotenv
+pydantic
+pydantic-settings
+requests
+pytest
