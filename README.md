@@ -101,7 +101,8 @@ ai_agent_DevOps/
 │   │       ├── prometheus_tools.py  # Инструменты Prometheus
 │   │       └── logs_tools.py        # Инструменты логов
 │   └── utils/
-│       └── logger.py      # Базовое логирование
+│       ├── logger.py      # Базовое логирование
+│       └── metrics.py     # Кастомные Prometheus-метрики агента
 ├── tests/
 ├── scripts/
 │   └── chaos_test.py      # chaos-эксперимент: ImagePullBackOff -> /diagnose (идемпотентный)
@@ -195,7 +196,20 @@ curl http://localhost:8000/health
 |-------|-------------|-----------------------------------------------------------------|
 | GET   | `/health`   | Живость сервиса → `{"status": "ok"}`                            |
 | GET   | `/ready`    | Проверка доступности K8s API и Prometheus → 200 / 503           |
+| GET   | `/metrics`  | Prometheus-метрики (HTTP + кастомные метрики агента)            |
 | POST  | `/diagnose` | Приём инцидента и запуск диагностики через оркестратор          |
+
+### Метрики (`/metrics`)
+
+Стандартные HTTP-метрики предоставляет `prometheus-fastapi-instrumentator`.
+Кастомные метрики агента объявлены в `src/utils/metrics.py`:
+
+| Метрика                      | Тип       | Labels                | Смысл                                        |
+|------------------------------|-----------|-----------------------|----------------------------------------------|
+| `diagnose_requests_total`    | Counter   | namespace, severity   | число выполненных диагностик                  |
+| `diagnose_duration_seconds`  | Histogram | namespace             | длительность `IncidentOrchestrator.diagnose`  |
+| `k8s_api_errors_total`       | Counter   | method                | ошибки Kubernetes API в инструментах          |
+| `llm_fallback_total`         | Counter   | —                     | срабатывания fallback-диагноза (битый JSON)   |
 
 Пример запроса:
 
