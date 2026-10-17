@@ -31,6 +31,11 @@ class Settings(BaseSettings):
     llm_base_url: str = "https://dashscope.aliyuncs.com/compatible-mode"
     llm_model: str = "qwen-max"
 
+    # Guardrails (ограничения безопасности агента)
+    allowed_namespaces: list[str] = ["default"]
+    max_log_lines: int = 200
+    enable_write_actions: bool = False
+
     @property
     def llm_api_key(self) -> str | None:
         """Ключ активного LLM-провайдера (Qwen приоритетнее, затем OpenAI)."""
