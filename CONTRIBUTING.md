@@ -7,22 +7,25 @@
 
 ```bash
 python -m venv .venv && source .venv/bin/activate   # требуется Python 3.12+
-pip install -r requirements.txt
+pip install -r requirements-dev.txt                 # тянет и requirements.txt, плюс pytest/ruff
 cp .env.example .env                                 # заполните ключи LLM и пути
 ```
 
 Реальный кластер для разработки **не обязателен**: все инструменты (K8s, Prometheus,
 LLM) в тестах подменяются моками. Для ручных проверок удобно использовать kind/minikube.
 
-## Как запускать тесты
+## Как запускать тесты и линтер
 
 ```bash
-python -m pytest tests/ -v        # весь набор
-python -m pytest tests/test_api.py            # только HTTP-слой
-python -m pytest -k "guardrails"              # точечный прогон по имени
+ruff check src tests                                # линтер (job "lint" в CI)
+python -m pytest --cov=src --cov-report=xml tests/  # тесты с покрытием (job "test")
+python -m pytest tests/test_api.py                  # только HTTP-слой
+python -m pytest -k "guardrails"                    # точечный прогон по имени
 ```
 
-Перед отправкой PR убедитесь, что **все тесты зелёные** и приложение стартует
+Перед отправкой PR убедитесь, что **линтер чистый** и **все тесты зелёные** —
+то же самое проверяет GitHub Actions (`.github/workflows/ci.yml`: lint → test → build),
+который запускается на каждый push/PR в `main`. Приложение при этом должно стартовать
 (`uvicorn src.main:app`, затем `curl localhost:8000/health`).
 
 ## Процесс контрибьюшена

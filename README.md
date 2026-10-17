@@ -1,9 +1,11 @@
 # ai_agent_DevOps
 
+[![CI](https://github.com/Mkft1/ai_agent_DevOps/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/Mkft1/ai_agent_DevOps/actions/workflows/ci.yml)
 [![Python 3.12](https://img.shields.io/badge/python-3.12-blue?logo=python&logoColor=white)](https://www.python.org/downloads/)
 [![Docker](https://img.shields.io/badge/docker-multistage%20image-2496ED?logo=docker&logoColor=white)](./Dockerfile)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](./LICENSE)
 [![Tests](https://img.shields.io/badge/tests-78%20passed-brightgreen?logo=pytest&logoColor=white)](#тесты)
+[![Ruff](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/astral-sh/ruff/main/assets/badge/v2.json)](https://github.com/astral-sh/ruff)
 
 AI-агент для диагностики инцидентов в Kubernetes.
 
@@ -81,8 +83,13 @@ Alertmanager → /diagnose → IncidentOrchestrator → [K8sTools, PrometheusToo
 ai_agent_DevOps/
 ├── README.md
 ├── requirements.txt
+├── requirements-dev.txt   # dev-зависимости: pytest, pytest-cov, httpx, ruff
+├── pyproject.toml         # конфиг ruff (линт в CI)
 ├── .gitignore
 ├── .env.example
+├── .github/
+│   └── workflows/
+│       └── ci.yml         # CI: lint (ruff) -> test (pytest+cov) -> build (Docker, no push)
 ├── src/
 │   ├── main.py            # Точка входа FastAPI-приложения
 │   ├── config.py          # Загрузка конфигурации из .env
@@ -230,14 +237,36 @@ python scripts/chaos_test.py
 > tolerations в общем проде — запускайте эксперимент в изолированном/тестовом кластере
 > (kind/minikube). Логика скрипта покрыта unit-тестами с моками (`tests/test_chaos_test.py`).
 
-## Тесты
+## Тесты и линтеры (локально)
+
+Зависимости для разработки — `requirements-dev.txt` (pytest, pytest-cov, httpx, ruff):
 
 ```bash
-python -m pytest tests/ -v
+pip install -r requirements-dev.txt
+
+# Линтер (то же самое, что job "lint" в CI)
+ruff check src tests
+
+# Тесты с покрытием (то же самое, что job "test" в CI)
+python -m pytest --cov=src --cov-report=xml tests/
 ```
 
 Текущий набор: **78 passed** (инструменты K8s/Prometheus/логов, оркестратор,
 LLM-клиент с моками HTTP, FastAPI-эндпоинты через TestClient, chaos-скрипт).
+
+## CI/CD
+
+Workflow [`.github/workflows/ci.yml`](.github/workflows/ci.yml) запускается на
+`push` и `pull_request` в `main` и состоит из трёх последовательных jobs:
+
+| Job | Что делает |
+|-----|------------|
+| `lint` | `ruff check src tests` (конфиг — `pyproject.toml`) |
+| `test` | `pytest --cov=src --cov-report=xml tests/`, артефакт `coverage.xml` |
+| `build` | Сборка Docker-образа (`docker/build-push-action`, **без push**) + smoke-тест `/health` |
+
+`build` зависит от `test`, `test` — от `lint`: образ не собирается, если код
+не прошёл линтер или тесты красные.
 
 ## Пример реального вывода агента
 

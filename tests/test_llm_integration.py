@@ -21,13 +21,13 @@ import pytest
 import requests
 
 from src.agent.llm_client import LLMClient, LLMError
-from src.config import Settings
 from src.agent.orchestrator import (
     SYSTEM_PROMPT,
     Diagnosis,
     DiagnosisPayload,
     IncidentOrchestrator,
 )
+from src.config import Settings
 
 VALID_ANSWER = json.dumps(
     {
