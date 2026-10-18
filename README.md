@@ -120,7 +120,10 @@ ai_agent_DevOps/
 │   └── runbooks/            # Markdown-runbook'и для RAG (OOMKilled, ImagePullBackOff, CrashLoopBackOff)
 ├── tests/
 ├── scripts/
-│   └── chaos_test.py      # chaos-эксперимент: ImagePullBackOff -> /diagnose (идемпотентный)
+│   ├── chaos_test.py      # chaos-эксперимент: ImagePullBackOff -> /diagnose (идемпотентный)
+│   ├── run_integration_test.sh  # e2e-тест на kind-кластере (создание/диагностика/очистка)
+│   └── kind/
+│       └── cluster.yaml   # конфигурация kind-кластера для интеграционного теста
 ├── Dockerfile             # многоступенчатый образ (builder + runtime, non-root)
 ├── docker-compose.yml     # локальный запуск сервиса agent (порт 8000)
 ├── .dockerignore          # .git/.env/tests/.venv/__pycache__ не попадают в образ
@@ -321,6 +324,29 @@ python scripts/chaos_test.py
 > tolerations в общем проде — запускайте эксперимент в изолированном/тестовом кластере
 > (kind/minikube). Логика скрипта покрыта unit-тестами с моками (`tests/test_chaos_test.py`).
 
+## Интеграционный тест с kind (end-to-end)
+
+Скрипт `scripts/run_integration_test.sh` поднимает **реальный Kubernetes-кластер**
+([kind](https://kind.sigs.k8s.io/)) из конфигурации `scripts/kind/cluster.yaml`
+(1 control-plane), создаёт «плохой» pod с несуществующим тегом (`kubectl run
+bad-pod --image=nginx:bad-tag` → ImagePullBackOff), запускает агента локально
+(uvicorn), отправляет `POST /diagnose` и через `jq` проверяет, что в ответе
+`root_cause` упоминает `image`/`pull`. В конце кластер всегда удаляется.
+
+```bash
+# Требования: docker, kind, kubectl, jq, python3
+./scripts/run_integration_test.sh
+```
+
+Скрипт **идемпотентен**: leftover-кластер `agent-e2e` и pod `bad-pod` от прошлых
+прогонов удаляются перед созданием новых, cleanup выполняется по `trap EXIT`
+даже при падении проверки. Код возврата `0` — агент успешно диагностировал
+сбой на реальном кластере.
+
+В CI этот сценарий выполняется отдельным job'ом **`integration-test`**
+(использует официальный экшн `engineerd/setup-kind`), который запускается
+**только на push в `main`**, чтобы не замедлять pull request'ы.
+
 ## Тесты и линтеры (локально)
 
 Зависимости для разработки — `requirements-dev.txt` (pytest, pytest-cov, httpx, ruff):
@@ -348,6 +374,7 @@ Workflow [`.github/workflows/ci.yml`](.github/workflows/ci.yml) запускае
 | `lint` | `ruff check src tests` (конфиг — `pyproject.toml`) |
 | `test` | `pytest --cov=src --cov-report=xml tests/`, артефакт `coverage.xml` |
 | `build` | Сборка Docker-образа (`docker/build-push-action`, **без push**) + smoke-тест `/health` |
+| `integration-test` | kind-кластер + ImagePullBackOff + проверка `/diagnose` (только push в main) |
 
 `build` зависит от `test`, `test` — от `lint`: образ не собирается, если код
 не прошёл линтер или тесты красные.
