@@ -36,6 +36,12 @@ class Settings(BaseSettings):
     max_log_lines: int = 200
     enable_write_actions: bool = False
 
+    # CORS (список разрешённых origins; по умолчанию "*" для dev)
+    cors_origins: list[str] = ["*"]
+
+    # Ограничение размера контекста (в символах), передаваемого в LLM
+    max_context_chars: int = 16000
+
     @property
     def llm_api_key(self) -> str | None:
         """Ключ активного LLM-провайдера (Qwen приоритетнее, затем OpenAI)."""
