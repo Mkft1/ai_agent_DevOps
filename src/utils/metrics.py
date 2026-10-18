@@ -59,6 +59,11 @@ LLM_FALLBACK_TOTAL = Counter(
     "Total number of LLM fallback diagnoses (invalid JSON after retry)",
 )
 
+APPROVAL_REQUESTS_TOTAL = Counter(
+    "approval_requests_total",
+    "Total number of dangerous-fix approvals requested from humans (Slack)",
+)
+
 
 # ----------------------------------------------------------------------
 # Хелперы инкрементирования (не падают при любых входных данных)
@@ -83,3 +88,8 @@ def inc_k8s_api_error(method: str | None) -> None:
 def inc_llm_fallback() -> None:
     """Увеличить счётчик срабатываний fallback-диагноза."""
     LLM_FALLBACK_TOTAL.inc()
+
+
+def inc_approval_request() -> None:
+    """Увеличить счётчик запрошенных человеческих аппрувов опасных фиксов."""
+    APPROVAL_REQUESTS_TOTAL.inc()

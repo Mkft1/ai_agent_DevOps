@@ -15,11 +15,13 @@ import time
 from pathlib import Path
 from typing import Any, Protocol, runtime_checkable
 
+import requests
 from opentelemetry import trace
 from opentelemetry.trace import StatusCode
 from pydantic import BaseModel, Field, ValidationError
 
 from src.agent.llm_client import LLMClient
+from src.agent.policies import check_policy
 from src.agent.rag import RunbookRAG
 from src.agent.tools.k8s_tools import K8sTools
 from src.agent.tools.logs_tools import LogsTools
@@ -27,6 +29,7 @@ from src.agent.tools.prometheus_tools import PrometheusTools
 from src.config import Settings, get_settings
 from src.utils.logger import get_logger
 from src.utils.metrics import (
+    inc_approval_request,
     inc_diagnose_request,
     inc_llm_fallback,
     observe_diagnose_duration,
@@ -49,6 +52,9 @@ class NamespaceNotAllowedError(ValueError):
 DEFAULT_TAIL_LINES = 50
 # Число runbook'ов, подтягиваемых RAG в контекст LLM (top_k).
 RAG_TOP_K = 2
+
+# Таймаут POST-запроса в Slack incoming webhook, секунд.
+SLACK_TIMEOUT_SECONDS = 5.0
 
 # Fallback-версия системного промта senior SRE (используется, если файл
 # src/prompts/sre_system.txt отсутствует или нечитаем — см. load_system_prompt).
@@ -120,7 +126,14 @@ class DiagnosisPayload(BaseModel):
 
 
 class Diagnosis(BaseModel):
-    """Выходной диагноз: RCA от LLM плюс сырые данные для отладки."""
+    """Выходной диагноз: RCA от LLM плюс сырые данные для отладки.
+
+    Attributes:
+        requires_approval: True, если ``suggested_fix`` распознан политикой
+            (:func:`~src.agent.policies.check_policy`) как опасное действие —
+            оператор должен явно approve'ить рекомендацию (Slack-уведомление
+            при настроенном ``SLACK_WEBHOOK_URL``).
+    """
 
     root_cause: str = ""
     evidence: list[str] = Field(default_factory=list)
@@ -129,6 +142,7 @@ class Diagnosis(BaseModel):
     raw_data: dict[str, Any] = Field(default_factory=dict)
     warnings: list[str] = Field(default_factory=list)
     llm_response: str = ""
+    requires_approval: bool = False
 
 
 @runtime_checkable
@@ -554,12 +568,47 @@ class IncidentOrchestrator:
             warnings=warnings,
             llm_response=llm_raw,
         )
+        # g2. Policy guardrail: опасные рекомендации требуют аппрува человека.
+        result.requires_approval = check_policy(result.suggested_fix, self.settings)
+        if result.requires_approval:
+            inc_approval_request()
+            self._notify_slack_approval(result.suggested_fix)
+
         logger.info(
-            "Diagnosis complete: severity=%s, warnings=%d",
+            "Diagnosis complete: severity=%s, warnings=%d, requires_approval=%s",
             result.severity,
             len(result.warnings),
+            result.requires_approval,
         )
         return result.model_dump()
+
+    def _notify_slack_approval(self, suggested_fix: str) -> None:
+        """Отправить запрос аппрува опасной рекомендации в Slack (incoming webhook).
+
+        Graceful degradation: без ``SLACK_WEBHOOK_URL`` — только WARNING в логах
+        (диагноз всё равно помечен ``requires_approval=true``); ошибка отправки
+        не роняет диагностику.
+        """
+        webhook = self.settings.slack_webhook_url
+        message = (
+            "⚠️ Action Required: Agent suggests dangerous fix: "
+            f"{suggested_fix}. Approve or Reject?"
+        )
+        if not webhook:
+            logger.warning(
+                "Dangerous fix requires human approval but SLACK_WEBHOOK_URL is "
+                "not set — approval request NOT sent (fix: %.300s)",
+                suggested_fix,
+            )
+            return
+        try:
+            resp = requests.post(
+                webhook, json={"text": message}, timeout=SLACK_TIMEOUT_SECONDS
+            )
+            resp.raise_for_status()
+            logger.info("Slack approval request sent (HTTP %s)", resp.status_code)
+        except Exception as exc:  # noqa: BLE001 - Slack недоступен не роняет диагноз
+            logger.error("Failed to send Slack approval request: %s", exc)
 
     def _log_token_estimate(self, user_prompt: str) -> None:
         """Залогировать грубую оценку токенов перед вызовом LLM.
@@ -711,6 +760,12 @@ class IncidentOrchestrator:
             "",
             f"*Suggested fix:* {diagnosis.get('suggested_fix') or '—'}",
         ]
+        if diagnosis.get("requires_approval"):
+            lines += [
+                "",
+                "🔔 *Требует аппрува человека:* рекомендация распознана политикой "
+                "безопасности как опасное действие (delete/drop/rm -rf/scale 0).",
+            ]
 
         warnings = diagnosis.get("warnings") or []
         if warnings:

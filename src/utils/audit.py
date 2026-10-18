@@ -24,7 +24,7 @@ logger = get_logger(__name__)
 
 # Из диагноза в журнал пишем только ключевые поля: полный ``raw_data``
 # (метры килобайт метрик/логов) раздул бы журнал и дублировал контекст LLM.
-_RESULT_FIELDS = ("root_cause", "severity", "suggested_fix", "warnings")
+_RESULT_FIELDS = ("root_cause", "severity", "suggested_fix", "warnings", "requires_approval")
 
 
 def audit_log_path() -> Path:
