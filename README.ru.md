@@ -11,7 +11,7 @@ AI-агент для диагностики инцидентов в Kubernetes. 
 [![Python 3.12](https://img.shields.io/badge/python-3.12-blue?logo=python&logoColor=white)](https://www.python.org/downloads/)
 [![Docker](https://img.shields.io/badge/docker-multistage%20image-2496ED?logo=docker&logoColor=white)](./Dockerfile)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](./LICENSE)
-[![Tests](https://img.shields.io/badge/tests-160%20passed-brightgreen?logo=pytest&logoColor=white)](#тесты)
+[![Tests](https://img.shields.io/badge/tests-170%20passed-brightgreen?logo=pytest&logoColor=white)](#тесты)
 [![Ruff](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/astral-sh/ruff/main/assets/badge/v2.json)](https://github.com/astral-sh/ruff)
 
 AI-агент для диагностики инцидентов в Kubernetes.
@@ -89,7 +89,7 @@ Alertmanager → /diagnose → IncidentOrchestrator → [K8sTools, PrometheusToo
   и возвращает `400` на битом JSON/схеме.
 - **Безопасность (guardrails)** — read-only по умолчанию, белый список namespace'ов,
   лимит строк логов, секреты только через `.env`, non-root контейнер, `.dockerignore`.
-- **Тестирование** — 160 unit/интеграционных тестов (pytest + unittest.mock), покрытие ~92%
+- **Тестирование** — 170 unit/интеграционных тестов (pytest + unittest.mock), покрытие ~92%
   (гейт в CI `--cov-fail-under=85`): инструменты, оркестратор, LLM-клиент (мок HTTP),
   FastAPI-эндпоинты (TestClient), конфигурация и логирование, chaos-скрипт.
 - **DevOps-практики** — многоступенчатый Docker-образ, docker-compose, идемпотентный
@@ -100,8 +100,11 @@ Alertmanager → /diagnose → IncidentOrchestrator → [K8sTools, PrometheusToo
 - Читает **метрики** из Prometheus (загрузка CPU/RAM, ошибки, задержки).
 - Собирает и анализирует **логи** контейнеров и компонентов кластера.
 - Проверяет **состояние подов**, деплоев и других ресурсов Kubernetes.
-- Подтягивает релевантные **runbook'и** (RAG по `docs/runbooks/`, TF-IDF) —
-  найденные инструкции попадают в контекст LLM как `relevant_runbooks`.
+- Подтягивает релевантные **runbook'и** гибридным RAG-поиском по `docs/runbooks/`:
+  `0.5 × TF-IDF` (точные термины) + `0.5 × косинусная близость эмбеддингов`
+  (sentence-transformers `all-MiniLM-L6-v2`, поиск по смыслу); найденные
+  инструкции попадают в контекст LLM как `relevant_runbooks`. Без векторной
+  БД и внешних сервисов; если модель недоступна — graceful fallback на TF-IDF.
 - Формирует гипотезу о причине инцидента и предлагает **RCA** (Root Cause Analysis)
   с рекомендациями для on-call инженера.
 
@@ -126,7 +129,7 @@ ai_agent_DevOps/
 │   ├── agent/
 │   │   ├── orchestrator.py  # Оркестрация шагов диагностики (K8s -> контекст -> LLM -> RCA)
 │   │   ├── llm_client.py    # Реальный LLM-клиент (Qwen / OpenAI-совместимый API, ретраи tenacity)
-│   │   ├── rag.py           # RunbookRAG: TF-IDF поиск релевантных runbook'ов по симптомам
+│   │   ├── rag.py           # RunbookRAG: гибридный поиск (TF-IDF + эмбеддинги) по runbook'ам
 │   │   └── tools/
 │   │       ├── k8s_tools.py         # Инструменты Kubernetes
 │   │       ├── prometheus_tools.py  # Инструменты Prometheus
@@ -234,6 +237,8 @@ curl http://localhost:8000/health
 | `AUDIT_LOG_PATH`  | `audit.jsonl`                                  | Append-only журнал аудита (JSON Lines): по одной JSON-строке на диагностику / guardrail-отклонение / webhook-батч |
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | — (выключено)                   | OTLP/gRPC endpoint экспорта трейсов, напр. `http://localhost:4317` (Jaeger); без значения спаны не экспортируются |
 | `OTEL_SERVICE_NAME` | `ai-agent-devops`                            | Имя сервиса (`service.name`) в UI Jaeger/Tempo |
+| `ENABLE_HYBRID_RAG` | `true`                                       | Гибридный RAG-поиск (TF-IDF + эмбеддинги); `false` — только TF-IDF |
+| `EMBEDDING_MODEL` | `all-MiniLM-L6-v2`                           | Модель sentence-transformers для векторной ветки гибридного RAG |
 
 ## Безопасность (guardrails)
 
@@ -397,15 +402,22 @@ Swagger UI доступен на `/docs`. CORS открыт для всех orig
 Агент умеет подтягивать локальные инструкции (runbook'и) в контекст LLM:
 
 - `RunbookRAG` (`src/agent/rag.py`) при старте читает все `docs/runbooks/*.md`
-  и строит TF-IDF индекс (scikit-learn, без внешних сервисов и эмбеддингов).
+  и строит два индекса (без внешних сервисов и векторных БД): TF-IDF
+  (scikit-learn) и матрицу эмбеддингов (sentence-transformers,
+  `EMBEDDING_MODEL`, по умолчанию лёгкая `all-MiniLM-L6-v2`).
 - После сбора логов и событий оркестратор формирует поисковый запрос
   (описание алерта + статус пода + последние 10 строк логов) и вызывает
-  `find_relevant(query, top_k=2)`.
+  `find_relevant(query, top_k=2)`: итоговый скор каждого runbook'а =
+  `0.5 × TF-IDF + 0.5 × cosine_similarity(эмбеддингов)` (hybrid search).
 - Найденные runbook'и добавляются в контекст как поле `relevant_runbooks`;
   системный промт (`src/prompts/sre_system.txt`) инструктирует модель опираться
   на них при формировании `suggested_fix`.
-- **Graceful degradation:** если директория отсутствует, индекс пуст, ничего не
-  найдено или поиск упал — агент работает как раньше (без `relevant_runbooks`).
+- **Graceful degradation:** если sentence-transformers не установлен или модель
+  не скачалась (нет сети/диска) — RAG молча работает на чистом TF-IDF
+  (`hybrid_enabled is False`); флаг `ENABLE_HYBRID_RAG=false` отключает
+  векторную ветку принудительно; если директория отсутствует, индекс пуст,
+  ничего не найдено или поиск упал — агент работает как раньше
+  (без `relevant_runbooks`).
 
 Чтобы обогатить агента знаниями о вашей инфраструктуре, просто добавьте новый
 `.md`-файл в `docs/runbooks/` — пересборка образа не требуется при монтировании
@@ -477,7 +489,7 @@ ruff check src tests scripts
 python -m pytest --cov=src --cov-report=xml tests/
 ```
 
-Текущий набор: **160 passed**, покрытие **~92%** (инструменты K8s/Prometheus/логов,
+Текущий набор: **170 passed**, покрытие **~92%** (инструменты K8s/Prometheus/логов,
 оркестратор, LLM-клиент с моками HTTP, FastAPI-эндпоинты через TestClient (включая
 webhook Alertmanager и журнал аудита), валидация конфигурации, JSON-логирование,
 трейсинг OpenTelemetry, chaos-скрипт).

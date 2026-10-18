@@ -22,7 +22,7 @@ The agent is strictly **read-only by default**: it never mutates the cluster (`E
 | | |
 |---|---|
 | 🧠 **LLM RCA** | OpenAI-compatible chat API (Qwen/DashScope by default) with strict JSON output validated by Pydantic; automatic one-shot retry on invalid JSON and an honest fallback diagnosis. |
-| 📚 **RAG over runbooks** | Local Markdown runbooks (`docs/runbooks/*.md`) indexed with scikit-learn TF-IDF; the most relevant playbooks are injected into the LLM context as `relevant_runbooks` and drive `suggested_fix`. |
+| 📚 **Hybrid RAG over runbooks** | Local Markdown runbooks (`docs/runbooks/*.md`) ranked by **hybrid search**: `0.5 × TF-IDF` (exact terms) + `0.5 × cosine similarity` of sentence-transformers embeddings (`all-MiniLM-L6-v2`, semantic match). No vector DB, no external service; if the model is unavailable the agent gracefully falls back to pure TF-IDF. Top playbooks are injected into the LLM context as `relevant_runbooks` and drive `suggested_fix`. |
 | ☸️ **Kubernetes integration** | Official Python client: pods, events, deployments, nodes, container logs (including pre-restart logs for OOMKilled/CrashLoopBackOff). |
 | 📈 **Prometheus integration** | instant & range queries, per-pod CPU/memory usage via `container_*` cAdvisor metrics. |
 | 🛡️ **Guardrails** | Namespace allow-list (`ALLOWED_NAMESPACES`), log-size cap (`MAX_LOG_LINES`), context-size cap (`MAX_CONTEXT_CHARS`), read-only mode (`ENABLE_WRITE_ACTIONS`). All configurable via `.env`, nothing hardcoded. |
@@ -30,7 +30,7 @@ The agent is strictly **read-only by default**: it never mutates the cluster (`E
 | 📊 **Observability** | `/metrics` endpoint (`prometheus-fastapi-instrumentator`) + custom counters/histograms: `diagnose_requests_total`, `diagnose_duration_seconds`, `k8s_api_errors_total`, `llm_fallback_total`. `X-Request-ID` correlation (echoed/generated per request), optional structured JSON logging (`LOG_FORMAT=json`) for Loki/CloudWatch, an append-only audit journal (`AUDIT_LOG_PATH`, JSON Lines) of every diagnosis, and **OpenTelemetry distributed tracing** (auto HTTP spans + manual spans per K8s/Prometheus/logs/RAG/LLM call, OTLP export to Jaeger/Tempo). |
 | 🚨 **Alertmanager webhook** | `POST /webhook/alertmanager` accepts the standard Alertmanager payload, diagnoses every `firing` alert (namespace/pod from labels, text from `annotations.summary`/`description`), skips `resolved`, and answers `400` on malformed payloads. |
 | 🔁 **Chaos self-test** | `scripts/chaos_test.py` creates an ImagePullBackOff pod, asks the agent to diagnose it, asserts the RCA mentions "image"/"pull", and cleans up. Idempotent. |
-| 🧪 **Testing & CI/CD** | 160 unit/integration tests with mocked clients (92% coverage, CI gate `--cov-fail-under=85`); GitHub Actions pipeline: lint → test+coverage → Docker build+smoke → kind-based e2e on `main` (auto-skipped when no LLM secret is configured). |
+| 🧪 **Testing & CI/CD** | 170 unit/integration tests with mocked clients (92% coverage, CI gate `--cov-fail-under=85`, SentenceTransformer mocked so tests never download models); GitHub Actions pipeline: lint → test+coverage → Docker build+smoke → kind-based e2e on `main` (auto-skipped when no LLM secret is configured). |
 | 🐳 **Containerized** | Multi-stage `python:3.12-slim` image, non-root user, healthcheck, no secrets baked into the image. |
 
 ---
@@ -82,7 +82,7 @@ Pipeline in one line:
 
 A few deliberate trade-offs worth knowing about:
 
-1. **TF-IDF RAG instead of a vector database.** Runbooks are small (a handful of Markdown files), so scikit-learn's `TfidfVectorizer` gives good-enough retrieval with **zero external infrastructure** — no embeddings API, no Chroma/Qdrant sidecar, no extra network hop. The index is rebuilt in-process at startup; adding knowledge is just dropping a `.md` file into `docs/runbooks/`. Swapping to embeddings later only touches `src/agent/rag.py`.
+1. **Hybrid RAG (TF-IDF + local embeddings) instead of a vector database.** Runbooks are small (a handful of Markdown files), so retrieval runs fully in-process with **zero external infrastructure** — no embeddings API, no Chroma/Qdrant sidecar. Exact-term matching (scikit-learn TF-IDF) is combined with semantic matching (sentence-transformers `all-MiniLM-L6-v2` embeddings, cosine similarity) as `0.5 × tfidf + 0.5 × cosine` — the gold-standard hybrid recipe: synonyms and paraphrases are found even when no keyword overlaps. The index is rebuilt in-process at startup; adding knowledge is just dropping a `.md` file into `docs/runbooks/`. If the embedding model cannot be installed/downloaded, `RunbookRAG` degrades gracefully to pure TF-IDF (`ENABLE_HYBRID_RAG=false` disables the vector branch outright).
 2. **FastAPI + pydantic-settings.** FastAPI gives async request handling, automatic OpenAPI docs (`/docs` Swagger UI) and request/response validation out of the box; pydantic models make the incident contract (`Incident`, `Diagnosis`) explicit and testable, and all configuration is env-driven via one `Settings` class.
 3. **Strict JSON output validated by Pydantic, with one retry and an honest fallback.** Instead of trusting free-form LLM prose, the system prompt demands a fixed JSON schema; invalid responses trigger a single correction retry, then a deterministic fallback diagnosis (`severity="unknown"`) — the pipeline never returns garbage or crashes because of the model.
 4. **Read-only by default + graceful degradation.** The agent suggests fixes rather than executing them (`ENABLE_WRITE_ACTIONS=false`), and any failing data source becomes a warning in the report instead of an exception — safe to wire directly into production alert pipelines.
@@ -116,6 +116,8 @@ cp .env.example .env
 | `AUDIT_LOG_PATH` | `audit.jsonl` | Append-only audit journal (JSON Lines): one record per diagnosis / guardrail rejection / webhook batch. |
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | — (disabled) | OTLP/gRPC endpoint for trace export, e.g. `http://localhost:4317` (Jaeger). Unset = tracing collects spans in-process, no export. |
 | `OTEL_SERVICE_NAME` | `ai-agent-devops` | `service.name` resource attribute shown in Jaeger/Tempo. |
+| `ENABLE_HYBRID_RAG` | `true` | Hybrid retrieval (TF-IDF + embeddings). `false` = pure TF-IDF. |
+| `EMBEDDING_MODEL` | `all-MiniLM-L6-v2` | sentence-transformers model for the vector branch of hybrid RAG. |
 
 ### 2. Run locally
 
@@ -405,14 +407,14 @@ ai_agent_DevOps/
 │   ├── agent/
 │   │   ├── orchestrator.py      # IncidentOrchestrator: pipeline, guardrails, degradation, reporting
 │   │   ├── llm_client.py        # OpenAI-compatible client: tenacity retries, 30s timeout
-│   │   ├── rag.py               # RunbookRAG: TF-IDF retrieval over docs/runbooks
+│   │   ├── rag.py               # RunbookRAG: hybrid retrieval (TF-IDF + embeddings) over docs/runbooks
 │   │   └── tools/               # k8s_tools.py, prometheus_tools.py, logs_tools.py
 │   └── utils/
 │       ├── audit.py             # append-only audit journal (JSON Lines)
 │       ├── logger.py            # stdlib logging setup
 │       ├── metrics.py           # custom Prometheus metrics
 │       └── text_utils.py        # truncate_context (bounded, JSON-safe)
-└── tests/                       # 160 tests, fully mocked externals
+└── tests/                       # 170 tests, fully mocked externals
 ```
 
 ---
