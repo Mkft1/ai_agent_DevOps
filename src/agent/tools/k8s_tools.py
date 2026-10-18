@@ -59,13 +59,20 @@ class K8sTools:
         try:
             kubernetes.config.load_kube_config(config_file=path)
         except Exception as exc:  # ConfigException и пр. ошибки чтения файла
-            logger.error(
-                "Не удалось загрузить kubeconfig '%s': %s — K8s-инструменты "
-                "переходят в degraded-режим (пустые результаты)",
-                path,
-                exc,
-            )
-            return
+            # В кластере kubeconfig-файла нет: пробуем in-cluster config
+            # (ServiceAccount + projected token), прежде чем деградировать.
+            try:
+                kubernetes.config.load_incluster_config()
+                logger.info("K8sTools: using in-cluster config (ServiceAccount)")
+            except Exception:
+                logger.error(
+                    "Не удалось загрузить kubeconfig '%s' (%s) и in-cluster "
+                    "config — K8s-инструменты переходят в degraded-режим "
+                    "(пустые результаты)",
+                    path,
+                    exc,
+                )
+                return
         self._core = kubernetes.client.CoreV1Api()
         self._apps = kubernetes.client.AppsV1Api()
         logger.debug("K8sTools инициализирован (kubeconfig: %s)", path)

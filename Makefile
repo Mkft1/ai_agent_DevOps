@@ -1,7 +1,7 @@
 PYTHON=python3
 PIP=pip
 
-.PHONY: install lint test run docker-build chaos e2e jaeger eval dashboard
+.PHONY: install lint test run docker-build chaos e2e jaeger eval dashboard helm-lint helm-install
 
 install:
 	$(PIP) install -r requirements.txt -r requirements-dev.txt
@@ -34,3 +34,9 @@ eval:
 
 dashboard:
 	streamlit run ui/dashboard.py
+
+helm-lint:
+	helm lint charts/ai-agent
+
+helm-install:
+	helm upgrade --install ai-agent charts/ai-agent -f charts/ai-agent/values.yaml

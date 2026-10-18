@@ -191,3 +191,35 @@ class TestDegradedModeWithoutKubeconfig:
         assert degraded.get_events(namespace="default") == []
         assert degraded.get_deployments(namespace="default") == []
         assert degraded.get_nodes() == []
+
+
+class TestInClusterConfigFallback:
+    def test_incluster_used_when_kubeconfig_missing(self) -> None:
+        """В кластере нет kubeconfig: инструменты пользуют in-cluster config (SA)."""
+        with patch(
+            "src.agent.tools.k8s_tools.kubernetes.config.load_kube_config",
+            side_effect=Exception("no kubeconfig"),
+        ), patch(
+            "src.agent.tools.k8s_tools.kubernetes.config.load_incluster_config",
+        ) as incluster, patch(
+            "src.agent.tools.k8s_tools.kubernetes.client.CoreV1Api"
+        ) as core_cls, patch(
+            "src.agent.tools.k8s_tools.kubernetes.client.AppsV1Api"
+        ) as apps_cls:
+            tools = K8sTools(kubeconfig_path="/nonexistent")
+        incluster.assert_called_once()
+        assert tools.available is True
+        assert tools._core is core_cls.return_value
+        assert tools._apps is apps_cls.return_value
+
+    def test_degraded_when_both_configs_fail(self) -> None:
+        with patch(
+            "src.agent.tools.k8s_tools.kubernetes.config.load_kube_config",
+            side_effect=Exception("no kubeconfig"),
+        ), patch(
+            "src.agent.tools.k8s_tools.kubernetes.config.load_incluster_config",
+            side_effect=Exception("not in cluster"),
+        ):
+            tools = K8sTools(kubeconfig_path="/nonexistent")
+        assert tools.available is False
+        assert tools.get_pods(namespace="default") == []

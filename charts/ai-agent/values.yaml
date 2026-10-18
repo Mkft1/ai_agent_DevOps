@@ -1,0 +1,128 @@
+# Default values for ai-agent.
+# Все настройки приложения (env) зеркалят src/config.py (pydantic-settings).
+
+replicaCount: 1
+
+image:
+  repository: k8s-incident-agent
+  # tag по умолчанию = .Chart.AppVersion
+  tag: ""
+  pullPolicy: IfNotPresent
+
+imagePullSecrets: []
+nameOverride: ""
+fullnameOverride: ""
+
+serviceAccount:
+  create: true
+  # имя SA; по умолчанию fullname чарта. ВАЖНО: Kyverno-политика
+  # manifests/policies/kyverno-validate-actions.yaml матчит SA с именем ai-agent —
+  # для работы политик оставьте name: ai-agent или обновите политику.
+  name: "ai-agent"
+  annotations: {}
+
+rbac:
+  create: true
+  # Read-only правила (агент не выполняет write-операций).
+  rules:
+    - apiGroups: [""]
+      resources:
+        - pods
+        - pods/log
+        - events
+        - services
+        - configmaps
+        - persistentvolumeclaims
+        - replicationcontrollers
+      verbs: ["get", "list", "watch"]
+    - apiGroups: ["apps"]
+      resources: ["deployments", "replicasets", "statefulsets", "daemonsets"]
+      verbs: ["get", "list", "watch"]
+    - apiGroups: ["batch"]
+      resources: ["jobs", "cronjobs"]
+      verbs: ["get", "list", "watch"]
+
+service:
+  type: ClusterIP
+  port: 8000
+
+resources:
+  requests:
+    cpu: 250m
+    memory: 512Mi
+  limits:
+    cpu: "1"
+    memory: 2Gi
+
+# Не-секретные настройки приложения (попадают в ConfigMap, envFrom в Deployment).
+# Ключи = переменные окружения из src/config.py.
+env:
+  LOG_LEVEL: "INFO"
+  LOG_FORMAT: "text"
+  PROMETHEUS_URL: "http://prometheus.monitoring.svc.cluster.local:9090"
+  ALLOWED_NAMESPACES: '["default"]'
+  MAX_LOG_LINES: "200"
+  MAX_CONTEXT_CHARS: "16000"
+  ENABLE_WRITE_ACTIONS: "false"
+  LLM_OFFLINE: "false"
+  LLM_BASE_URL: "https://dashscope.aliyuncs.com/compatible-mode"
+  LLM_MODEL: "qwen-max"
+  ENABLE_HYBRID_RAG: "true"
+  EMBEDDING_MODEL: "all-MiniLM-L6-v2"
+  OTEL_SERVICE_NAME: "ai-agent"
+  # OTLP gRPC endpoint трейсов; пусто = экспорт отключён
+  OTEL_EXPORTER_OTLP_ENDPOINT: ""
+  # журнал аудита пишем на emptyDir-том (readOnlyRootFilesystem: true)
+  AUDIT_LOG_PATH: "/app/audit/audit.jsonl"
+
+secrets:
+  # Использовать существующий Secret (production: external-secrets/Vault) вместо
+  # создания из значений ниже. Ключи Secret'а: QWEN_API_KEY, OPENAI_API_KEY,
+  # SLACK_WEBHOOK_URL.
+  existingSecret: ""
+  # LLM API key (в спеке — LLM_API_KEY): приложение читает QWEN_API_KEY
+  # (приоритет) или OPENAI_API_KEY. Значения уходят в Secret base64-ом.
+  llmApiKey: ""
+  openaiApiKey: ""
+  slackWebhookUrl: ""
+
+# Каталог журнала аудита внутри пода (emptyDir-том; rootfs read-only).
+auditMountPath: /app/audit
+
+podAnnotations: {}
+podLabels: {}
+
+nodeSelector: {}
+tolerations: []
+affinity: {}
+
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 10001
+  runAsGroup: 10001
+  fsGroup: 10001
+  seccompProfile:
+    type: RuntimeDefault
+
+securityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  capabilities:
+    drop: ["ALL"]
+
+probes:
+  liveness:
+    path: /health
+    initialDelaySeconds: 10
+    periodSeconds: 30
+    timeoutSeconds: 5
+    failureThreshold: 3
+  readiness:
+    # /ready возвращает 503, если K8s API или Prometheus недоступны:
+    # без Prometheus под будет NotReady — задайте достижимый PROMETHEUS_URL
+    # или поправьте путь/пороги под свою среду.
+    path: /ready
+    initialDelaySeconds: 10
+    periodSeconds: 15
+    timeoutSeconds: 5
+    failureThreshold: 3
