@@ -1,13 +1,13 @@
 PYTHON=python3
 PIP=pip
 
-.PHONY: install lint test run docker-build chaos e2e jaeger
+.PHONY: install lint test run docker-build chaos e2e jaeger eval
 
 install:
 	$(PIP) install -r requirements.txt -r requirements-dev.txt
 
 lint:
-	ruff check src tests scripts
+	ruff check src tests scripts eval
 
 test:
 	pytest --cov=src --cov-report=term-missing tests/
@@ -28,3 +28,6 @@ jaeger:
 	docker rm -f jaeger 2>/dev/null || true
 	docker run -d --name jaeger -p 16686:16686 -p 4317:4317 jaegertracing/all-in-one:latest
 	@echo "Jaeger UI: http://localhost:16686 (OTLP gRPC: 4317)"
+
+eval:
+	$(PYTHON) eval/evaluate.py
