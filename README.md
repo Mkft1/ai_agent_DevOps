@@ -83,6 +83,16 @@ Pipeline in one line:
 `Alertmanager → POST /diagnose → IncidentOrchestrator → [K8sTools, PrometheusTools, LogsTools] → RunbookRAG → LLM → RCA → Report`
 
 ---
+## Architecture Decisions
+
+A few deliberate trade-offs worth knowing about:
+
+1. **TF-IDF RAG instead of a vector database.** Runbooks are small (a handful of Markdown files), so scikit-learn's `TfidfVectorizer` gives good-enough retrieval with **zero external infrastructure** — no embeddings API, no Chroma/Qdrant sidecar, no extra network hop. The index is rebuilt in-process at startup; adding knowledge is just dropping a `.md` file into `docs/runbooks/`. Swapping to embeddings later only touches `src/agent/rag.py`.
+2. **FastAPI + pydantic-settings.** FastAPI gives async request handling, automatic OpenAPI docs (`/docs` Swagger UI) and request/response validation out of the box; pydantic models make the incident contract (`Incident`, `Diagnosis`) explicit and testable, and all configuration is env-driven via one `Settings` class.
+3. **Strict JSON output validated by Pydantic, with one retry and an honest fallback.** Instead of trusting free-form LLM prose, the system prompt demands a fixed JSON schema; invalid responses trigger a single correction retry, then a deterministic fallback diagnosis (`severity="unknown"`) — the pipeline never returns garbage or crashes because of the model.
+4. **Read-only by default + graceful degradation.** The agent suggests fixes rather than executing them (`ENABLE_WRITE_ACTIONS=false`), and any failing data source becomes a warning in the report instead of an exception — safe to wire directly into production alert pipelines.
+5. **OpenAI-compatible client over raw HTTP (requests + tenacity).** No heavyweight SDK lock-in: works with Qwen/DashScope, OpenAI, or any self-hosted compatible gateway by changing two env vars (`LLM_BASE_URL`, `LLM_MODEL`).
+---
 
 ## Quick Start
 
@@ -132,6 +142,29 @@ make e2e           # bash scripts/run_integration_test.sh (kind cluster, end-to-
 ```
 
 The Makefile is a convenience wrapper only — it does not change or replace CI/CD.
+
+#### Real `/diagnose` response (OOMKilled incident)
+
+The agent retrieves the matching runbook (`docs/runbooks/oom_killed.md`) via RAG and grounds the fix on it:
+
+```json
+{
+  "diagnosis": {
+    "root_cause": "Container 'payments-api' is being OOMKilled: working set (~488 MiB) has reached the 512Mi memory limit; the batch allocation at 09:40:55 triggers a cgroup OOM kill (3 restarts, matching Warning events).",
+    "evidence": [
+      "container_memory_working_set_bytes = 511705088 bytes (~488 MiB) vs limit 512Mi",
+      "Pod status shows 5 restarts; last state reason: OOMKilled",
+      "K8s Warning event 'OOMKilling' for pod/payments-api-7d9f4b-x2kq",
+      "Logs: 'fatal error: runtime: out of memory' right before container exit",
+      "Runbook oom_killed.md: raise memory limit or cap batch size"
+    ],
+    "suggested_fix": "Increase the container memory limit to 1Gi (kubectl patch) and cap the batch buffer size via PAYMENTS_BATCH_MB=128; then roll the deployment and watch restarts drop to zero.",
+    "severity": "high",
+    "warnings": []
+  },
+  "report": "🟠 Incident: diagnosis (severity: high)\nNamespace: default, Pod: payments-api-7d9f4b-x2kq\n..."
+}
+```
 
 ### 3. Run with Docker
 
