@@ -641,6 +641,14 @@ registry path/credentials (imagePullSecrets), then delete the pod to force a fre
 > Пример сгенерирован реальным пайплайном оркестратора (мок инструментов + LLM-ответ уровня
 > qwen-max); фактический текст LLM может отличаться в зависимости от модели.
 
+## Документация
+
+| Документ | Для кого | Содержание |
+|---|---|---|
+| [`docs/OPERATIONS.md`](./docs/OPERATIONS.md) | **Дежурные инженеры** | Порядок действий при `severity: critical` и проверка безопасности фикса, реакция на `warnings` (деградация источников данных), добавление runbook'ов, обновление golden-датасета, troubleshooting (429 от LLM, загрузка embedding-модели) |
+| [`docs/runbooks/`](./docs/runbooks/) | База знаний SRE | 8 peer-reviewed runbook'ов, которые агент подтягивает гибридным RAG |
+| [`CONTRIBUTING.md`](./CONTRIBUTING.md) | Разработчики | Окружение разработки, правила тестов/линта, процесс PR |
+
 ## Лицензия
 
 MIT — см. [LICENSE](./LICENSE).
