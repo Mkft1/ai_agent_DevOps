@@ -11,11 +11,13 @@
 
 from __future__ import annotations
 
+import json
 import os
 import uuid
 
 import requests
 from fastapi import Depends, FastAPI, HTTPException, Request
+from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from prometheus_fastapi_instrumentator import Instrumentator
@@ -30,7 +32,9 @@ from src.agent.orchestrator import (
     LLMClientStub,
     NamespaceNotAllowedError,
 )
+from src.api.models import AlertmanagerPayload, AlertmanagerWebhookResponse
 from src.config import Settings, get_settings
+from src.utils.audit import log_audit_event
 from src.utils.logger import get_logger, request_id_var, setup_logging
 
 settings = get_settings()
@@ -159,6 +163,20 @@ def run_health_check() -> dict[str, str]:
 
 
 # ----------------------------------------------------------------------
+# Ошибки валидации/парсинга тела запроса: 422 по умолчанию, но для
+# webhook Alertmanager контракт требует 400 (некорректный JSON/схема).
+# ----------------------------------------------------------------------
+@app.exception_handler(RequestValidationError)
+async def request_validation_handler(request: Request, exc: RequestValidationError) -> JSONResponse:
+    """Возвращает 400 для /webhook/alertmanager и 422 для остальных эндпоинтов."""
+    status = 400 if request.url.path == "/webhook/alertmanager" else 422
+    return JSONResponse(
+        status_code=status,
+        content={"detail": json.loads(json.dumps(exc.errors(), default=str))},
+    )
+
+
+# ----------------------------------------------------------------------
 # Глобальный обработчик необработанных исключений -> 500 {"detail": ...}
 # ----------------------------------------------------------------------
 @app.exception_handler(Exception)
@@ -249,17 +267,98 @@ def diagnose(
     except NamespaceNotAllowedError as exc:
         # Guardrail: запрещённый namespace — запрос не выполняется.
         logger.warning("Guardrail rejected incident: %s", exc)
+        log_audit_event(
+            "guardrail_rejected",
+            incident.model_dump(),
+            {"root_cause": f"guardrail: {exc}", "severity": "unknown"},
+        )
         raise HTTPException(status_code=403, detail=str(exc)) from exc
     except ValidationError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
     except Exception as exc:
         logger.exception("Diagnosis failed for incident %s: %s", incident, exc)
+        log_audit_event(
+            "diagnose_failed",
+            incident.model_dump(),
+            {"root_cause": f"exception: {exc}", "severity": "unknown"},
+        )
         raise HTTPException(status_code=500, detail=f"Diagnosis failed: {exc}") from exc
 
+    log_audit_event("diagnose", incident.model_dump(), diagnosis_dict)
     report = orchestrator.format_report(diagnosis_dict)
     return DiagnosisResponse(
         diagnosis=Diagnosis.model_validate(diagnosis_dict),
         report=report,
+    )
+
+
+@app.post("/webhook/alertmanager", response_model=AlertmanagerWebhookResponse)
+def webhook_alertmanager(
+    payload: AlertmanagerPayload,
+    orchestrator: IncidentOrchestrator = Depends(get_orchestrator),
+) -> AlertmanagerWebhookResponse:
+    """Webhook для Alertmanager: диагностика всех firing-алертов пейлоада.
+
+    Контракт: принимаем стандартный пейлоад Alertmanager (``version``/
+    ``status``/``alerts``); из каждого firing-алерта извлекаются namespace
+    (``labels.namespace``), pod (``labels.pod``/``pod_name``) и описание
+    (``annotations.summary`` || ``annotations.description``) и передаются
+    в :meth:`IncidentOrchestrator.diagnose`. Resolved-алерты пропускаются.
+    Ошибки парсинга JSON/схемы -> 400 (см. ``request_validation_handler``).
+    Каждое событие пишется в журнал аудита (``src/utils/audit.py``).
+    """
+    firing = payload.firing_alerts
+    skipped = len(payload.alerts) - len(firing)
+    if not firing:
+        logger.info(
+            "Alertmanager webhook: no firing alerts (status=%s, alerts=%d)",
+            payload.status,
+            len(payload.alerts),
+        )
+        log_audit_event(
+            "alertmanager_no_firing",
+            {"status": payload.status, "alerts": len(payload.alerts)},
+            {},
+        )
+        return AlertmanagerWebhookResponse(processed=0, skipped=skipped, diagnoses=[])
+
+    diagnoses: list[dict] = []
+    for alert in firing:
+        incident = alert.to_incident()
+        logger.info(
+            "Alertmanager firing alert: name=%s ns=%s pod=%s fingerprint=%s",
+            alert.labels.get("alertname"),
+            incident.namespace,
+            incident.pod_name,
+            alert.fingerprint,
+        )
+        try:
+            diagnosis_dict = orchestrator.diagnose(incident)
+        except NamespaceNotAllowedError as exc:
+            # Guardrail: запрещённый namespace — алерт пропускаем, не роняем батч.
+            logger.warning("Guardrail rejected alert: %s", exc)
+            log_audit_event(
+                "guardrail_rejected",
+                incident.model_dump(),
+                {"root_cause": f"guardrail: {exc}", "severity": "unknown"},
+            )
+            skipped += 1
+            continue
+        except Exception as exc:
+            logger.exception("Diagnosis failed for alert %s", alert.labels.get("alertname"))
+            log_audit_event(
+                "diagnose_failed",
+                incident.model_dump(),
+                {"root_cause": f"exception: {exc}", "severity": "unknown"},
+            )
+            raise HTTPException(status_code=500, detail=f"Diagnosis failed: {exc}") from exc
+
+        log_audit_event("alertmanager_diagnose", incident.model_dump(), diagnosis_dict)
+        report = orchestrator.format_report(diagnosis_dict)
+        diagnoses.append({"diagnosis": diagnosis_dict, "report": report})
+
+    return AlertmanagerWebhookResponse(
+        processed=len(diagnoses), skipped=skipped, diagnoses=diagnoses
     )
 
 

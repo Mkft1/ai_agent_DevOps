@@ -11,7 +11,7 @@ AI-агент для диагностики инцидентов в Kubernetes. 
 [![Python 3.12](https://img.shields.io/badge/python-3.12-blue?logo=python&logoColor=white)](https://www.python.org/downloads/)
 [![Docker](https://img.shields.io/badge/docker-multistage%20image-2496ED?logo=docker&logoColor=white)](./Dockerfile)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](./LICENSE)
-[![Tests](https://img.shields.io/badge/tests-139%20passed-brightgreen?logo=pytest&logoColor=white)](#тесты)
+[![Tests](https://img.shields.io/badge/tests-153%20passed-brightgreen?logo=pytest&logoColor=white)](#тесты)
 [![Ruff](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/astral-sh/ruff/main/assets/badge/v2.json)](https://github.com/astral-sh/ruff)
 
 AI-агент для диагностики инцидентов в Kubernetes.
@@ -78,11 +78,17 @@ Alertmanager → /diagnose → IncidentOrchestrator → [K8sTools, PrometheusToo
   продолжается с частичными данными; ретраи tenacity с экспоненциальной задержкой.
   Отсутствие kubeconfig при старте деградирует K8s/логи до пустых результатов, а отсутствие
   LLM-ключа даёт честный `503` с подсказкой (или stub-режим при `LLM_OFFLINE=true`) — не `500`.
-- **Наблюдаемость** — `X-Request-ID` в каждом ответе (эхо входящего или сгенерированный)
-  и структурированное JSON-логирование (`LOG_FORMAT=json`) с корреляцией по `request_id`.
+- **Наблюдаемость** — `X-Request-ID` в каждом ответе (эхо входящего или сгенерированный),
+  структурированное JSON-логирование (`LOG_FORMAT=json`) с корреляцией по `request_id`
+  и append-only журнал аудита (`AUDIT_LOG_PATH`, JSON Lines): каждая диагностика,
+  отклонение guardrail'ом и webhook-батч пишутся одной JSON-строкой.
+- **Интеграция с Alertmanager** — `POST /webhook/alertmanager` принимает стандартный
+  пейлоад (version/status/alerts), диагностирует каждый `firing`-алерт (namespace и pod
+  из `labels`, текст из `annotations.summary`/`description`), пропускает `resolved`
+  и возвращает `400` на битом JSON/схеме.
 - **Безопасность (guardrails)** — read-only по умолчанию, белый список namespace'ов,
   лимит строк логов, секреты только через `.env`, non-root контейнер, `.dockerignore`.
-- **Тестирование** — 139 unit/интеграционных тестов (pytest + unittest.mock), покрытие ~92%
+- **Тестирование** — 153 unit/интеграционных тестов (pytest + unittest.mock), покрытие ~92%
   (гейт в CI `--cov-fail-under=85`): инструменты, оркестратор, LLM-клиент (мок HTTP),
   FastAPI-эндпоинты (TestClient), конфигурация и логирование, chaos-скрипт.
 - **DevOps-практики** — многоступенчатый Docker-образ, docker-compose, идемпотентный
@@ -112,7 +118,9 @@ ai_agent_DevOps/
 │   └── workflows/
 │       └── ci.yml         # CI: lint (ruff) -> test (pytest+cov) -> build (Docker, no push)
 ├── src/
-│   ├── main.py            # Точка входа FastAPI-приложения
+│   ├── main.py            # Точка входа FastAPI: /health /ready /diagnose /metrics /webhook/alertmanager
+│   ├── api/
+│   │   └── models.py      # pydantic-контракты: пейлоад Alertmanager -> Incident
 │   ├── config.py          # Загрузка конфигурации из .env
 │   ├── agent/
 │   │   ├── orchestrator.py  # Оркестрация шагов диагностики (K8s -> контекст -> LLM -> RCA)
@@ -125,6 +133,7 @@ ai_agent_DevOps/
 │   ├── prompts/
 │   │   └── sre_system.txt # Системный промт SRE-эксперта (редактируется без кода)
 │   └── utils/
+│       ├── audit.py       # Журнал аудита диагностик (append-only JSON Lines)
 │       ├── logger.py      # Базовое логирование
 │       ├── metrics.py     # Кастомные Prometheus-метрики агента
 │       └── text_utils.py  # truncate_context: рекурсивная обрезка контекста для LLM
@@ -221,6 +230,7 @@ curl http://localhost:8000/health
 | `MAX_CONTEXT_CHARS` | `16000`                                    | Максимальный размер контекста (в символах), передаваемого в LLM; при превышении обрезается с пометкой |
 | `LOG_FORMAT`      | `text`                                         | Формат логов: `text` (человекочитаемый) или `json` (structured logging для Loki/CloudWatch) |
 | `LLM_OFFLINE`     | `false`                                        | Демо/оффлайн-режим: без LLM-ключа `/diagnose` отвечает stub-диагнозом вместо честного `503`; в проде держите `false` |
+| `AUDIT_LOG_PATH`  | `audit.jsonl`                                  | Append-only журнал аудита (JSON Lines): по одной JSON-строке на диагностику / guardrail-отклонение / webhook-батч |
 
 ## Безопасность (guardrails)
 
@@ -288,9 +298,34 @@ OpenAI-совместимого провайдера + `LLM_BASE_URL`).
 | GET   | `/ready`    | Проверка доступности K8s API и Prometheus → 200 / 503           |
 | GET   | `/metrics`  | Prometheus-метрики (HTTP + кастомные метрики агента)            |
 | POST  | `/diagnose` | Приём инцидента и запуск диагностики через оркестратор          |
+| POST  | `/webhook/alertmanager` | Webhook Alertmanager: диагностика firing-алертов → `{processed, skipped, diagnoses}`; `400` на невалидном пейлоаде |
 
 Все HTTP-ответы несут заголовок `X-Request-ID` (входящий эхом либо сгенерированный) —
 он же попадает в JSON-логи (`LOG_FORMAT=json`) для корреляции запросов и логов.
+
+### Интеграция с Alertmanager
+
+Достаточно направить Alertmanager на агента — каждый firing-алерт превратится в RCA:
+
+```yaml
+# alertmanager.yml
+route:
+  receiver: ai-agent
+  group_by: [alertname, namespace]
+receivers:
+  - name: ai-agent
+    webhook_configs:
+      - url: http://<agent-host>:8000/webhook/alertmanager
+        send_resolved: true   # resolved-алерты агент пропускает (skipped), аудит их видит
+```
+
+Поведение эндпоинта: `labels.namespace` → namespace инцидента (по умолчанию `default`),
+`labels.pod` / `labels.pod_name` → имя пода, `annotations.summary` (иначе
+`annotations.description`, иначе `alertname`) → описание; каждый диагноз пишется
+в журнал аудита (`AUDIT_LOG_PATH`) и возвращается в `diagnoses[]` вместе с готовым
+`report` для Slack/Telegram. Битый JSON или схема → `400`; алерт с запрещённым
+namespace пропускается (`skipped++`, событие `guardrail_rejected` в аудите),
+не роняя остальной батч.
 
 ### Метрики (`/metrics`)
 
@@ -400,9 +435,10 @@ ruff check src tests scripts
 python -m pytest --cov=src --cov-report=xml tests/
 ```
 
-Текущий набор: **139 passed**, покрытие **~92%** (инструменты K8s/Prometheus/логов,
-оркестратор, LLM-клиент с моками HTTP, FastAPI-эндпоинты через TestClient,
-валидация конфигурации, JSON-логирование, chaos-скрипт).
+Текущий набор: **153 passed**, покрытие **~92%** (инструменты K8s/Prometheus/логов,
+оркестратор, LLM-клиент с моками HTTP, FastAPI-эндпоинты через TestClient (включая
+webhook Alertmanager и журнал аудита), валидация конфигурации, JSON-логирование,
+chaos-скрипт).
 
 ## CI/CD
 

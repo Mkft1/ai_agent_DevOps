@@ -27,9 +27,10 @@ The agent is strictly **read-only by default**: it never mutates the cluster (`E
 | 📈 **Prometheus integration** | instant & range queries, per-pod CPU/memory usage via `container_*` cAdvisor metrics. |
 | 🛡️ **Guardrails** | Namespace allow-list (`ALLOWED_NAMESPACES`), log-size cap (`MAX_LOG_LINES`), context-size cap (`MAX_CONTEXT_CHARS`), read-only mode (`ENABLE_WRITE_ACTIONS`). All configurable via `.env`, nothing hardcoded. |
 | 🩹 **Graceful degradation** | If any data source fails (K8s API down, Prometheus unreachable, empty logs), the agent records a warning in the report and continues diagnosing with whatever data it has — it never crashes the pipeline. |
-| 📊 **Observability** | `/metrics` endpoint (`prometheus-fastapi-instrumentator`) + custom counters/histograms: `diagnose_requests_total`, `diagnose_duration_seconds`, `k8s_api_errors_total`, `llm_fallback_total`. `X-Request-ID` correlation (echoed/generated per request) and optional structured JSON logging (`LOG_FORMAT=json`) for Loki/CloudWatch. |
+| 📊 **Observability** | `/metrics` endpoint (`prometheus-fastapi-instrumentator`) + custom counters/histograms: `diagnose_requests_total`, `diagnose_duration_seconds`, `k8s_api_errors_total`, `llm_fallback_total`. `X-Request-ID` correlation (echoed/generated per request), optional structured JSON logging (`LOG_FORMAT=json`) for Loki/CloudWatch, and an append-only audit journal (`AUDIT_LOG_PATH`, JSON Lines) of every diagnosis. |
+| 🚨 **Alertmanager webhook** | `POST /webhook/alertmanager` accepts the standard Alertmanager payload, diagnoses every `firing` alert (namespace/pod from labels, text from `annotations.summary`/`description`), skips `resolved`, and answers `400` on malformed payloads. |
 | 🔁 **Chaos self-test** | `scripts/chaos_test.py` creates an ImagePullBackOff pod, asks the agent to diagnose it, asserts the RCA mentions "image"/"pull", and cleans up. Idempotent. |
-| 🧪 **Testing & CI/CD** | 139 unit/integration tests with mocked clients (92% coverage, CI gate `--cov-fail-under=85`); GitHub Actions pipeline: lint → test+coverage → Docker build+smoke → kind-based e2e on `main` (auto-skipped when no LLM secret is configured). |
+| 🧪 **Testing & CI/CD** | 153 unit/integration tests with mocked clients (92% coverage, CI gate `--cov-fail-under=85`); GitHub Actions pipeline: lint → test+coverage → Docker build+smoke → kind-based e2e on `main` (auto-skipped when no LLM secret is configured). |
 | 🐳 **Containerized** | Multi-stage `python:3.12-slim` image, non-root user, healthcheck, no secrets baked into the image. |
 
 ---
@@ -112,6 +113,7 @@ cp .env.example .env
 | `ENABLE_WRITE_ACTIONS` | `false` | Read-only mode. No write path exists in the codebase today. |
 | `LOG_FORMAT` | `text` | `text` (human-readable) or `json` (one JSON object per line for log aggregators). |
 | `LLM_OFFLINE` | `false` | Demo/offline mode: without an LLM key `/diagnose` answers with the deterministic `LLMClientStub` instead of an honest `503`. Keep `false` in production. |
+| `AUDIT_LOG_PATH` | `audit.jsonl` | Append-only audit journal (JSON Lines): one record per diagnosis / guardrail rejection / webhook batch. |
 
 ### 2. Run locally
 
@@ -188,6 +190,7 @@ docker compose up --build
 | `GET` | `/health` | Liveness probe → `{"status": "ok"}`. |
 | `GET` | `/ready` | Checks K8s API + Prometheus reachability → `200` or `503`. |
 | `POST` | `/diagnose` | Accepts an incident, returns `{diagnosis, report}`. |
+| `POST` | `/webhook/alertmanager` | Alertmanager webhook: diagnoses firing alerts, returns `{processed, skipped, diagnoses}`; `400` on invalid JSON/schema. |
 | `GET` | `/metrics` | Prometheus exposition format (HTTP + custom metrics). |
 
 All responses carry an `X-Request-ID` header (echoed when provided by the client/LB, generated otherwise); the same id appears in JSON logs (`LOG_FORMAT=json`) for request/log correlation.
@@ -249,6 +252,24 @@ curl -s -X POST http://localhost:8000/diagnose \
 }
 ```
 
+### Alertmanager integration
+
+Point Alertmanager at the agent — every firing alert becomes a full RCA:
+
+```yaml
+# alertmanager.yml
+route:
+  receiver: ai-agent
+  group_by: [alertname, namespace]
+receivers:
+  - name: ai-agent
+    webhook_configs:
+      - url: http://<agent-host>:8000/webhook/alertmanager
+        send_resolved: true   # resolved-алерты агент пропускает (skipped), но аудит получает
+```
+
+Behaviour: `labels.namespace` → incident namespace (default `default`), `labels.pod`/`labels.pod_name` → pod, `annotations.summary` (else `annotations.description`, else `alertname`) → description; each diagnosis is written to the audit journal (`AUDIT_LOG_PATH`) and returned in `diagnoses[]` together with the Slack/Telegram-ready `report`. Malformed JSON or schema violations return `400`; a guardrail-rejected namespace skips that alert (`skipped++`) instead of failing the whole batch.
+
 ---
 
 ## Security & Guardrails
@@ -278,6 +299,7 @@ tests/
 ├── test_chaos_test.py        # chaos script logic (mocked k8s + requests)
 ├── test_config.py            # Settings validators: fail-fast on bad LOG_LEVEL/LOG_FORMAT/limits
 ├── test_logger.py            # JSON structured logging + request_id correlation
+├── test_webhook_alertmanager.py  # Alertmanager payload parsing, 400s, resolved-skip, audit journal
 └── test_api.py               # FastAPI TestClient: /health /ready /diagnose /metrics, CORS, errors, X-Request-ID
 ```
 
@@ -337,7 +359,8 @@ ai_agent_DevOps/
 │   ├── run_integration_test.sh  # kind-based end-to-end test
 │   └── kind/cluster.yaml        # kind cluster config
 ├── src/
-│   ├── main.py                  # FastAPI app: /health /ready /diagnose /metrics, CORS, error handlers
+│   ├── main.py                  # FastAPI app: /health /ready /diagnose /metrics /webhook/alertmanager
+│   ├── api/models.py            # pydantic contracts: Alertmanager payload -> Incident
 │   ├── config.py                # pydantic-settings (.env driven)
 │   ├── prompts/sre_system.txt   # system prompt for the LLM (loaded at init, fallback in code)
 │   ├── agent/
@@ -346,10 +369,11 @@ ai_agent_DevOps/
 │   │   ├── rag.py               # RunbookRAG: TF-IDF retrieval over docs/runbooks
 │   │   └── tools/               # k8s_tools.py, prometheus_tools.py, logs_tools.py
 │   └── utils/
+│       ├── audit.py             # append-only audit journal (JSON Lines)
 │       ├── logger.py            # stdlib logging setup
 │       ├── metrics.py           # custom Prometheus metrics
 │       └── text_utils.py        # truncate_context (bounded, JSON-safe)
-└── tests/                       # 139 tests, fully mocked externals
+└── tests/                       # 153 tests, fully mocked externals
 ```
 
 ---
