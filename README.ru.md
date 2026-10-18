@@ -11,7 +11,7 @@ AI-агент для диагностики инцидентов в Kubernetes. 
 [![Python 3.12](https://img.shields.io/badge/python-3.12-blue?logo=python&logoColor=white)](https://www.python.org/downloads/)
 [![Docker](https://img.shields.io/badge/docker-multistage%20image-2496ED?logo=docker&logoColor=white)](./Dockerfile)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](./LICENSE)
-[![Tests](https://img.shields.io/badge/tests-153%20passed-brightgreen?logo=pytest&logoColor=white)](#тесты)
+[![Tests](https://img.shields.io/badge/tests-160%20passed-brightgreen?logo=pytest&logoColor=white)](#тесты)
 [![Ruff](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/astral-sh/ruff/main/assets/badge/v2.json)](https://github.com/astral-sh/ruff)
 
 AI-агент для диагностики инцидентов в Kubernetes.
@@ -79,16 +79,17 @@ Alertmanager → /diagnose → IncidentOrchestrator → [K8sTools, PrometheusToo
   Отсутствие kubeconfig при старте деградирует K8s/логи до пустых результатов, а отсутствие
   LLM-ключа даёт честный `503` с подсказкой (или stub-режим при `LLM_OFFLINE=true`) — не `500`.
 - **Наблюдаемость** — `X-Request-ID` в каждом ответе (эхо входящего или сгенерированный),
-  структурированное JSON-логирование (`LOG_FORMAT=json`) с корреляцией по `request_id`
-  и append-only журнал аудита (`AUDIT_LOG_PATH`, JSON Lines): каждая диагностика,
-  отклонение guardrail'ом и webhook-батч пишутся одной JSON-строкой.
+  структурированное JSON-логирование (`LOG_FORMAT=json`) с корреляцией по `request_id`,
+  append-only журнал аудита (`AUDIT_LOG_PATH`, JSON Lines) и **распределённый трейсинг
+  OpenTelemetry**: авто-спаны на каждый HTTP-запрос плюс ручные спаны на каждый вызов
+  K8s/Prometheus/логов/RAG/LLM с экспортом по OTLP в Jaeger/Tempo.
 - **Интеграция с Alertmanager** — `POST /webhook/alertmanager` принимает стандартный
   пейлоад (version/status/alerts), диагностирует каждый `firing`-алерт (namespace и pod
   из `labels`, текст из `annotations.summary`/`description`), пропускает `resolved`
   и возвращает `400` на битом JSON/схеме.
 - **Безопасность (guardrails)** — read-only по умолчанию, белый список namespace'ов,
   лимит строк логов, секреты только через `.env`, non-root контейнер, `.dockerignore`.
-- **Тестирование** — 153 unit/интеграционных тестов (pytest + unittest.mock), покрытие ~92%
+- **Тестирование** — 160 unit/интеграционных тестов (pytest + unittest.mock), покрытие ~92%
   (гейт в CI `--cov-fail-under=85`): инструменты, оркестратор, LLM-клиент (мок HTTP),
   FastAPI-эндпоинты (TestClient), конфигурация и логирование, chaos-скрипт.
 - **DevOps-практики** — многоступенчатый Docker-образ, docker-compose, идемпотентный
@@ -231,6 +232,8 @@ curl http://localhost:8000/health
 | `LOG_FORMAT`      | `text`                                         | Формат логов: `text` (человекочитаемый) или `json` (structured logging для Loki/CloudWatch) |
 | `LLM_OFFLINE`     | `false`                                        | Демо/оффлайн-режим: без LLM-ключа `/diagnose` отвечает stub-диагнозом вместо честного `503`; в проде держите `false` |
 | `AUDIT_LOG_PATH`  | `audit.jsonl`                                  | Append-only журнал аудита (JSON Lines): по одной JSON-строке на диагностику / guardrail-отклонение / webhook-батч |
+| `OTEL_EXPORTER_OTLP_ENDPOINT` | — (выключено)                   | OTLP/gRPC endpoint экспорта трейсов, напр. `http://localhost:4317` (Jaeger); без значения спаны не экспортируются |
+| `OTEL_SERVICE_NAME` | `ai-agent-devops`                            | Имя сервиса (`service.name`) в UI Jaeger/Tempo |
 
 ## Безопасность (guardrails)
 
@@ -326,6 +329,45 @@ receivers:
 `report` для Slack/Telegram. Битый JSON или схема → `400`; алерт с запрещённым
 namespace пропускается (`skipped++`, событие `guardrail_rejected` в аудите),
 не роняя остальной батч.
+
+### Трейсинг (OpenTelemetry)
+
+Трейсы показывают, куда уходят миллисекунды диагностики: K8s API, Prometheus,
+чтение логов, RAG-поиск или «раздумья» LLM.
+
+* **Авто-спаны HTTP** — каждый запрос (`GET /health`, `POST /diagnose`, ...) получает
+  серверный спан через `FastAPIInstrumentor.instrument_app(app)`.
+* **Ручные спаны** в `IncidentOrchestrator` образуют дерево инцидента:
+
+```
+incident.diagnose            (incident.namespace, incident.severity, incident.warnings)
+├── k8s.get_pods             (k8s.namespace, k8s.pods_found)
+├── k8s.get_events           (k8s.namespace, k8s.events_found)
+├── prometheus.pod_cpu       (k8s.pod)
+├── prometheus.pod_memory    (k8s.pod)
+├── logs.pod_tail            (k8s.pod, logs.tail_lines, logs.bytes)
+├── rag.search               (rag.top_k, rag.matches)
+└── llm.generate             (llm.model, llm.ok, llm.response_chars)
+```
+
+* Сбой инструмента фиксируется на спане (`record_exception` + статус `ERROR`) —
+  деградация видна в трейсе, а не только в логах.
+* Экспорт **опционален**: задайте `OTEL_EXPORTER_OTLP_ENDPOINT` (OTLP/gRPC);
+  без него спаны собираются in-process и никуда не отправляются (CI/оффлайн без
+  внешних эффектов).
+
+#### Локально с Jaeger
+
+```bash
+make jaeger          # или: docker run -d --name jaeger -p 16686:16686 -p 4317:4317 jaegertracing/all-in-one:latest
+OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4317 uvicorn src.main:app --port 8000
+curl -s -X POST localhost:8000/diagnose -H 'Content-Type: application/json' \
+     -d '{"namespace":"default","pod_name":"web-1","description":"pod restarts"}'
+```
+
+Откройте UI Jaeger **http://localhost:16686**, выберите сервис `ai-agent-devops`
+(имя меняется через `OTEL_SERVICE_NAME`) и посмотрите дерево трейса `incident.diagnose`.
+Тот же endpoint подходит Tempo/OpenTelemetry Collector — любому приёмнику OTLP/gRPC.
 
 ### Метрики (`/metrics`)
 
@@ -435,10 +477,10 @@ ruff check src tests scripts
 python -m pytest --cov=src --cov-report=xml tests/
 ```
 
-Текущий набор: **153 passed**, покрытие **~92%** (инструменты K8s/Prometheus/логов,
+Текущий набор: **160 passed**, покрытие **~92%** (инструменты K8s/Prometheus/логов,
 оркестратор, LLM-клиент с моками HTTP, FastAPI-эндпоинты через TestClient (включая
 webhook Alertmanager и журнал аудита), валидация конфигурации, JSON-логирование,
-chaos-скрипт).
+трейсинг OpenTelemetry, chaos-скрипт).
 
 ## CI/CD
 
