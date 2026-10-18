@@ -27,10 +27,10 @@ The agent is strictly **read-only by default**: it never mutates the cluster (`E
 | 📈 **Prometheus integration** | instant & range queries, per-pod CPU/memory usage via `container_*` cAdvisor metrics. |
 | 🛡️ **Guardrails** | Namespace allow-list (`ALLOWED_NAMESPACES`), log-size cap (`MAX_LOG_LINES`), context-size cap (`MAX_CONTEXT_CHARS`), read-only mode (`ENABLE_WRITE_ACTIONS`). All configurable via `.env`, nothing hardcoded. |
 | 🩹 **Graceful degradation** | If any data source fails (K8s API down, Prometheus unreachable, empty logs), the agent records a warning in the report and continues diagnosing with whatever data it has — it never crashes the pipeline. |
-| 📊 **Observability** | `/metrics` endpoint (`prometheus-fastapi-instrumentator`) + custom counters/histograms: `diagnose_requests_total`, `diagnose_duration_seconds`, `k8s_api_errors_total`, `llm_fallback_total`. `X-Request-ID` correlation (echoed/generated per request), optional structured JSON logging (`LOG_FORMAT=json`) for Loki/CloudWatch, and an append-only audit journal (`AUDIT_LOG_PATH`, JSON Lines) of every diagnosis. |
+| 📊 **Observability** | `/metrics` endpoint (`prometheus-fastapi-instrumentator`) + custom counters/histograms: `diagnose_requests_total`, `diagnose_duration_seconds`, `k8s_api_errors_total`, `llm_fallback_total`. `X-Request-ID` correlation (echoed/generated per request), optional structured JSON logging (`LOG_FORMAT=json`) for Loki/CloudWatch, an append-only audit journal (`AUDIT_LOG_PATH`, JSON Lines) of every diagnosis, and **OpenTelemetry distributed tracing** (auto HTTP spans + manual spans per K8s/Prometheus/logs/RAG/LLM call, OTLP export to Jaeger/Tempo). |
 | 🚨 **Alertmanager webhook** | `POST /webhook/alertmanager` accepts the standard Alertmanager payload, diagnoses every `firing` alert (namespace/pod from labels, text from `annotations.summary`/`description`), skips `resolved`, and answers `400` on malformed payloads. |
 | 🔁 **Chaos self-test** | `scripts/chaos_test.py` creates an ImagePullBackOff pod, asks the agent to diagnose it, asserts the RCA mentions "image"/"pull", and cleans up. Idempotent. |
-| 🧪 **Testing & CI/CD** | 153 unit/integration tests with mocked clients (92% coverage, CI gate `--cov-fail-under=85`); GitHub Actions pipeline: lint → test+coverage → Docker build+smoke → kind-based e2e on `main` (auto-skipped when no LLM secret is configured). |
+| 🧪 **Testing & CI/CD** | 160 unit/integration tests with mocked clients (92% coverage, CI gate `--cov-fail-under=85`); GitHub Actions pipeline: lint → test+coverage → Docker build+smoke → kind-based e2e on `main` (auto-skipped when no LLM secret is configured). |
 | 🐳 **Containerized** | Multi-stage `python:3.12-slim` image, non-root user, healthcheck, no secrets baked into the image. |
 
 ---
@@ -114,6 +114,8 @@ cp .env.example .env
 | `LOG_FORMAT` | `text` | `text` (human-readable) or `json` (one JSON object per line for log aggregators). |
 | `LLM_OFFLINE` | `false` | Demo/offline mode: without an LLM key `/diagnose` answers with the deterministic `LLMClientStub` instead of an honest `503`. Keep `false` in production. |
 | `AUDIT_LOG_PATH` | `audit.jsonl` | Append-only audit journal (JSON Lines): one record per diagnosis / guardrail rejection / webhook batch. |
+| `OTEL_EXPORTER_OTLP_ENDPOINT` | — (disabled) | OTLP/gRPC endpoint for trace export, e.g. `http://localhost:4317` (Jaeger). Unset = tracing collects spans in-process, no export. |
+| `OTEL_SERVICE_NAME` | `ai-agent-devops` | `service.name` resource attribute shown in Jaeger/Tempo. |
 
 ### 2. Run locally
 
@@ -270,6 +272,42 @@ receivers:
 
 Behaviour: `labels.namespace` → incident namespace (default `default`), `labels.pod`/`labels.pod_name` → pod, `annotations.summary` (else `annotations.description`, else `alertname`) → description; each diagnosis is written to the audit journal (`AUDIT_LOG_PATH`) and returned in `diagnoses[]` together with the Slack/Telegram-ready `report`. Malformed JSON or schema violations return `400`; a guardrail-rejected namespace skips that alert (`skipped++`) instead of failing the whole batch.
 
+## Tracing (OpenTelemetry)
+
+The agent emits **distributed traces** so you can see exactly where milliseconds go:
+K8s API calls, Prometheus queries, log tails, RAG retrieval or the LLM "thinking" time.
+
+* **Automatic HTTP spans** — every request gets a server span (`GET /health`, `POST /diagnose`, ...) via `FastAPIInstrumentor.instrument_app(app)`.
+* **Manual spans** in `IncidentOrchestrator` form a per-incident tree:
+
+```
+incident.diagnose            (attrs: incident.namespace, incident.severity, incident.warnings)
+├── k8s.get_pods             (k8s.namespace, k8s.pods_found)
+├── k8s.get_events           (k8s.namespace, k8s.events_found)
+├── prometheus.pod_cpu       (k8s.pod)
+├── prometheus.pod_memory    (k8s.pod)
+├── logs.pod_tail            (k8s.pod, logs.tail_lines, logs.bytes)
+├── rag.search               (rag.top_k, rag.matches)
+└── llm.generate             (llm.model, llm.ok, llm.response_chars)
+```
+
+* Tool failures are recorded on the span (`record_exception` + `ERROR` status) — a degraded step is visible in the trace, not only in logs.
+* Export is **opt-in**: set `OTEL_EXPORTER_OTLP_ENDPOINT` (OTLP/gRPC). Without it spans are collected in-process and nothing is sent anywhere — zero external side effects in CI/offline runs.
+
+### Try it locally with Jaeger
+
+```bash
+make jaeger          # or: docker run -d --name jaeger -p 16686:16686 -p 4317:4317 jaegertracing/all-in-one:latest
+OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4317 uvicorn src.main:app --port 8000
+curl -s localhost:8000/health >/dev/null
+curl -s -X POST localhost:8000/diagnose -H 'Content-Type: application/json' \
+     -d '{"namespace":"default","pod_name":"web-1","description":"pod restarts"}'
+```
+
+Open the Jaeger UI at **http://localhost:16686**, pick service `ai-agent-devops`
+(override with `OTEL_SERVICE_NAME`) and inspect the `incident.diagnose` trace tree.
+The same endpoint works with Tempo/OpenTelemetry Collector — anything speaking OTLP/gRPC.
+
 ---
 
 ## Security & Guardrails
@@ -300,6 +338,7 @@ tests/
 ├── test_config.py            # Settings validators: fail-fast on bad LOG_LEVEL/LOG_FORMAT/limits
 ├── test_logger.py            # JSON structured logging + request_id correlation
 ├── test_webhook_alertmanager.py  # Alertmanager payload parsing, 400s, resolved-skip, audit journal
+├── test_tracing.py           # OTel provider, FastAPI auto-spans, manual tool/LLM spans
 └── test_api.py               # FastAPI TestClient: /health /ready /diagnose /metrics, CORS, errors, X-Request-ID
 ```
 
@@ -373,7 +412,7 @@ ai_agent_DevOps/
 │       ├── logger.py            # stdlib logging setup
 │       ├── metrics.py           # custom Prometheus metrics
 │       └── text_utils.py        # truncate_context (bounded, JSON-safe)
-└── tests/                       # 153 tests, fully mocked externals
+└── tests/                       # 160 tests, fully mocked externals
 ```
 
 ---

@@ -15,6 +15,8 @@ import time
 from pathlib import Path
 from typing import Any, Protocol, runtime_checkable
 
+from opentelemetry import trace
+from opentelemetry.trace import StatusCode
 from pydantic import BaseModel, Field, ValidationError
 
 from src.agent.llm_client import LLMClient
@@ -32,6 +34,11 @@ from src.utils.metrics import (
 from src.utils.text_utils import TOKEN_SOFT_LIMIT, estimate_tokens, truncate_context
 
 logger = get_logger(__name__)
+
+# Распределённый трейсинг: спаны инструментов и LLM (экспорт настраивается
+# в src/main.py через OTEL_EXPORTER_OTLP_ENDPOINT; без endpoint спаны
+# собираются in-process и никуда не отправляются).
+tracer = trace.get_tracer(__name__)
 
 
 class NamespaceNotAllowedError(ValueError):
@@ -315,10 +322,14 @@ class IncidentOrchestrator:
             else getattr(incident, "namespace", None)
         )
         started = time.perf_counter()
-        try:
-            result = self._diagnose_impl(incident)
-        finally:
-            observe_diagnose_duration(ns, time.perf_counter() - started)
+        with tracer.start_as_current_span("incident.diagnose") as span:
+            span.set_attribute("incident.namespace", str(ns or "unknown"))
+            try:
+                result = self._diagnose_impl(incident)
+            finally:
+                observe_diagnose_duration(ns, time.perf_counter() - started)
+            span.set_attribute("incident.severity", str(result.get("severity", "unknown")))
+            span.set_attribute("incident.warnings", len(result.get("warnings", [])))
         inc_diagnose_request(ns, result.get("severity"))
         return result
 
@@ -355,12 +366,17 @@ class IncidentOrchestrator:
         # a. Список подов в namespace (Graceful Degradation: ошибка K8s API не
         # прерывает диагностику — продолжаем только по Prometheus-метрикам).
         k8s_unavailable = False
-        try:
-            pods = self.k8s.get_pods(namespace=incident.namespace)
-        except Exception as exc:  # защита от непредвиденных ошибок инструмента
-            logger.error("get_pods failed: %s", exc)
-            pods = []
-            k8s_unavailable = True
+        with tracer.start_as_current_span("k8s.get_pods") as span:
+            span.set_attribute("k8s.namespace", incident.namespace)
+            try:
+                pods = self.k8s.get_pods(namespace=incident.namespace)
+                span.set_attribute("k8s.pods_found", len(pods))
+            except Exception as exc:  # защита от непредвиденных ошибок инструмента
+                span.record_exception(exc)
+                span.set_status(StatusCode.ERROR, str(exc))
+                logger.error("get_pods failed: %s", exc)
+                pods = []
+                k8s_unavailable = True
         if not pods and not incident.pod_name:
             # Инструмент «съел» ApiException и вернул [] — сам факт ошибки виден
             # только в логах; считаем K8s API недоступным (degraded mode).
@@ -412,11 +428,16 @@ class IncidentOrchestrator:
 
             # K8s-события запрашиваем только если API заведомо доступен (есть поды).
             if pods:
-                try:
-                    events = self.k8s.get_events(namespace=incident.namespace)
-                except Exception as exc:
-                    logger.error("get_events failed: %s", exc)
-                    events = []
+                with tracer.start_as_current_span("k8s.get_events") as span:
+                    span.set_attribute("k8s.namespace", incident.namespace)
+                    try:
+                        events = self.k8s.get_events(namespace=incident.namespace)
+                        span.set_attribute("k8s.events_found", len(events))
+                    except Exception as exc:
+                        span.record_exception(exc)
+                        span.set_status(StatusCode.ERROR, str(exc))
+                        logger.error("get_events failed: %s", exc)
+                        events = []
                 relevant = [
                     e
                     for e in events
@@ -429,20 +450,28 @@ class IncidentOrchestrator:
 
             # c. CPU и память через Prometheus (работает даже при K8s outage —
             # kubelet/cAdvisor метрики независимы от API-сервера).
-            try:
-                cpu = self.prometheus.get_pod_cpu_usage(
-                    namespace=incident.namespace, pod_name=target_pod
-                )
-            except Exception as exc:
-                logger.error("get_pod_cpu_usage failed: %s", exc)
-                cpu = None
-            try:
-                mem = self.prometheus.get_pod_memory_usage(
-                    namespace=incident.namespace, pod_name=target_pod
-                )
-            except Exception as exc:
-                logger.error("get_pod_memory_usage failed: %s", exc)
-                mem = None
+            with tracer.start_as_current_span("prometheus.pod_cpu") as span:
+                span.set_attribute("k8s.pod", target_pod)
+                try:
+                    cpu = self.prometheus.get_pod_cpu_usage(
+                        namespace=incident.namespace, pod_name=target_pod
+                    )
+                except Exception as exc:
+                    span.record_exception(exc)
+                    span.set_status(StatusCode.ERROR, str(exc))
+                    logger.error("get_pod_cpu_usage failed: %s", exc)
+                    cpu = None
+            with tracer.start_as_current_span("prometheus.pod_memory") as span:
+                span.set_attribute("k8s.pod", target_pod)
+                try:
+                    mem = self.prometheus.get_pod_memory_usage(
+                        namespace=incident.namespace, pod_name=target_pod
+                    )
+                except Exception as exc:
+                    span.record_exception(exc)
+                    span.set_status(StatusCode.ERROR, str(exc))
+                    logger.error("get_pod_memory_usage failed: %s", exc)
+                    mem = None
             context["metrics"] = {"cpu_cores": cpu, "memory_bytes": mem}
             if cpu is None:
                 warnings.append(f"CPU-метрики по поду {target_pod} недоступны")
@@ -451,13 +480,19 @@ class IncidentOrchestrator:
 
             # d. Логи пода (tail, ограничен MAX_LOG_LINES из конфига).
             tail_lines = self._clamp_tail_lines(DEFAULT_TAIL_LINES)
-            try:
-                log_text = self.logs.get_pod_logs(
-                    namespace=incident.namespace, pod_name=target_pod, tail_lines=tail_lines
-                )
-            except Exception as exc:
-                logger.error("get_pod_logs failed: %s", exc)
-                log_text = ""
+            with tracer.start_as_current_span("logs.pod_tail") as span:
+                span.set_attribute("k8s.pod", target_pod)
+                span.set_attribute("logs.tail_lines", tail_lines)
+                try:
+                    log_text = self.logs.get_pod_logs(
+                        namespace=incident.namespace, pod_name=target_pod, tail_lines=tail_lines
+                    )
+                    span.set_attribute("logs.bytes", len(log_text or ""))
+                except Exception as exc:
+                    span.record_exception(exc)
+                    span.set_status(StatusCode.ERROR, str(exc))
+                    logger.error("get_pod_logs failed: %s", exc)
+                    log_text = ""
             context["pod_logs_tail"] = log_text
             if not log_text:
                 warnings.append(f"Логи пода {target_pod} не получены")
@@ -465,13 +500,18 @@ class IncidentOrchestrator:
             # d2. RAG: поиск релевантных runbook'ов по симптомам (статус пода +
             # последние 10 строк логов). Ошибки/пустой результат не влияют на
             # диагностику — агент работает как раньше без relevant_runbooks.
-            try:
-                runbooks = self.rag.find_relevant(
-                    self._build_rag_query(context, log_text), top_k=RAG_TOP_K
-                )
-            except Exception as exc:
-                logger.error("RAG lookup failed: %s", exc)
-                runbooks = []
+            with tracer.start_as_current_span("rag.search") as span:
+                span.set_attribute("rag.top_k", RAG_TOP_K)
+                try:
+                    runbooks = self.rag.find_relevant(
+                        self._build_rag_query(context, log_text), top_k=RAG_TOP_K
+                    )
+                    span.set_attribute("rag.matches", len(runbooks))
+                except Exception as exc:
+                    span.record_exception(exc)
+                    span.set_status(StatusCode.ERROR, str(exc))
+                    logger.error("RAG lookup failed: %s", exc)
+                    runbooks = []
             if runbooks:
                 context["relevant_runbooks"] = runbooks
         else:
@@ -490,12 +530,19 @@ class IncidentOrchestrator:
         # ограничил контекст по символам.
         self._log_token_estimate(user_prompt)
         llm_raw = ""
-        try:
-            diagnosis_dict, llm_raw = self._query_llm(context, user_prompt)
-        except Exception as exc:
-            logger.error("LLM step failed: %s", exc)
-            diagnosis_dict = {}
-            warnings.append("LLM не ответил — RCA не сформирован")
+        with tracer.start_as_current_span("llm.generate") as span:
+            span.set_attribute("llm.model", self.settings.llm_model)
+            try:
+                diagnosis_dict, llm_raw = self._query_llm(context, user_prompt)
+                span.set_attribute("llm.ok", True)
+                span.set_attribute("llm.response_chars", len(llm_raw or ""))
+            except Exception as exc:
+                span.record_exception(exc)
+                span.set_status(StatusCode.ERROR, str(exc))
+                span.set_attribute("llm.ok", False)
+                logger.error("LLM step failed: %s", exc)
+                diagnosis_dict = {}
+                warnings.append("LLM не ответил — RCA не сформирован")
 
         # g. Результат LLM плюс сырые данные для отладки.
         result = Diagnosis(

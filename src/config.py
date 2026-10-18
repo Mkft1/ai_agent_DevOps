@@ -37,6 +37,13 @@ class Settings(BaseSettings):
     # Журнал аудита диагностик (append-only JSON Lines); см. src/utils/audit.py.
     audit_log_path: str = "audit.jsonl"
 
+    # OpenTelemetry: endpoint OTLP-экспортера трейсов (gRPC, напр. http://localhost:4317
+    # для локального Jaeger). None (по умолчанию) — экспорт отключён: спаны
+    # собираются in-process, но никуда не отправляются (нуль внешних эффектов).
+    otel_exporter_otlp_endpoint: str | None = None
+    # Имя сервиса в трейсах (service.name в Jaeger/Tempo).
+    otel_service_name: str = "ai-agent-devops"
+
     # LLM API-ключи (используется один из провайдеров)
     openai_api_key: str | None = None
     qwen_api_key: str | None = None
