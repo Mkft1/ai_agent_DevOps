@@ -187,3 +187,78 @@ class TestGuardrailsAPI:
         assert resp.status_code == 403
         assert "not allowed" in resp.json()["detail"]
         orch.format_report.assert_not_called()
+
+
+class TestMetrics:
+    """Эндпоинт /metrics: стандартные HTTP-метрики + кастомные метрики агента."""
+
+    def test_metrics_endpoint_returns_200(self, client: TestClient) -> None:
+        resp = client.get("/metrics")
+        assert resp.status_code == 200
+        assert "text/plain" in resp.headers.get("content-type", "")
+
+    def test_metrics_contains_http_and_custom_metrics(
+        self, client: TestClient, mock_orchestrator: MagicMock
+    ) -> None:
+        # Сгенерировать трафик: диагностика через мок (severity=high, ns=prod).
+        client.post("/diagnose", json={"namespace": "prod", "description": "cpu"})
+        body = client.get("/metrics").text
+        # Стандартные метрики instrumentator'а.
+        assert "http_requests_total" in body
+        # Кастомные метрики из src/utils/metrics.py объявлены и экспортируются.
+        for name in (
+            "diagnose_requests_total",
+            "diagnose_duration_seconds",
+            "k8s_api_errors_total",
+            "llm_fallback_total",
+        ):
+            assert f"# {name}" in body or name in body, name
+
+    def test_diagnose_updates_custom_counters(self, client: TestClient) -> None:
+        """Реальный оркестратор (моки инструментов): diagnose() обновляет счётчики."""
+        from src.agent.orchestrator import IncidentOrchestrator
+
+        orch = IncidentOrchestrator(
+            k8s_tools=MagicMock(), prometheus_tools=MagicMock(),
+            logs_tools=MagicMock(), llm_client=MagicMock(),
+        )
+        orch.k8s.get_pods.return_value = []
+        orch.prometheus.get_pod_cpu_usage.return_value = None
+        orch.prometheus.get_pod_memory_usage.return_value = None
+        orch.logs.get_pod_logs.return_value = ""
+        orch.llm.generate.return_value = (
+            '{"root_cause": "oom", "evidence": [], '
+            '"suggested_fix": "f", "severity": "high"}'
+        )
+        app.dependency_overrides[get_orchestrator] = lambda: orch
+        try:
+            before = _counter_value(client, "diagnose_requests_total")
+            resp = client.post(
+                "/diagnose", json={"namespace": "default", "description": "x"}
+            )
+            assert resp.status_code == 200
+            after = _counter_value(client, "diagnose_requests_total")
+            assert after > before
+        finally:
+            app.dependency_overrides.pop(get_orchestrator, None)
+
+    def test_metrics_exposes_llm_fallback_counter(self, client: TestClient) -> None:
+        from src.utils.metrics import inc_llm_fallback
+
+        before = _counter_value(client, "llm_fallback_total")
+        inc_llm_fallback()
+        after = _counter_value(client, "llm_fallback_total")
+        assert after == before + 1
+
+
+def _counter_value(client: TestClient, name: str) -> float:
+    """Прочитать суммарное значение Counter'а по тексту /metrics."""
+    total = 0.0
+    for line in client.get("/metrics").text.splitlines():
+        if line.startswith("#"):
+            continue
+        metric_part, _, value = line.rpartition(" ")
+        base = metric_part.split("{", 1)[0]
+        if base == name:
+            total += float(value)
+    return total

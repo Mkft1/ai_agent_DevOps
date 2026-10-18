@@ -15,6 +15,7 @@ from kubernetes.client.exceptions import ApiException
 
 from src.config import get_settings
 from src.utils.logger import get_logger
+from src.utils.metrics import inc_k8s_api_error
 
 logger = get_logger(__name__)
 
@@ -74,6 +75,7 @@ class K8sTools:
         try:
             pods = self._core.list_namespaced_pod(namespace=namespace).items
         except ApiException as exc:
+            inc_k8s_api_error("get_pods")
             logger.error(
                 "Ошибка list_namespaced_pod(namespace=%s): status=%s reason=%s",
                 namespace,
@@ -114,6 +116,7 @@ class K8sTools:
         try:
             events = self._core.list_namespaced_event(namespace=namespace).items
         except ApiException as exc:
+            inc_k8s_api_error("get_events")
             logger.error(
                 "Ошибка list_namespaced_event(namespace=%s): status=%s reason=%s",
                 namespace,
@@ -162,6 +165,7 @@ class K8sTools:
         try:
             deployments = self._apps.list_namespaced_deployment(namespace=namespace).items
         except ApiException as exc:
+            inc_k8s_api_error("get_deployments")
             logger.error(
                 "Ошибка list_namespaced_deployment(namespace=%s): status=%s reason=%s",
                 namespace,
@@ -196,6 +200,7 @@ class K8sTools:
         try:
             nodes = self._core.list_node().items
         except ApiException as exc:
+            inc_k8s_api_error("get_nodes")
             logger.error(
                 "Ошибка list_node: status=%s reason=%s", exc.status, exc.reason
             )
