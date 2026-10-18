@@ -25,13 +25,13 @@ The agent is strictly **read-only by default**: it never mutates the cluster (`E
 | 📚 **Hybrid RAG over runbooks** | Local Markdown runbooks (`docs/runbooks/*.md`) ranked by **hybrid search**: `0.5 × TF-IDF` (exact terms) + `0.5 × cosine similarity` of sentence-transformers embeddings (`all-MiniLM-L6-v2`, semantic match). No vector DB, no external service; if the model is unavailable the agent gracefully falls back to pure TF-IDF. Top playbooks are injected into the LLM context as `relevant_runbooks` and drive `suggested_fix`. |
 | ☸️ **Kubernetes integration** | Official Python client: pods, events, deployments, nodes, container logs (including pre-restart logs for OOMKilled/CrashLoopBackOff). |
 | 📈 **Prometheus integration** | instant & range queries, per-pod CPU/memory usage via `container_*` cAdvisor metrics. |
-| 🛡️ **Guardrails** | Namespace allow-list (`ALLOWED_NAMESPACES`), log-size cap (`MAX_LOG_LINES`), context-size cap (`MAX_CONTEXT_CHARS`), read-only mode (`ENABLE_WRITE_ACTIONS`), and **dangerous-action policy**: fixes mentioning `delete`/`drop`/`rm -rf`/`scale 0` are flagged `requires_approval: true` and routed to a human via Slack. All configurable via `.env`, nothing hardcoded. |
+| 🛡️ **Guardrails** | Namespace allow-list (`ALLOWED_NAMESPACES`), log-size cap (`MAX_LOG_LINES`), context-size cap (`MAX_CONTEXT_CHARS`), read-only mode (`ENABLE_WRITE_ACTIONS`), **dangerous-action policy** (fixes mentioning `delete`/`drop`/`rm -rf`/`scale 0` are flagged `requires_approval: true` and routed to a human via Slack), and cluster-level **Policy-as-Code**: least-privilege RBAC + Kyverno ClusterPolicies in `manifests/`. All configurable via `.env`, nothing hardcoded. |
 | 🩹 **Graceful degradation** | If any data source fails (K8s API down, Prometheus unreachable, empty logs), the agent records a warning in the report and continues diagnosing with whatever data it has — it never crashes the pipeline. |
 | 📊 **Observability** | `/metrics` endpoint (`prometheus-fastapi-instrumentator`) + custom counters/histograms: `diagnose_requests_total`, `diagnose_duration_seconds`, `k8s_api_errors_total`, `llm_fallback_total`. `X-Request-ID` correlation (echoed/generated per request), optional structured JSON logging (`LOG_FORMAT=json`) for Loki/CloudWatch, an append-only audit journal (`AUDIT_LOG_PATH`, JSON Lines) of every diagnosis, and **OpenTelemetry distributed tracing** (auto HTTP spans + manual spans per K8s/Prometheus/logs/RAG/LLM call, OTLP export to Jaeger/Tempo). |
 | 🚨 **Alertmanager webhook** | `POST /webhook/alertmanager` accepts the standard Alertmanager payload, diagnoses every `firing` alert (namespace/pod from labels, text from `annotations.summary`/`description`), skips `resolved`, and answers `400` on malformed payloads. |
 | 🔁 **Chaos self-test** | `scripts/chaos_test.py` creates an ImagePullBackOff pod, asks the agent to diagnose it, asserts the RCA mentions "image"/"pull", and cleans up. Idempotent. |
 | 🖥️ **Operator dashboard** | `make dashboard` — Streamlit UI over the audit journal: incident table (Timestamp/Namespace/Severity/Root Cause), severity metrics, and approval cards with `suggested_fix` + "Approve & Apply" for every `requires_approval` incident. |
-| 🧪 **Testing & CI/CD** | 213 unit/integration tests with mocked clients (92% coverage, CI gate `--cov-fail-under=85`, SentenceTransformer mocked so tests never download models), plus an offline **evaluation framework** (`make eval`) with a golden dataset and LLM-as-a-judge scoring; | GitHub Actions pipeline: lint → test+coverage → Docker build+smoke → kind-based e2e on `main` (auto-skipped when no LLM secret is configured). |
+| 🧪 **Testing & CI/CD** | 222 unit/integration tests with mocked clients (92% coverage, CI gate `--cov-fail-under=85`, SentenceTransformer mocked so tests never download models), plus an offline **evaluation framework** (`make eval`) with a golden dataset and LLM-as-a-judge scoring; | GitHub Actions pipeline: lint → test+coverage → Docker build+smoke → kind-based e2e on `main` (auto-skipped when no LLM secret is configured). |
 | 🐳 **Containerized** | Multi-stage `python:3.12-slim` image, non-root user, healthcheck, no secrets baked into the image. |
 
 ---
@@ -312,6 +312,42 @@ SLACK_WEBHOOK_URL=https://hooks.slack.com/services/T000/B000/XXXX
 Safe recommendations (raise limits, fix image tags, add probes...) skip the gate:
 `requires_approval: false`, no Slack message.
 
+## Security & Policy-as-Code
+
+Application guardrails (`ALLOWED_NAMESPACES`, read-only mode) are the first line of
+defence; the cluster enforces the same rules independently via **least-privilege RBAC**
+and **Kyverno Policy-as-Code** — a compromised or misconfigured agent still cannot
+touch what it must not touch.
+
+```bash
+# 1. Kyverno (if not installed): policy engine that enforces the ClusterPolicies
+helm repo add kyverno https://kyverno.github.io/kyverno
+helm install kyverno kyverno/kyverno -n kyverno --create-namespace
+
+# 2. Apply RBAC + policies
+kubectl apply -f manifests/
+```
+
+| Manifest | What it is | Protection |
+|---|---|---|
+| `manifests/agent-rbac.yaml` | ServiceAccount `ai-agent` + Role (`get/list/watch` only) + RoleBinding in `default` | Least privilege: the agent has **no write verbs at cluster level**, even if `ENABLE_WRITE_ACTIONS` is ever flipped or the app is compromised |
+| `manifests/policies/kyverno-block-kube-system.yaml` | ClusterPolicy (Enforce): deny CREATE/UPDATE/DELETE in `kube-system` for every ServiceAccount except system ones (`kube-system`/`kube-public`/`kube-node-lease`) | System components (CoreDNS, kube-proxy, controllers) are untouchable by workloads and the agent |
+| `manifests/policies/kyverno-validate-actions.yaml` | ClusterPolicy (Enforce): any write by SA `ai-agent` is denied unless the target namespace has label `agent-managed=true` | Write actions (if ever enabled) work only in explicitly opted-in namespaces |
+
+Verify the enforcement yourself:
+
+```bash
+# RBAC: no write verbs for the agent
+kubectl auth can-i delete pods -n default --as=system:serviceaccount:default:ai-agent   # -> no
+kubectl auth can-i get pods  -n default --as=system:serviceaccount:default:ai-agent   # -> yes
+
+# Kyverno: label-gated writes
+kubectl label ns sandbox agent-managed=true   # opted-in namespace for future write paths
+```
+
+Policies run in `Enforce` mode (AdmissionReview deny). To observe first without
+blocking, set `spec.validationFailureAction: Audit` and watch Kyverno's policy reports.
+
 ## Evaluation & Quality Assurance
 
 Prompts, runbooks and models evolve — without a measurement harness every change is
@@ -517,6 +553,10 @@ ai_agent_DevOps/
 ├── eval/
 │   ├── golden_dataset.json      # golden incidents: expected root cause + runbook
 │   └── evaluate.py              # LLM-as-a-judge harness (make eval), no cluster needed
+├── manifests/
+│   ├── agent-rbac.yaml          # least-privilege SA/Role/RoleBinding (read-only)
+│   └── policies/                # Kyverno ClusterPolicies: kube-system lockdown,
+│                                # agent-managed=true label gate for writes
 ├── ui/
 │   └── dashboard.py             # Streamlit operator UI over audit.jsonl (make dashboard)
 ├── scripts/
@@ -539,7 +579,7 @@ ai_agent_DevOps/
 │       ├── logger.py            # stdlib logging setup
 │       ├── metrics.py           # custom Prometheus metrics
 │       └── text_utils.py        # truncate_context (bounded, JSON-safe)
-└── tests/                       # 213 tests, fully mocked externals
+└── tests/                       # 222 tests, fully mocked externals
 ```
 
 ---

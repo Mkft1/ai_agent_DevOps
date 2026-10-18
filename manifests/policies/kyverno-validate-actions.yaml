@@ -1,0 +1,59 @@
+# ClusterPolicy: write-действия агента допустимы только в namespace'ах,
+# помеченных label'ом agent-managed=true.
+#
+# Сегодня агент read-only (ENABLE_WRITE_ACTIONS=false), но если write-путь
+# когда-либо появится (или оператор включит его ошибочно), эта политика
+# ограничит его исключительно namespace'ами, явно размеченными как
+# "под управлением агента". Read-операции не ограничиваются.
+#
+# namespaceLabels — встроенная переменная Kyverno: labels целевого namespace
+# запроса (недоступна для cluster-scoped ресурсов, поэтому rule матчит только
+# namespaced-ресурсы через namespaced operations).
+#
+# Требует Kyverno >= 1.9 (apiVersion kyverno.io/v1).
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: require-agent-managed-label-for-agent-writes
+  annotations:
+    policies.kyverno.io/title: Agent write actions require agent-managed namespace
+    policies.kyverno.io/category: Security, AI-Agent Guardrails
+    policies.kyverno.io/severity: high
+    policies.kyverno.io/subject-kind: ServiceAccount
+    policies.kyverno.io/description: >-
+      Любой write-запрос (CREATE/UPDATE/DELETE) от ServiceAccount ai-agent
+      разрешён только в namespace с меткой agent-managed=true. Namespace без
+      метки получает отказ AdmissionReview, даже если app-level guardrails
+      агента сконфигурированы слишком широко.
+spec:
+  validationFailureAction: Enforce
+  background: false
+  rules:
+    - name: agent-writes-require-agent-managed-namespace
+      match:
+        any:
+          - subjects:
+              - kind: ServiceAccount
+                name: ai-agent
+                namespace: "*"
+            resources:
+              kinds: ["*"]
+              operations: ["CREATE", "UPDATE", "DELETE"]
+      exclude:
+        any:
+          # Системные namespace'ы агенту и так запрещены app-level guardrails;
+          # исключаем их из правила, чтобы не маскировать другие политики.
+          - resources:
+              namespaces: ["kube-system", "kube-public", "kube-node-lease"]
+      validate:
+        message: >-
+          Write actions by ServiceAccount ai-agent are allowed only in
+          namespaces labeled agent-managed=true. Label the namespace
+          (kubectl label ns <name> agent-managed=true) or keep the agent
+          read-only (ENABLE_WRITE_ACTIONS=false).
+        deny:
+          conditions:
+            any:
+              - key: "{{namespaceLabels.\"agent-managed\" || 'false'}}"
+                operator: NotEquals
+                value: "true"
