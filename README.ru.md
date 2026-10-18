@@ -1,4 +1,8 @@
-**[English](./README.md) | Русский**
+<p align="center">
+  <a href="./README.md"><b>🇬🇧 English </b></a> &nbsp;|&nbsp; <a href="./README.ru.md"><b>🇷🇺 Русский</b></a>
+</p>
+
+<h1 align="center">ai_agent_DevOps</h1>
 
 # ai_agent_DevOps
 
