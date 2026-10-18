@@ -221,6 +221,7 @@ class TestMetrics:
         orch = IncidentOrchestrator(
             k8s_tools=MagicMock(), prometheus_tools=MagicMock(),
             logs_tools=MagicMock(), llm_client=MagicMock(),
+            rag=MagicMock(),  # RAG выключён: find_relevant -> []
         )
         orch.k8s.get_pods.return_value = []
         orch.prometheus.get_pod_cpu_usage.return_value = None
