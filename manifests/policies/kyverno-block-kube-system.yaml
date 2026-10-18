@@ -1,0 +1,63 @@
+# ClusterPolicy: защита kube-system от write-действий несистемных
+# ServiceAccount (включая SA агента и любых workload-ов).
+#
+# Системными считаются SA системных namespace'ов (kube-system, kube-public,
+# kube-node-lease) — их контроллеры легитимно пишут в kube-system.
+# Все остальные SA (ai-agent, приложенческие SA и т.д.) получают отказ на
+# CREATE / UPDATE / DELETE в kube-system. Read (get/list/watch) не ограничивается:
+# политика governs только изменяющие операции.
+#
+# Требует Kyverno >= 1.9 (apiVersion kyverno.io/v1, validationFailureAction: Enforce).
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: block-non-system-sa-writes-in-kube-system
+  annotations:
+    policies.kyverno.io/title: Block non-system ServiceAccount writes in kube-system
+    policies.kyverno.io/category: Security, AI-Agent Guardrails
+    policies.kyverno.io/severity: high
+    policies.kyverno.io/subject-kind: ServiceAccount
+    policies.kyverno.io/description: >-
+      Запрещает любым ServiceAccount, кроме системных (SA namespace'ов
+      kube-system/kube-public/kube-node-lease), создавать, изменять и удалять
+      ресурсы в namespace kube-system. Defense-in-depth поверх app-level
+      guardrails агента (ALLOWED_NAMESPACES): даже скомпрометированный
+      workload не сможет тронуть системные компоненты кластера.
+spec:
+  validationFailureAction: Enforce
+  background: false
+  rules:
+    - name: deny-non-system-sa-writes-in-kube-system
+      match:
+        any:
+          - resources:
+              kinds: ["*"]
+              namespaces: ["kube-system"]
+              operations: ["CREATE", "UPDATE", "DELETE"]
+            subjects:
+              - kind: ServiceAccount
+                name: "*"
+                namespace: "*"
+      exclude:
+        any:
+          # Системные SA: контроллеры kube-system и других системных namespace'ов
+          - subjects:
+              - kind: ServiceAccount
+                name: "*"
+                namespace: kube-system
+              - kind: ServiceAccount
+                name: "*"
+                namespace: kube-public
+              - kind: ServiceAccount
+                name: "*"
+                namespace: kube-node-lease
+      validate:
+        message: >-
+          ServiceAccounts other than the cluster system ones are not allowed to
+          create/update/delete resources in kube-system (AI-agent cluster policy).
+        deny:
+          conditions:
+            any:
+              - key: "{{request.operation}}"
+                operator: In
+                value: ["CREATE", "UPDATE", "DELETE"]

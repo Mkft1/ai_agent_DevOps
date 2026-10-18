@@ -11,7 +11,7 @@ AI-агент для диагностики инцидентов в Kubernetes. 
 [![Python 3.12](https://img.shields.io/badge/python-3.12-blue?logo=python&logoColor=white)](https://www.python.org/downloads/)
 [![Docker](https://img.shields.io/badge/docker-multistage%20image-2496ED?logo=docker&logoColor=white)](./Dockerfile)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](./LICENSE)
-[![Tests](https://img.shields.io/badge/tests-213%20passed-brightgreen?logo=pytest&logoColor=white)](#тесты)
+[![Tests](https://img.shields.io/badge/tests-222%20passed-brightgreen?logo=pytest&logoColor=white)](#тесты)
 [![Ruff](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/astral-sh/ruff/main/assets/badge/v2.json)](https://github.com/astral-sh/ruff)
 
 AI-агент для диагностики инцидентов в Kubernetes.
@@ -95,7 +95,7 @@ Alertmanager → /diagnose → IncidentOrchestrator → [K8sTools, PrometheusToo
   (таблица инцидентов Timestamp/Namespace/Severity/Root Cause, метрики по severity,
   карточки аппрува с `suggested_fix` и кнопкой "Approve & Apply" для инцидентов с
   `requires_approval=true`); запускается отдельно от FastAPI, кластер не трогает.
-- **Тестирование** — 213 unit/интеграционных тестов (pytest + unittest.mock), покрытие ~92%
+- **Тестирование** — 222 unit/интеграционных тестов (pytest + unittest.mock), покрытие ~92%
   (гейт в CI `--cov-fail-under=85`): инструменты, оркестратор, LLM-клиент (мок HTTP),
   FastAPI-эндпоинты (TestClient), конфигурация и логирование, chaos-скрипт.
 - **DevOps-практики** — многоступенчатый Docker-образ, docker-compose, идемпотентный
@@ -155,6 +155,10 @@ ai_agent_DevOps/
 ├── eval/
 │   ├── golden_dataset.json  # золотые инциденты: ожидаемый root cause + runbook
 │   └── evaluate.py          # harness LLM-as-a-judge (make eval), без кластера
+├── manifests/
+│   ├── agent-rbac.yaml      # least-privilege SA/Role/RoleBinding (только чтение)
+│   └── policies/            # Kyverno ClusterPolicies: lockdown kube-system,
+│                            # гейт agent-managed=true для write-действий
 ├── ui/
 │   └── dashboard.py         # Streamlit-UI оператора поверх audit.jsonl (make dashboard)
 ├── docs/
@@ -383,6 +387,38 @@ SLACK_WEBHOOK_URL=https://hooks.slack.com/services/T000/B000/XXXX
 
 Безопасные рекомендации (поднять лимиты, поправить тег образа, добавить probes)
 гейт не проходят: `requires_approval: false`, сообщение в Slack не отправляется.
+
+## Безопасность и Policy-as-Code
+
+App-level guardrails (`ALLOWED_NAMESPACES`, read-only) — первая линия защиты;
+кластер обеспечивает те же правила независимо через **least-privilege RBAC**
+и **Kyverno Policy-as-Code**: даже скомпрометированный агент не тронет запретное.
+
+```bash
+# 1. Kyverno (если не установлен): движок политик, enforce'ит ClusterPolicy
+helm repo add kyverno https://kyverno.github.io/kyverno
+helm install kyverno kyverno/kyverno -n kyverno --create-namespace
+
+# 2. Применить RBAC + политики
+kubectl apply -f manifests/
+```
+
+| Манифест | Что это | Защита |
+|---|---|---|
+| `manifests/agent-rbac.yaml` | ServiceAccount `ai-agent` + Role (только `get/list/watch`) + RoleBinding в `default` | Least privilege: у агента **нет write-verb'ов на уровне кластера**, даже если `ENABLE_WRITE_ACTIONS` когда-либо включат или приложение скомпрометируют |
+| `manifests/policies/kyverno-block-kube-system.yaml` | ClusterPolicy (Enforce): запрет CREATE/UPDATE/DELETE в `kube-system` для всех SA, кроме системных (`kube-system`/`kube-public`/`kube-node-lease`) | Системные компоненты (CoreDNS, kube-proxy, контроллеры) недоступны для workload'ов и агента |
+| `manifests/policies/kyverno-validate-actions.yaml` | ClusterPolicy (Enforce): любой write от SA `ai-agent` запрещён, если у namespace нет метки `agent-managed=true` | Write-действия (если появятся) работают только в явно размеченных namespace'ах |
+
+Самопроверка enforcement:
+
+```bash
+kubectl auth can-i delete pods -n default --as=system:serviceaccount:default:ai-agent   # -> no
+kubectl auth can-i get pods  -n default --as=system:serviceaccount:default:ai-agent   # -> yes
+kubectl label ns sandbox agent-managed=true   # opt-in namespace для будущих write-путей
+```
+
+Политики работают в `Enforce` (AdmissionReview deny). Для наблюдения без блокировки
+поставьте `spec.validationFailureAction: Audit` и смотрите policy reports Kyverno.
 
 ## Оценка качества (Evaluation, LLM-as-a-judge)
 
