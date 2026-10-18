@@ -1,449 +1,299 @@
-# ai_agent_DevOps
+# K8s Incident Diagnosis AI Agent
 
 [![CI](https://github.com/Mkft1/ai_agent_DevOps/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/Mkft1/ai_agent_DevOps/actions/workflows/ci.yml)
-[![Python 3.12](https://img.shields.io/badge/python-3.12-blue?logo=python&logoColor=white)](https://www.python.org/downloads/)
-[![Docker](https://img.shields.io/badge/docker-multistage%20image-2496ED?logo=docker&logoColor=white)](./Dockerfile)
+![Coverage](https://img.shields.io/badge/coverage-89%25-brightgreen)
+![Python](https://img.shields.io/badge/python-3.12-blue?logo=python&logoColor=white)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](./LICENSE)
-[![Tests](https://img.shields.io/badge/tests-78%20passed-brightgreen?logo=pytest&logoColor=white)](#тесты)
+[![Docker](https://img.shields.io/badge/docker-multistage-2496ED?logo=docker&logoColor=white)](./Dockerfile)
 [![Ruff](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/astral-sh/ruff/main/assets/badge/v2.json)](https://github.com/astral-sh/ruff)
 
-AI-агент для диагностики инцидентов в Kubernetes.
+An LLM-powered SRE agent that diagnoses Kubernetes incidents end-to-end. It ingests alerts via a REST API, correlates live signals — pod status, Kubernetes events, Prometheus metrics, container logs — grounds the analysis with TF-IDF retrieval over local runbooks (RAG), and returns a structured **Root Cause Analysis (RCA)** plus a human-readable report ready for Slack/Telegram.
 
-## Архитектура
+The agent is strictly **read-only by default**: it never mutates the cluster (`ENABLE_WRITE_ACTIONS=false`), so it is safe to expose to production alert pipelines.
 
-```
-+------------------+     POST /diagnose      +------------------------+
-|  Alertmanager /  | ----------------------> |   FastAPI (src/main.py)|
-|  curl / чат-бот  |                         +-----------+------------+
-+------------------+                                     |
-                                                         v
-                     +---------------------------------------------------------------+
-                     |                    IncidentOrchestrator (diagnose)            |
-                     |   guardrails: ALLOWED_NAMESPACES / MAX_LOG_LINES / read-only  |
-                     +---------+-----------------+-------------------------+---------+
-                               |                 |                         |
-                       +-------v------+   +------v--------+       +--------v-----+
-                       |  K8sTools    |   |PrometheusTools|       |  LogsTools   |
-                       | pods/events/ |   | query, pod    |       | pod/container|
-                       | nodes        |   | cpu/memory    |       | logs         |
-                       +-------+------+   +------+--------+       +--------+-----+
-                               |                 |                         |
-                               +-----------------+-------------------------+
-                                                 |
-                                       структурированный контекст (dict)
-                                                 v
-                       структурированный контекст (+ relevant_runbooks из RAG)
-                                                 v
-                                    +--------------------------+
-                                    | RunbookRAG (TF-IDF по    |
-                                    | docs/runbooks/*.md)      |
-                                    +------------+-------------+
-                                                 v
-                                    +--------------------------+
-                                    | LLMClient (Qwen/OpenAI-  |
-                                    | совместимый API, retries)|
-                                    +------------+-------------+
-                                                 |
-                                        RCA (JSON: root_cause,
-                                        evidence, suggested_fix, severity)
-                                                 v
-                                    format_report() -> отчёт
-                                    для Slack / Telegram
-```
+---
 
-Поток простыми словами:
+## Features
 
-```
-Alertmanager → /diagnose → IncidentOrchestrator → [K8sTools, PrometheusTools, LogsTools] → RunbookRAG(docs) → LLM → RCA → Report
-```
+| | |
+|---|---|
+| 🧠 **LLM RCA** | OpenAI-compatible chat API (Qwen/DashScope by default) with strict JSON output validated by Pydantic; automatic one-shot retry on invalid JSON and an honest fallback diagnosis. |
+| 📚 **RAG over runbooks** | Local Markdown runbooks (`docs/runbooks/*.md`) indexed with scikit-learn TF-IDF; the most relevant playbooks are injected into the LLM context as `relevant_runbooks` and drive `suggested_fix`. |
+| ☸️ **Kubernetes integration** | Official Python client: pods, events, deployments, nodes, container logs (including pre-restart logs for OOMKilled/CrashLoopBackOff). |
+| 📈 **Prometheus integration** | instant & range queries, per-pod CPU/memory usage via `container_*` cAdvisor metrics. |
+| 🛡️ **Guardrails** | Namespace allow-list (`ALLOWED_NAMESPACES`), log-size cap (`MAX_LOG_LINES`), context-size cap (`MAX_CONTEXT_CHARS`), read-only mode (`ENABLE_WRITE_ACTIONS`). All configurable via `.env`, nothing hardcoded. |
+| 🩹 **Graceful degradation** | If any data source fails (K8s API down, Prometheus unreachable, empty logs), the agent records a warning in the report and continues diagnosing with whatever data it has — it never crashes the pipeline. |
+| 📊 **Observability** | `/metrics` endpoint (`prometheus-fastapi-instrumentator`) + custom counters/histograms: `diagnose_requests_total`, `diagnose_duration_seconds`, `k8s_api_errors_total`, `llm_fallback_total`. |
+| 🔁 **Chaos self-test** | `scripts/chaos_test.py` creates an ImagePullBackOff pod, asks the agent to diagnose it, asserts the RCA mentions "image"/"pull", and cleans up. Idempotent. |
+| 🧪 **Testing & CI/CD** | 111 unit/integration tests with mocked clients; GitHub Actions pipeline: lint → test+coverage → Docker build → kind-based e2e on `main`. |
+| 🐳 **Containerized** | Multi-stage `python:3.12-slim` image, non-root user, healthcheck, no secrets baked into the image. |
 
-## Что демонстрирует проект
+---
 
-- **Работа с Kubernetes API** — официальный python-клиент: поды, события, деплойменты,
-  узлы, чтение логов контейнеров (`read_namespaced_pod_log`), включая логи до рестарта.
-- **Интеграция с Prometheus** — instant/range запросы через HTTP API, PromQL-выражения
-  для CPU и памяти пода (`rate(container_cpu_usage_seconds_total)`, working set).
-- **LLM-интеграция** — OpenAI-совместимый API (Qwen/DashScope): системный промт SRE-эксперта,
-  строгая pydantic-валидация JSON-ответа, retry с указанием ошибки валидации и fallback-диагноз;
-  клиент за DI-протоколом — заглушка легко меняется на реальный API и наоборот.
-- **Обработка ошибок и отказоустойчивость** — ни один сбой инструмента (ApiException,
-  HTTP 5xx, network timeout) не роняет сервис: шаги помечаются в `warnings`, диагностика
-  продолжается с частичными данными; ретраи tenacity с экспоненциальной задержкой.
-- **Безопасность (guardrails)** — read-only по умолчанию, белый список namespace'ов,
-  лимит строк логов, секреты только через `.env`, non-root контейнер, `.dockerignore`.
-- **Тестирование** — 78 unit/интеграционных тестов (pytest + unittest.mock): инструменты,
-  оркестратор, LLM-клиент (мок HTTP), FastAPI-эндпоинты (TestClient), chaos-скрипт.
-- **DevOps-практики** — многоступенчатый Docker-образ, docker-compose, идемпотентный
-  chaos-эксперимент (ImagePullBackOff) как end-to-end проверка качества диагностики.
+## Architecture
 
-## Что делает агент
+```mermaid
+flowchart LR
+    AM[Alertmanager /\ncurl / chat-bot] -->|POST /diagnose| API[FastAPI\nsrc/main.py]
+    API --> ORCH{IncidentOrchestrator}
 
-- Читает **метрики** из Prometheus (загрузка CPU/RAM, ошибки, задержки).
-- Собирает и анализирует **логи** контейнеров и компонентов кластера.
-- Проверяет **состояние подов**, деплоев и других ресурсов Kubernetes.
-- Подтягивает релевантные **runbook'и** (RAG по `docs/runbooks/`, TF-IDF) —
-  найденные инструкции попадают в контекст LLM как `relevant_runbooks`.
-- Формирует гипотезу о причине инцидента и предлагает **RCA** (Root Cause Analysis)
-  с рекомендациями для on-call инженера.
+    subgraph Tools [Data collection tools]
+        K8S[K8sTools\npods / events /\ndeployments / nodes]
+        PROM[PrometheusTools\nCPU / memory /\ninstant+range queries]
+        LOGS[LogsTools\npod & container logs]
+    end
 
-## Структура проекта
+    ORCH --> K8S
+    ORCH --> PROM
+    ORCH --> LOGS
 
-```
-ai_agent_DevOps/
-├── README.md
-├── requirements.txt
-├── requirements-dev.txt   # dev-зависимости: pytest, pytest-cov, httpx, ruff
-├── pyproject.toml         # конфиг ruff (линт в CI)
-├── .gitignore
-├── .env.example
-├── .github/
-│   └── workflows/
-│       └── ci.yml         # CI: lint (ruff) -> test (pytest+cov) -> build (Docker, no push)
-├── src/
-│   ├── main.py            # Точка входа FastAPI-приложения
-│   ├── config.py          # Загрузка конфигурации из .env
-│   ├── agent/
-│   │   ├── orchestrator.py  # Оркестрация шагов диагностики (K8s -> контекст -> LLM -> RCA)
-│   │   ├── llm_client.py    # Реальный LLM-клиент (Qwen / OpenAI-совместимый API, ретраи tenacity)
-│   │   ├── rag.py           # RunbookRAG: TF-IDF поиск релевантных runbook'ов по симптомам
-│   │   └── tools/
-│   │       ├── k8s_tools.py         # Инструменты Kubernetes
-│   │       ├── prometheus_tools.py  # Инструменты Prometheus
-│   │       └── logs_tools.py        # Инструменты логов
-│   ├── prompts/
-│   │   └── sre_system.txt # Системный промт SRE-эксперта (редактируется без кода)
-│   └── utils/
-│       ├── logger.py      # Базовое логирование
-│       ├── metrics.py     # Кастомные Prometheus-метрики агента
-│       └── text_utils.py  # truncate_context: рекурсивная обрезка контекста для LLM
-├── docs/
-│   └── runbooks/            # Markdown-runbook'и для RAG (OOMKilled, ImagePullBackOff, CrashLoopBackOff)
-├── tests/
-├── scripts/
-│   ├── chaos_test.py      # chaos-эксперимент: ImagePullBackOff -> /diagnose (идемпотентный)
-│   ├── run_integration_test.sh  # e2e-тест на kind-кластере (создание/диагностика/очистка)
-│   └── kind/
-│       └── cluster.yaml   # конфигурация kind-кластера для интеграционного теста
-├── Dockerfile             # многоступенчатый образ (builder + runtime, non-root)
-├── docker-compose.yml     # локальный запуск сервиса agent (порт 8000)
-├── .dockerignore          # .git/.env/tests/.venv/__pycache__ не попадают в образ
-├── LICENSE                # MIT
-└── CONTRIBUTING.md        # правила запуска тестов и контрибьюшена
+    K8S --> CTX[(Structured context\ndict)]
+    PROM --> CTX
+    LOGS --> CTX
+
+    CTX --> RAG[RunbookRAG\nTF-IDF over\ndocs/runbooks/*.md]
+    RAG -->|"context +\nrelevant_runbooks"| TRUNC[truncate_context\nMAX_CONTEXT_CHARS]
+    TRUNC --> LLM[LLM Client\nQwen / OpenAI-compatible\nretries + JSON validation]
+    LLM -->|Diagnosis payload| DIAG[RCA JSON:\nroot_cause / evidence /\nsuggested_fix / severity]
+    DIAG --> REPORT[format_report\nSlack / Telegram text]
+    REPORT --> API
+
+    subgraph Guardrails
+        G1[ALLOWED_NAMESPACES]
+        G2[MAX_LOG_LINES]
+        G3[ENABLE_WRITE_ACTIONS=false]
+    end
+    G1 -.enforced by.-> ORCH
+    G2 -.enforced by.-> ORCH
+    G3 -.enforced by.-> ORCH
 ```
 
-## Запуск
+Pipeline in one line:
 
-### Локально (без Docker)
+`Alertmanager → POST /diagnose → IncidentOrchestrator → [K8sTools, PrometheusTools, LogsTools] → RunbookRAG → LLM → RCA → Report`
+
+---
+
+## Quick Start
+
+### 1. Configure environment
+
+```bash
+cp .env.example .env
+# edit .env: set QWEN_API_KEY (or OPENAI_API_KEY), KUBECONFIG_PATH, PROMETHEUS_URL
+```
+
+| Variable | Default | Description |
+|---|---|---|
+| `KUBECONFIG_PATH` | `~/.kube/config` | Path to the kubeconfig used by K8sTools/LogsTools. |
+| `PROMETHEUS_URL` | `http://localhost:9090` | Base URL of your Prometheus instance. |
+| `LOG_LEVEL` | `INFO` | Application log level (`DEBUG` also logs prompts/LLM responses, without secrets). |
+| `QWEN_API_KEY` / `OPENAI_API_KEY` | — | LLM API key (`QWEN_API_KEY` takes precedence). Never hardcoded, only via env. |
+| `LLM_BASE_URL` | DashScope compatible-mode | OpenAI-compatible endpoint (`.../v1` suffix optional). |
+| `LLM_MODEL` | `qwen-max` | Chat model name — swap freely (gpt-4o-mini, qwen-plus, ...) without code changes. |
+| `CORS_ORIGINS` | `["*"]` | Allowed CORS origins (JSON list, e.g. `["http://localhost:3000"]`). |
+| `ALLOWED_NAMESPACES` | `["default"]` | Namespaces the agent may inspect; anything else → HTTP 403. |
+| `MAX_LOG_LINES` | `200` | Hard cap on `tail_lines` for log retrieval. |
+| `MAX_CONTEXT_CHARS` | `16000` | Max serialized size of the LLM context (long strings get truncated with `... [truncated]`). |
+| `ENABLE_WRITE_ACTIONS` | `false` | Read-only mode. No write path exists in the codebase today. |
+
+### 2. Run locally
 
 ```bash
 python -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
-cp .env.example .env   # заполните переменные окружения
-uvicorn src.main:app --reload
+uvicorn src.main:app --reload --host 0.0.0.0 --port 8000
 ```
 
-### В Docker
+Interactive API docs (Swagger UI): **http://localhost:8000/docs**
 
-Сборка и запуск одним контейнером (секреты подгружаются только в рантайме, `.dockerignore` не пускает `.env` в образ):
+### 3. Run with Docker
 
 ```bash
-cp .env.example .env                      # заполните QWEN_API_KEY / OPENAI_API_KEY и др.
-docker build -t ai-agent-devops .         # многоступенчатая сборка: builder + runtime
-docker run -d --name ai-agent \
-  -p 8000:8000 \
+docker build -t k8s-incident-agent .
+docker run --rm -p 8000:8000 \
   --env-file .env \
-  -v ~/.kube/config:/home/appuser/.kube/config:ro \
-  ai-agent-devops
+  -v "$HOME/.kube/config:/home/appuser/.kube/config:ro" \
+  k8s-incident-agent
 ```
 
-### docker-compose (рекомендуемый локальный вариант)
-
-Поднимает сервис `agent` на порту 8000, подгружает `.env` и монтирует kubeconfig только для чтения:
+### 4. Run with docker-compose
 
 ```bash
-docker compose up --build -d
-docker compose logs -f agent              # логи сервиса
-docker compose down                       # остановка
+docker compose up --build
+# app on http://localhost:8000, kubeconfig and .env mounted read-only
 ```
 
-Проверка работоспособности:
-
-```bash
-curl http://localhost:8000/health
-# {"status":"ok"}
-```
-
-## Переменные окружения
-
-Все настройки читаются из `.env` (см. `.env.example`) через pydantic-settings. Ключи API храните только в `.env` — в репозиторий и в Docker-образ они не попадают.
-
-| Переменная        | По умолчанию                                   | Описание                                                        |
-|-------------------|------------------------------------------------|-----------------------------------------------------------------|
-| `KUBECONFIG_PATH` | `~/.kube/config`                               | Путь к kubeconfig для доступа к кластеру Kubernetes             |
-| `PROMETHEUS_URL`  | `http://localhost:9090`                        | Базовый URL Prometheus для запроса метрик                       |
-| `LOG_LEVEL`       | `INFO`                                         | Уровень логирования: DEBUG / INFO / WARNING / ERROR / CRITICAL  |
-| `OPENAI_API_KEY`  | —                                              | Ключ OpenAI (если используете OpenAI-совместимый API)           |
-| `QWEN_API_KEY`    | —                                              | Ключ Qwen/DashScope (приоритетнее `OPENAI_API_KEY`)             |
-| `LLM_BASE_URL`    | `https://dashscope.aliyuncs.com/compatible-mode` | Base URL LLM-API (OpenAI-совместимый: Qwen, vLLM, Ollama...)  |
-| `LLM_MODEL`       | `qwen-max`                                     | Имя модели LLM                                                  |
-| `ALLOWED_NAMESPACES` | `["default"]`                               | Guardrail: список namespace'ов, к которым агенту разрешён доступ (JSON-массив или через запятую; `["*"]` — разрешить всё) |
-| `MAX_LOG_LINES`   | `200`                                          | Guardrail: максимум строк лога, забираемых у пода               |
-| `ENABLE_WRITE_ACTIONS` | `false`                                   | Guardrail: разрешить агенту write-действия (по умолчанию только чтение) |
-| `CORS_ORIGINS`    | `[\"*\"]`                                      | Список разрешённых CORS origins (JSON-массив). Для прода задайте явно, напр. `[\"http://localhost:3000\"]` |
-| `MAX_CONTEXT_CHARS` | `16000`                                    | Максимальный размер контекста (в символах), передаваемого в LLM; при превышении обрезается с пометкой |
-
-## Безопасность (guardrails)
-
-Агент работает в **read-only режиме по умолчанию** и защищён следующими ограничениями
-(все настраиваются через `.env`, ничего не захардкожено):
-
-1. **ALLOWED_NAMESPACES** — диагностика запускается только для namespace'ов из белого
-   списка. При запросе к запрещённому namespace агент возвращает ошибку
-   `Namespace 'x' not allowed` (HTTP 403 на `/diagnose`) **до** выполнения каких-либо
-   запросов к кластеру. По умолчанию — только `default`.
-2. **MAX_LOG_LINES** — объём читаемых логов ограничен (по умолчанию 200 строк):
-   tail-запрос к API пода обрезается до этого лимита, чтобы не выкачивать гигантские
-   логи и не раздувать контекст LLM.
-3. **ENABLE_WRITE_ACTIONS=false** — агент **только читает** данные (поды, события,
-   метрики, логи) и **предлагает** фиксы в отчёте (`suggested_fix`); он не выполняет
-   никаких изменений в кластере: ни `delete`, ни `exec`, ни `apply`, ни `scale`.
-   Write-операции в коде отсутствуют как класс и не будут включены этим флагом без
-   отдельной явной реализации. Контекст диагностики помечен режимом `read-only`.
-4. **CORS_ORIGINS** — кросс-доменные запросы настраиваются через `.env`
-   (по умолчанию `["*"]` только для dev). Для продакшена ограничьте список
-   конкретных origin'ов вашего UI, например `CORS_ORIGINS=["http://localhost:3000"]`
-   или `["https://alerts.example.com"]` — это исключит произвольные сторонние сайты
-   от вызова `/diagnose`.
-5. **MAX_CONTEXT_CHARS** — объём данных, отправляемых в LLM, ограничен (по умолчанию
-   16000 символов). Перед запросом к модели контекст проходит рекурсивное усечение
-   (`src/utils/text_utils.py::truncate_context`): длинные строки (логи, события)
-   обрезаются с маркером `... [truncated]` (для логов сохраняется хвост), при
-   необходимости усекаются и списки; если JSON всё ещё не влезает — применяется
-   финальное усечение с пометкой `[context truncated]`. Результат всегда
-   JSON-сериализуем — защита от раздувания токенов без падения сериализации.
-
-### Graceful Degradation (устойчивость к сбоям инструментов)
-
-Агент никогда не прерывает диагностику из-за недоступности одного источника данных:
-
-* Если **K8s API недоступен** (`get_pods` бросил исключение или вернул пустой список
-  с ошибкой в логах), оркестратор **не прерывает** цикл: в отчёт добавляется
-  предупреждение `K8s API unavailable, using only Prometheus metrics`, целевой под
-  берётся из алерта (`pod_name`), и диагностика продолжается только по метрикам
-  Prometheus (CPU/память) и логам. K8s-события в этом режиме не запрашиваются.
-* Ошибки Prometheus/логов фиксируются как отдельные warnings, RCA формируется из
-  доступных данных; при полном отсутствии данных LLM честно сообщает о недостатке
-  информации (severity=`unknown`).
-* Все предупреждения видны в ответе `/diagnose` (`warnings`) и в текстовом отчёте.
-
-### Промты и модель LLM
-
-Системный промт SRE-эксперта вынесен в файл `src/prompts/sre_system.txt` — его можно
-редактировать без изменения кода. Если файл отсутствует или пуст, оркестратор логирует
-ошибку и использует встроенный fallback-промт (приложение не падает). Модель LLM
-меняется одной переменной окружения: `LLM_MODEL=qwen-max` (или любая модель вашего
-OpenAI-совместимого провайдера + `LLM_BASE_URL`).
+---
 
 ## API
 
-| Метод | Путь        | Описание                                                        |
-|-------|-------------|-----------------------------------------------------------------|
-| GET   | `/health`   | Живость сервиса → `{"status": "ok"}`                            |
-| GET   | `/ready`    | Проверка доступности K8s API и Prometheus → 200 / 503           |
-| GET   | `/metrics`  | Prometheus-метрики (HTTP + кастомные метрики агента)            |
-| POST  | `/diagnose` | Приём инцидента и запуск диагностики через оркестратор          |
+| Method | Path | Description |
+|---|---|---|
+| `GET` | `/health` | Liveness probe → `{"status": "ok"}`. |
+| `GET` | `/ready` | Checks K8s API + Prometheus reachability → `200` or `503`. |
+| `POST` | `/diagnose` | Accepts an incident, returns `{diagnosis, report}`. |
+| `GET` | `/metrics` | Prometheus exposition format (HTTP + custom metrics). |
 
-### Метрики (`/metrics`)
+### Example: `POST /diagnose`
 
-Стандартные HTTP-метрики предоставляет `prometheus-fastapi-instrumentator`.
-Кастомные метрики агента объявлены в `src/utils/metrics.py`:
-
-| Метрика                      | Тип       | Labels                | Смысл                                        |
-|------------------------------|-----------|-----------------------|----------------------------------------------|
-| `diagnose_requests_total`    | Counter   | namespace, severity   | число выполненных диагностик                  |
-| `diagnose_duration_seconds`  | Histogram | namespace             | длительность `IncidentOrchestrator.diagnose`  |
-| `k8s_api_errors_total`       | Counter   | method                | ошибки Kubernetes API в инструментах          |
-| `llm_fallback_total`         | Counter   | —                     | срабатывания fallback-диагноза (битый JSON)   |
-
-Пример запроса:
+Request:
 
 ```bash
-curl -X POST http://localhost:8000/diagnose \
+curl -s -X POST http://localhost:8000/diagnose \
   -H 'Content-Type: application/json' \
-  -d '{"namespace": "prod", "pod_name": "web-1", "description": "Pod restarts alert"}'
-# -> {"diagnosis": {root_cause, evidence, suggested_fix, severity, ...}, "report": "..."}
+  -d '{
+    "namespace": "default",
+    "pod_name": "payments-api-7d9f4b-x2kq",
+    "description": "Pod payments-api restarts repeatedly, alert: ContainerOOMKilling"
+  }'
 ```
 
-Swagger UI доступен на `/docs`. CORS открыт для всех origins (dev-режим).
-
-## RAG по runbook'ам
-
-Агент умеет подтягивать локальные инструкции (runbook'и) в контекст LLM:
-
-- `RunbookRAG` (`src/agent/rag.py`) при старте читает все `docs/runbooks/*.md`
-  и строит TF-IDF индекс (scikit-learn, без внешних сервисов и эмбеддингов).
-- После сбора логов и событий оркестратор формирует поисковый запрос
-  (описание алерта + статус пода + последние 10 строк логов) и вызывает
-  `find_relevant(query, top_k=2)`.
-- Найденные runbook'и добавляются в контекст как поле `relevant_runbooks`;
-  системный промт (`src/prompts/sre_system.txt`) инструктирует модель опираться
-  на них при формировании `suggested_fix`.
-- **Graceful degradation:** если директория отсутствует, индекс пуст, ничего не
-  найдено или поиск упал — агент работает как раньше (без `relevant_runbooks`).
-
-Чтобы обогатить агента знаниями о вашей инфраструктуре, просто добавьте новый
-`.md`-файл в `docs/runbooks/` — пересборка образа не требуется при монтировании
-директории, либо достаточно перезапуска контейнера.
-
-## Chaos-тест (проверка диагностики искусственного сбоя)
-
-Скрипт `scripts/chaos_test.py` создаёт в кластере pod с заведомо несуществующим
-образом (состояние **ImagePullBackOff**), ждёт 10 секунд, отправляет инцидент на
-`POST /diagnose` и проверяет, что агент в `root_cause` упомянул проблему с образом
-(`image`/`pull`, регистронезависимо). После проверки pod удаляется.
-
-Запуск (нужны доступный кластер и работающий агент):
-
-```bash
-# 1. Запустить агента (в другом терминале):
-uvicorn src.main:app --host 0.0.0.0 --port 8000
-
-# 2. Выполнить chaos-эксперимент:
-python scripts/chaos_test.py
-# опции: --agent-url http://localhost:8000 --wait 10 --namespace default
-```
-
-Код возврата `0` — агент диагностировал сбой, `1` — диагностика не прошла или
-агент недоступен. Скрипт **идемпотентен**: перед созданием он удаляет pod от
-прошлого прогона (если тот остался), а cleanup выполняется даже при ошибке
-диагностики — повторный запуск не падает с «already exists».
-
-> ⚠️ Скрипт выполняет write-операцию над кластером (создание/удаление pod'а) **от
-> имени человека-оператора**. Сам агент остаётся read-only (`ENABLE_WRITE_ACTIONS=false`)
-> и никаких изменений в кластере не производит. Не используйте образ без nodeSelector/
-> tolerations в общем проде — запускайте эксперимент в изолированном/тестовом кластере
-> (kind/minikube). Логика скрипта покрыта unit-тестами с моками (`tests/test_chaos_test.py`).
-
-## Интеграционный тест с kind (end-to-end)
-
-Скрипт `scripts/run_integration_test.sh` поднимает **реальный Kubernetes-кластер**
-([kind](https://kind.sigs.k8s.io/)) из конфигурации `scripts/kind/cluster.yaml`
-(1 control-plane), создаёт «плохой» pod с несуществующим тегом (`kubectl run
-bad-pod --image=nginx:bad-tag` → ImagePullBackOff), запускает агента локально
-(uvicorn), отправляет `POST /diagnose` и через `jq` проверяет, что в ответе
-`root_cause` упоминает `image`/`pull`. В конце кластер всегда удаляется.
-
-```bash
-# Требования: docker, kind, kubectl, jq, python3
-./scripts/run_integration_test.sh
-```
-
-Скрипт **идемпотентен**: leftover-кластер `agent-e2e` и pod `bad-pod` от прошлых
-прогонов удаляются перед созданием новых, cleanup выполняется по `trap EXIT`
-даже при падении проверки. Код возврата `0` — агент успешно диагностировал
-сбой на реальном кластере.
-
-В CI этот сценарий выполняется отдельным job'ом **`integration-test`**
-(использует официальный экшн `engineerd/setup-kind`), который запускается
-**только на push в `main`**, чтобы не замедлять pull request'ы.
-
-## Тесты и линтеры (локально)
-
-Зависимости для разработки — `requirements-dev.txt` (pytest, pytest-cov, httpx, ruff):
-
-```bash
-pip install -r requirements-dev.txt
-
-# Линтер (то же самое, что job "lint" в CI)
-ruff check src tests
-
-# Тесты с покрытием (то же самое, что job "test" в CI)
-python -m pytest --cov=src --cov-report=xml tests/
-```
-
-Текущий набор: **78 passed** (инструменты K8s/Prometheus/логов, оркестратор,
-LLM-клиент с моками HTTP, FastAPI-эндпоинты через TestClient, chaos-скрипт).
-
-## CI/CD
-
-Workflow [`.github/workflows/ci.yml`](.github/workflows/ci.yml) запускается на
-`push` и `pull_request` в `main` и состоит из трёх последовательных jobs:
-
-| Job | Что делает |
-|-----|------------|
-| `lint` | `ruff check src tests` (конфиг — `pyproject.toml`) |
-| `test` | `pytest --cov=src --cov-report=xml tests/`, артефакт `coverage.xml` |
-| `build` | Сборка Docker-образа (`docker/build-push-action`, **без push**) + smoke-тест `/health` |
-| `integration-test` | kind-кластер + ImagePullBackOff + проверка `/diagnose` (только push в main) |
-
-`build` зависит от `test`, `test` — от `lint`: образ не собирается, если код
-не прошёл линтер или тесты красные.
-
-## Пример реального вывода агента
-
-Получен на локальном кластере (kind) во время chaos-эксперимента
-(`scripts/chaos_test.py`): pod `chaos-imagepull-test` был создан с заведомо
-несуществующим образом. Запрос:
-
-```bash
-curl -X POST http://localhost:8000/diagnose \
-  -H 'Content-Type: application/json' \
-  -d '{"namespace": "default", "pod_name": "chaos-imagepull-test", "description": "Pod in ImagePullBackOff"}'
-```
-
-Фрагмент ответа (`diagnosis`):
+Response (excerpt — produced by the real orchestrator pipeline; deterministic LLM stand-in used here to avoid spending API tokens):
 
 ```json
 {
-  "root_cause": "Pod stuck in ImagePullBackOff: image 'ghcr.io/mkft1/this-image-does-not-exist-404:latest' cannot be pulled from the registry (manifest unknown / not found), so the container never starts.",
-  "evidence": [
-    "Pod status: Pending, waiting reason: ImagePullBackOff",
-    "K8s Warning events: 'Failed to pull image ... manifest for tag latest not found' and 'Error: ErrImagePull' (count=6)",
-    "Restart count: 0 — container has never started successfully",
-    "No application logs available (tail returned empty) — consistent with image pull failure"
-  ],
-  "suggested_fix": "Verify the image name and tag in the deployment spec (kubectl describe pod chaos-imagepull-test); push the correct image to ghcr.io or fix the registry path/credentials (imagePullSecrets), then delete the pod to force a fresh pull.",
-  "severity": "high"
+  "diagnosis": {
+    "root_cause": "Container 'payments-api' is being OOMKilled: working set (~488 MiB) has reached the 512Mi memory limit; the batch allocation at 09:40:55 triggers a cgroup OOM kill (3 restarts, matching Warning events).",
+    "evidence": [
+      "container_memory_working_set_bytes = 511705088 bytes (~488 MiB) vs limit 512Mi",
+      "Pod status shows 5 restarts; last state reason: OOMKilled",
+      "K8s Warning event 'OOMKilling' for pod/payments-api-7d9f4b-x2kq",
+      "Logs: 'fatal error: runtime: out of memory' right before container exit",
+      "Runbook oom_killed.md: raise memory limit or cap batch size"
+    ],
+    "suggested_fix": "Increase the container memory limit to 1Gi (kubectl patch) and cap the batch buffer size via PAYMENTS_BATCH_MB=128; then roll the deployment and watch restarts drop to zero.",
+    "severity": "high",
+    "warnings": []
+  },
+  "report": "🟠 *Инцидент: диагностика* (severity: high)\n*Namespace:* `default`, *Pod:* `payments-api-7d9f4b-x2kq`\n..."
 }
 ```
 
-Тот же ответ в формате `report` (для Slack/Telegram, генерируется `format_report()`):
+Note how the last piece of evidence comes from the **RAG-retrieved runbook** (`oom_killed.md`) — retrieved automatically from the pod status + log lines, not hardcoded.
 
-```text
-🟠 *Инцидент: диагностика* (severity: high)
-*Namespace:* `default`, *Pod:* `chaos-imagepull-test`
-*Алерт:* Pod in ImagePullBackOff
+### Example: chaos scenario (ImagePullBackOff)
 
-*Root cause:* Pod stuck in ImagePullBackOff: image 'ghcr.io/mkft1/this-image-does-not-exist-404:latest'
-cannot be pulled from the registry (manifest unknown / not found), so the container never starts.
+After running `python scripts/chaos_test.py` against a live cluster + local agent:
 
-*Evidence:*
-  • Pod status: Pending, waiting reason: ImagePullBackOff
-  • K8s Warning events: 'Failed to pull image ... manifest for tag latest not found' and 'Error: ErrImagePull' (count=6)
-  • Restart count: 0 — container has never started successfully
-  • No application logs available (tail returned empty) — consistent with image pull failure
-
-*Suggested fix:* Verify the image name and tag in the deployment spec
-(kubectl describe pod chaos-imagepull-test); push the correct image to ghcr.io or fix the
-registry path/credentials (imagePullSecrets), then delete the pod to force a fresh pull.
-
-⚠️ *Замечания по сбору данных:*
-  • CPU-метрики по поду chaos-imagepull-test недоступны
-  • Memory-метрики по поду chaos-imagepull-test недоступны
-  • Логи пода chaos-imagepull-test не получены
+```bash
+curl -s -X POST http://localhost:8000/diagnose \
+  -H 'Content-Type: application/json' \
+  -d '{"namespace": "default", "pod_name": "bad-pod", "description": "Pod in ImagePullBackOff"}'
 ```
 
-Обратите внимание: Prometheus и логи для пода, который никогда не стартует, недоступны —
-агент честно фиксирует это в `warnings` и строит RCA по событиям Kubernetes. Это демонстрирует
-деградацию при частичных данных без падения сервиса.
+```json
+{
+  "diagnosis": {
+    "root_cause": "Image pull failure for pod 'bad-pod': the tag 'definitely-bad-tag-404' does not exist in the registry (ErrImagePull -> backoff).",
+    "severity": "medium",
+    "suggested_fix": "Fix the image tag in the Deployment spec to an existing tag (e.g. nginx:1.27) and roll the deployment."
+  }
+}
+```
 
-> Пример сгенерирован реальным пайплайном оркестратора (мок инструментов + LLM-ответ уровня
-> qwen-max); фактический текст LLM может отличаться в зависимости от модели.
+---
 
-## Лицензия
+## Security & Guardrails
 
-MIT — см. [LICENSE](./LICENSE).
+All limits are configuration-driven (see table above), enforced **before** any cluster call:
 
-## Как внести вклад
+1. **Namespace allow-list** — requests for namespaces outside `ALLOWED_NAMESPACES` fail fast with `"Namespace not allowed"` (HTTP 403); no API calls are made.
+2. **Read-only by design** — with `ENABLE_WRITE_ACTIONS=false` the agent only reads data and *suggests* fixes. There is no delete/exec/apply code path in the repository; the flag guards future action-proposing features.
+3. **Bounded context** — log tails capped by `MAX_LOG_LINES`; the whole LLM context is recursively trimmed to `MAX_CONTEXT_CHARS` (long values keep their tail — the freshest log lines — and are marked `... [truncated]`).
+4. **No secrets anywhere** — API keys come exclusively from `.env` (never committed, excluded from the Docker image via `.dockerignore`); prompt/response logging at DEBUG never includes auth headers.
+5. **Graceful degradation** — a failing tool produces a warning in the report ("K8s API unavailable, using only Prometheus metrics"), not a crash.
+6. **Non-root container** — the runtime image runs as `appuser` (UID 10001) with a read-only kubeconfig mount.
 
-См. [CONTRIBUTING.md](./CONTRIBUTING.md).
+---
+
+## Testing
+
+```
+tests/
+├── test_k8s_tools.py         # K8s client mocking (pods/events/deployments/nodes, ApiException paths)
+├── test_prometheus_tools.py  # HTTP mocking: success, timeouts, 5xx, parsing
+├── test_logs_tools.py        # read_namespaced_pod_log mocking
+├── test_orchestrator.py      # full pipeline w/ mocks, graceful degradation, guardrails
+├── test_llm_integration.py   # LLMClient: retries (429/5xx), JSON validation, fallback
+├── test_rag.py               # RunbookRAG on fixture md-files + orchestrator integration
+├── test_text_utils.py        # truncate_context recursion & guarantees
+├── test_chaos_test.py        # chaos script logic (mocked k8s + requests)
+└── test_api.py               # FastAPI TestClient: /health /ready /diagnose /metrics, CORS, errors
+```
+
+- **Unit tests**: every external boundary (Kubernetes API, Prometheus HTTP, LLM HTTP) is mocked — the suite runs offline in ~2 seconds.
+- **Coverage**: `pytest --cov=src --cov-report=xml` — currently **~89%** (uploaded as a CI artifact every run).
+- **Integration (end-to-end)**: `scripts/run_integration_test.sh` spins up a real [kind](https://kind.sigs.k8s.io/) cluster, creates a pod with a bad image tag, runs the agent under uvicorn, sends a real `POST /diagnose`, and asserts the RCA mentions *"image"*/*"pull"* (via `jq`). Idempotent: leftover clusters/pods are removed before each run; cleanup happens even on failure.
+- **CI jobs** (GitHub Actions): `lint` (ruff) → `test` (pytest + coverage) → `build` (Docker, load + smoke-test) → `integration-test` (kind, push to `main` only, so PRs stay fast).
+
+---
+
+## Contributing
+
+### Dev environment
+
+```bash
+python -m venv .venv && source .venv/bin/activate
+pip install -r requirements-dev.txt   # runtime deps + ruff, pytest, pytest-cov, httpx
+```
+
+### Before opening a PR
+
+```bash
+ruff check src tests scripts          # linter (config in pyproject.toml)
+pytest --cov=src tests/               # all tests must pass
+```
+
+### Project rules
+
+- Follow Git flow in this repo: sync with `main` first (`git fetch origin main && git rebase origin/main`), one feature branch per task, clean diffs.
+- Keep the agent **read-only** unless a task explicitly adds guarded write actions.
+- New settings go through `src/config.py` (pydantic-settings) + `.env.example` — never hardcode.
+- Every new tool method must swallow `ApiException`/HTTP errors and return an empty result + logged warning (graceful degradation principle).
+
+### Adding a new runbook (RAG)
+
+1. Create `docs/runbooks/<your_incident>.md` — use the existing files as templates: `Symptoms`, `Root causes`, `How to fix` (with copy-pasteable `kubectl` commands), `Prevention`.
+2. Write naturally — the TF-IDF index is rebuilt at startup, no registration step needed.
+3. Sanity-check retrieval:
+   ```bash
+   python -c "from src.agent.rag import RunbookRAG; print([t.splitlines()[0] for t in RunbookRAG().find_relevant('your sample error text')])"
+   ```
+4. Optionally add a keyword assertion to `tests/test_rag.py`.
+
+---
+
+## Project structure
+
+```
+ai_agent_DevOps/
+├── .github/workflows/ci.yml     # lint → test → build → integration-test (kind)
+├── Dockerfile                   # multi-stage, non-root, healthcheck
+├── docker-compose.yml           # local stack: agent + kubeconfig/.env mounts
+├── docs/runbooks/               # RAG knowledge base (oom_killed, image_pull_backoff, crash_loop)
+├── scripts/
+│   ├── chaos_test.py            # ImagePullBackOff chaos experiment vs /diagnose
+│   ├── run_integration_test.sh  # kind-based end-to-end test
+│   └── kind/cluster.yaml        # kind cluster config
+├── src/
+│   ├── main.py                  # FastAPI app: /health /ready /diagnose /metrics, CORS, error handlers
+│   ├── config.py                # pydantic-settings (.env driven)
+│   ├── prompts/sre_system.txt   # system prompt for the LLM (loaded at init, fallback in code)
+│   ├── agent/
+│   │   ├── orchestrator.py      # IncidentOrchestrator: pipeline, guardrails, degradation, reporting
+│   │   ├── llm_client.py        # OpenAI-compatible client: tenacity retries, 30s timeout
+│   │   ├── rag.py               # RunbookRAG: TF-IDF retrieval over docs/runbooks
+│   │   └── tools/               # k8s_tools.py, prometheus_tools.py, logs_tools.py
+│   └── utils/
+│       ├── logger.py            # stdlib logging setup
+│       ├── metrics.py           # custom Prometheus metrics
+│       └── text_utils.py        # truncate_context (bounded, JSON-safe)
+└── tests/                       # 111 tests, fully mocked externals
+```
+
+---
+
+## License
+
+[MIT](./LICENSE)
