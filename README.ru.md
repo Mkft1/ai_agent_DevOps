@@ -5,13 +5,13 @@
 <h1 align="center">ИИ-агент для диагностики инцидентов в K8s</h1>
 
 
-AI-агент для диагностики инцидентов в Kubernetes. Полная английская версия документации — в [README.md](./README.md). Ниже — оригинальная русская версия README по состоянию на момент перевода (разделы «Архитектура», «Метрики», «Graceful Degradation», «RAG» и др. актуальны; самые свежие детали, Mermaid-диаграмма и примеры реального вывода агента см. в англоязычном README).
+AI-агент для диагностики инцидентов в Kubernetes. Русская и английская ([README.md](./README.md)) версии синхронизированы и описывают актуальное состояние проекта; англоязычная версия дополнительно содержит Mermaid-диаграмму архитектуры и раздел архитектурных решений.
 
 [![CI](https://github.com/Mkft1/ai_agent_DevOps/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/Mkft1/ai_agent_DevOps/actions/workflows/ci.yml)
 [![Python 3.12](https://img.shields.io/badge/python-3.12-blue?logo=python&logoColor=white)](https://www.python.org/downloads/)
 [![Docker](https://img.shields.io/badge/docker-multistage%20image-2496ED?logo=docker&logoColor=white)](./Dockerfile)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](./LICENSE)
-[![Tests](https://img.shields.io/badge/tests-78%20passed-brightgreen?logo=pytest&logoColor=white)](#тесты)
+[![Tests](https://img.shields.io/badge/tests-139%20passed-brightgreen?logo=pytest&logoColor=white)](#тесты)
 [![Ruff](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/astral-sh/ruff/main/assets/badge/v2.json)](https://github.com/astral-sh/ruff)
 
 AI-агент для диагностики инцидентов в Kubernetes.
@@ -76,10 +76,15 @@ Alertmanager → /diagnose → IncidentOrchestrator → [K8sTools, PrometheusToo
 - **Обработка ошибок и отказоустойчивость** — ни один сбой инструмента (ApiException,
   HTTP 5xx, network timeout) не роняет сервис: шаги помечаются в `warnings`, диагностика
   продолжается с частичными данными; ретраи tenacity с экспоненциальной задержкой.
+  Отсутствие kubeconfig при старте деградирует K8s/логи до пустых результатов, а отсутствие
+  LLM-ключа даёт честный `503` с подсказкой (или stub-режим при `LLM_OFFLINE=true`) — не `500`.
+- **Наблюдаемость** — `X-Request-ID` в каждом ответе (эхо входящего или сгенерированный)
+  и структурированное JSON-логирование (`LOG_FORMAT=json`) с корреляцией по `request_id`.
 - **Безопасность (guardrails)** — read-only по умолчанию, белый список namespace'ов,
   лимит строк логов, секреты только через `.env`, non-root контейнер, `.dockerignore`.
-- **Тестирование** — 78 unit/интеграционных тестов (pytest + unittest.mock): инструменты,
-  оркестратор, LLM-клиент (мок HTTP), FastAPI-эндпоинты (TestClient), chaos-скрипт.
+- **Тестирование** — 139 unit/интеграционных тестов (pytest + unittest.mock), покрытие ~92%
+  (гейт в CI `--cov-fail-under=85`): инструменты, оркестратор, LLM-клиент (мок HTTP),
+  FastAPI-эндпоинты (TestClient), конфигурация и логирование, chaos-скрипт.
 - **DevOps-практики** — многоступенчатый Docker-образ, docker-compose, идемпотентный
   chaos-эксперимент (ImagePullBackOff) как end-to-end проверка качества диагностики.
 
@@ -124,13 +129,15 @@ ai_agent_DevOps/
 │       ├── metrics.py     # Кастомные Prometheus-метрики агента
 │       └── text_utils.py  # truncate_context: рекурсивная обрезка контекста для LLM
 ├── docs/
-│   └── runbooks/            # Markdown-runbook'и для RAG (OOMKilled, ImagePullBackOff, CrashLoopBackOff)
+│   ├── assets/              # демо-ассеты (placeholder под будущий demo.gif)
+│   └── runbooks/            # RAG-база: 8 runbook'ов (OOMKilled, ImagePullBackOff, CrashLoop, DNS, NodeNotReady, PVCPending, CreateContainerConfigError, Evicted)
 ├── tests/
 ├── scripts/
 │   ├── chaos_test.py      # chaos-эксперимент: ImagePullBackOff -> /diagnose (идемпотентный)
 │   ├── run_integration_test.sh  # e2e-тест на kind-кластере (создание/диагностика/очистка)
 │   └── kind/
 │       └── cluster.yaml   # конфигурация kind-кластера для интеграционного теста
+├── Makefile               # dev-команды: install/lint/test/run/docker-build/chaos/e2e
 ├── Dockerfile             # многоступенчатый образ (builder + runtime, non-root)
 ├── docker-compose.yml     # локальный запуск сервиса agent (порт 8000)
 ├── .dockerignore          # .git/.env/tests/.venv/__pycache__ не попадают в образ
@@ -147,6 +154,20 @@ python -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
 cp .env.example .env   # заполните переменные окружения
 uvicorn src.main:app --reload
+```
+
+#### Developer shortcuts с `make`
+
+`Makefile` в корне репозитория оборачивает частые команды:
+
+```bash
+make install       # pip install -r requirements.txt -r requirements-dev.txt
+make lint          # ruff check src tests scripts
+make test          # pytest --cov=src --cov-report=term-missing tests/
+make run           # uvicorn src.main:app --host 0.0.0.0 --port 8000 --reload
+make docker-build  # docker build -t ai-agent-devops:local .
+make chaos         # python scripts/chaos_test.py (ImagePullBackOff self-test)
+make e2e           # bash scripts/run_integration_test.sh (kind cluster, end-to-end)
 ```
 
 ### В Docker
@@ -198,6 +219,8 @@ curl http://localhost:8000/health
 | `ENABLE_WRITE_ACTIONS` | `false`                                   | Guardrail: разрешить агенту write-действия (по умолчанию только чтение) |
 | `CORS_ORIGINS`    | `[\"*\"]`                                      | Список разрешённых CORS origins (JSON-массив). Для прода задайте явно, напр. `[\"http://localhost:3000\"]` |
 | `MAX_CONTEXT_CHARS` | `16000`                                    | Максимальный размер контекста (в символах), передаваемого в LLM; при превышении обрезается с пометкой |
+| `LOG_FORMAT`      | `text`                                         | Формат логов: `text` (человекочитаемый) или `json` (structured logging для Loki/CloudWatch) |
+| `LLM_OFFLINE`     | `false`                                        | Демо/оффлайн-режим: без LLM-ключа `/diagnose` отвечает stub-диагнозом вместо честного `503`; в проде держите `false` |
 
 ## Безопасность (guardrails)
 
@@ -241,6 +264,12 @@ curl http://localhost:8000/health
 * Ошибки Prometheus/логов фиксируются как отдельные warnings, RCA формируется из
   доступных данных; при полном отсутствии данных LLM честно сообщает о недостатке
   информации (severity=`unknown`).
+* Если **kubeconfig отсутствует при старте**, `K8sTools`/`LogsTools` не роняют приложение:
+  клиенты помечаются недоступными (`available is False`), методы возвращают пустые
+  результаты с ошибкой в логах и метрикой `k8s_api_errors_total`.
+* Если **не задан LLM-ключ**, `/diagnose` возвращает честный `503` с подсказкой
+  («set QWEN_API_KEY or OPENAI_API_KEY … or LLM_OFFLINE=true»), а не «голый» `500`;
+  при `LLM_OFFLINE=true` используется детерминированная заглушка `LLMClientStub`.
 * Все предупреждения видны в ответе `/diagnose` (`warnings`) и в текстовом отчёте.
 
 ### Промты и модель LLM
@@ -259,6 +288,9 @@ OpenAI-совместимого провайдера + `LLM_BASE_URL`).
 | GET   | `/ready`    | Проверка доступности K8s API и Prometheus → 200 / 503           |
 | GET   | `/metrics`  | Prometheus-метрики (HTTP + кастомные метрики агента)            |
 | POST  | `/diagnose` | Приём инцидента и запуск диагностики через оркестратор          |
+
+Все HTTP-ответы несут заголовок `X-Request-ID` (входящий эхом либо сгенерированный) —
+он же попадает в JSON-логи (`LOG_FORMAT=json`) для корреляции запросов и логов.
 
 ### Метрики (`/metrics`)
 
@@ -362,26 +394,28 @@ bad-pod --image=nginx:bad-tag` → ImagePullBackOff), запускает аге�
 pip install -r requirements-dev.txt
 
 # Линтер (то же самое, что job "lint" в CI)
-ruff check src tests
+ruff check src tests scripts
 
 # Тесты с покрытием (то же самое, что job "test" в CI)
 python -m pytest --cov=src --cov-report=xml tests/
 ```
 
-Текущий набор: **78 passed** (инструменты K8s/Prometheus/логов, оркестратор,
-LLM-клиент с моками HTTP, FastAPI-эндпоинты через TestClient, chaos-скрипт).
+Текущий набор: **139 passed**, покрытие **~92%** (инструменты K8s/Prometheus/логов,
+оркестратор, LLM-клиент с моками HTTP, FastAPI-эндпоинты через TestClient,
+валидация конфигурации, JSON-логирование, chaos-скрипт).
 
 ## CI/CD
 
 Workflow [`.github/workflows/ci.yml`](.github/workflows/ci.yml) запускается на
-`push` и `pull_request` в `main` и состоит из трёх последовательных jobs:
+`push` и `pull_request` в `main` (плюс ручной `workflow_dispatch`) и состоит из
+четырёх последовательных jobs:
 
 | Job | Что делает |
 |-----|------------|
-| `lint` | `ruff check src tests` (конфиг — `pyproject.toml`) |
-| `test` | `pytest --cov=src --cov-report=xml tests/`, артефакт `coverage.xml` |
+| `lint` | `ruff check src tests scripts` (конфиг — `pyproject.toml`) |
+| `test` | `pytest --cov=src --cov-report=xml --cov-fail-under=85 tests/`, артефакт `coverage.xml` |
 | `build` | Сборка Docker-образа (`docker/build-push-action`, **без push**) + smoke-тест `/health` |
-| `integration-test` | kind-кластер + ImagePullBackOff + проверка `/diagnose` (только push в main) |
+| `integration-test` | kind-кластер + ImagePullBackOff + проверка `/diagnose` (только push в main / ручной запуск; автоматически пропускается, если в репозитории не задан secret `QWEN_API_KEY`/`OPENAI_API_KEY`) |
 
 `build` зависит от `test`, `test` — от `lint`: образ не собирается, если код
 не прошёл линтер или тесты красные.

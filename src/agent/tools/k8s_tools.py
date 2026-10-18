@@ -44,20 +44,44 @@ class K8sTools:
     def __init__(self, kubeconfig_path: str | None = None) -> None:
         """Загружает kubeconfig и создаёт CoreV1Api / AppsV1Api клиенты.
 
+        Graceful degradation: если kubeconfig отсутствует/повреждён — клиенты
+        остаются ``None`` (``available is False``), а публичные методы
+        возвращают пустые результаты с ошибкой в логах, не роняя приложение.
+
         Args:
             kubeconfig_path: явный путь к kubeconfig; если не задан —
                 берётся из ``get_settings().kubeconfig_path``.
         """
         path = kubeconfig_path or get_settings().kubeconfig_path
         path = os.path.expanduser(path)
+        self._core: kubernetes.client.CoreV1Api | None = None
+        self._apps: kubernetes.client.AppsV1Api | None = None
         try:
             kubernetes.config.load_kube_config(config_file=path)
         except Exception as exc:  # ConfigException и пр. ошибки чтения файла
-            logger.error("Не удалось загрузить kubeconfig '%s': %s", path, exc)
-            raise
+            logger.error(
+                "Не удалось загрузить kubeconfig '%s': %s — K8s-инструменты "
+                "переходят в degraded-режим (пустые результаты)",
+                path,
+                exc,
+            )
+            return
         self._core = kubernetes.client.CoreV1Api()
         self._apps = kubernetes.client.AppsV1Api()
         logger.debug("K8sTools инициализирован (kubeconfig: %s)", path)
+
+    @property
+    def available(self) -> bool:
+        """True, если kubeconfig загружен и клиенты Kubernetes созданы."""
+        return self._core is not None
+
+    def _degraded(self, method: str) -> None:
+        """Логирует и учитывает метрикой обращение в degraded-режиме."""
+        inc_k8s_api_error(method)
+        logger.error(
+            "K8s client not initialized (no kubeconfig) — %s returns empty result",
+            method,
+        )
 
     # ------------------------------------------------------------------
     # Публичные методы
@@ -70,8 +94,11 @@ class K8sTools:
 
         Returns:
             Список словарей с полями: name, status, restarts, node, age, labels.
-            Пустой список при ошибке API.
+            Пустой список при ошибке API или недоступном kubeconfig.
         """
+        if self._core is None:
+            self._degraded("get_pods")
+            return []
         try:
             pods = self._core.list_namespaced_pod(namespace=namespace).items
         except ApiException as exc:
@@ -111,8 +138,12 @@ class K8sTools:
 
         Returns:
             Список словарей с полями: type, reason, message, involved_object,
-            count, last_timestamp. Пустой список при ошибке API.
+            count, last_timestamp. Пустой список при ошибке API или
+            недоступном kubeconfig.
         """
+        if self._core is None:
+            self._degraded("get_events")
+            return []
         try:
             events = self._core.list_namespaced_event(namespace=namespace).items
         except ApiException as exc:
@@ -160,8 +191,11 @@ class K8sTools:
         Returns:
             Список словарей с полями: name, replicas, ready_replicas,
             updated_replicas, available_replicas, image.
-            Пустой список при ошибке API.
+            Пустой список при ошибке API или недоступном kubeconfig.
         """
+        if self._apps is None:
+            self._degraded("get_deployments")
+            return []
         try:
             deployments = self._apps.list_namespaced_deployment(namespace=namespace).items
         except ApiException as exc:
@@ -195,8 +229,12 @@ class K8sTools:
 
         Returns:
             Список словарей с полями: name, status, roles, cpu_capacity,
-            memory_capacity, conditions. Пустой список при ошибке API.
+            memory_capacity, conditions. Пустой список при ошибке API или
+            недоступном kubeconfig.
         """
+        if self._core is None:
+            self._degraded("get_nodes")
+            return []
         try:
             nodes = self._core.list_node().items
         except ApiException as exc:

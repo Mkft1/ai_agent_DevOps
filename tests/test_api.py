@@ -263,3 +263,83 @@ def _counter_value(client: TestClient, name: str) -> float:
         if base == name:
             total += float(value)
     return total
+
+
+class TestRequestID:
+    """Middleware X-Request-ID: генерация и эхо для корреляции логов."""
+
+    def test_generated_when_absent(self, client: TestClient) -> None:
+        resp = client.get("/health")
+        rid = resp.headers.get("x-request-id")
+        assert rid and len(rid) == 16
+
+    def test_echoed_when_provided(self, client: TestClient) -> None:
+        resp = client.get("/health", headers={"X-Request-ID": "trace-42"})
+        assert resp.headers["x-request-id"] == "trace-42"
+
+
+def _boom(*args, **kwargs):
+    raise Exception("hermetic test: external dependency disabled")
+
+
+@pytest.fixture()
+def hermetic_env(monkeypatch: pytest.MonkeyPatch):
+    """Изоляция от окружения разработчика: нет kubeconfig, Prometheus, LLM-ключа."""
+    from src.agent import llm_client
+    from src.config import Settings
+
+    monkeypatch.setattr(
+        llm_client,
+        "get_settings",
+        lambda: Settings(_env_file=None, qwen_api_key=None, openai_api_key=None),
+    )
+    monkeypatch.setattr(
+        "src.agent.tools.k8s_tools.kubernetes.config.load_kube_config", _boom
+    )
+    monkeypatch.setattr(
+        "src.agent.tools.logs_tools.kubernetes.config.load_kube_config", _boom
+    )
+    monkeypatch.setattr("src.agent.tools.prometheus_tools.requests.get", _boom)
+
+
+@pytest.fixture()
+def fresh_orchestrator(monkeypatch: pytest.MonkeyPatch):
+    """Сброс singleton-оркестратора и флага offline между тестами."""
+    import src.main as main_module
+
+    monkeypatch.setattr(main_module, "_orchestrator", None)
+    monkeypatch.setattr(main_module.settings, "llm_offline", False)
+    yield
+    main_module._orchestrator = None
+    main_module.settings.llm_offline = False
+
+
+class TestOrchestratorBootstrap:
+    """Старт оркестратора: честный 503 без ключа и stub-режим LLM_OFFLINE=true."""
+
+    def test_diagnose_503_when_llm_not_configured(
+        self, client: TestClient, hermetic_env, fresh_orchestrator
+    ) -> None:
+        resp = client.post("/diagnose", json={"namespace": "default", "pod_name": "web-1"})
+        assert resp.status_code == 503
+        assert "LLM is not configured" in resp.json()["detail"]
+
+    def test_diagnose_offline_stub_mode(
+        self, client: TestClient, hermetic_env, fresh_orchestrator, monkeypatch
+    ) -> None:
+        import src.main as main_module
+
+        monkeypatch.setattr(main_module.settings, "llm_offline", True)
+        resp = client.post(
+            "/diagnose",
+            json={
+                "namespace": "default",
+                "pod_name": "web-1",
+                "description": "Pod in ImagePullBackOff",
+            },
+        )
+        assert resp.status_code == 200
+        body = resp.json()
+        assert "[stub]" in body["diagnosis"]["root_cause"]
+        # Graceful degradation: внешние системы недоступны — честные warnings.
+        assert body["diagnosis"]["warnings"]
