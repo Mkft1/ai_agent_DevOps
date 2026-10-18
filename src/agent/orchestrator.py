@@ -485,6 +485,10 @@ class IncidentOrchestrator:
         user_prompt = (
             f"Данные диагностики:\n{self._limit_context(context_json)}"
         )
+        # Грубая оценка стоимости запроса в токенах (1 токен ~ 4 символа).
+        # Только для наблюдаемости: не блокирует вызов — truncate_context уже
+        # ограничил контекст по символам.
+        self._log_token_estimate(user_prompt)
         llm_raw = ""
         try:
             diagnosis_dict, llm_raw = self._query_llm(context, user_prompt)
@@ -509,6 +513,34 @@ class IncidentOrchestrator:
             len(result.warnings),
         )
         return result.model_dump()
+        def _log_token_estimate(self, user_prompt: str) -> None:
+        """Залогировать грубую оценку токенов перед вызовом LLM.
+
+        INFO-строка содержит оценку для системного промта, пользовательского
+        промта (контекста) и ожидаемого ответа (короткий JSON ~ 300 токенов).
+        Если суммарная оценка превышает ``TOKEN_SOFT_LIMIT`` (8000 токенов —
+        примерный лимит дешёвых моделей), добавляется WARNING о возможном
+        превышении контекста. Запрос при этом НЕ блокируется: размер контекста
+        уже ограничен ``truncate_context``/MAX_CONTEXT_CHARS.
+        """
+        system_tokens = estimate_tokens(SYSTEM_PROMPT)
+        user_tokens = estimate_tokens(user_prompt)
+        expected_response_tokens = 300  # короткий RCA-JSON по формату промта
+        total = system_tokens + user_tokens + expected_response_tokens
+        logger.info(
+            "LLM token estimate: system=%d, context=%d, expected_response=%d, total=%d",
+            system_tokens,
+            user_tokens,
+            expected_response_tokens,
+            total,
+        )
+        if total > TOKEN_SOFT_LIMIT:
+            logger.warning(
+                "Prompt exceeds soft token limit (%d > %d): possible context "
+                "overflow for small models; request is NOT blocked",
+                total,
+                TOKEN_SOFT_LIMIT,
+            )
 
     # ------------------------------------------------------------------
     # Взаимодействие с LLM: запрос, валидация, retry, fallback
