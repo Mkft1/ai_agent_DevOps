@@ -11,7 +11,7 @@ AI-агент для диагностики инцидентов в Kubernetes. 
 [![Python 3.12](https://img.shields.io/badge/python-3.12-blue?logo=python&logoColor=white)](https://www.python.org/downloads/)
 [![Docker](https://img.shields.io/badge/docker-multistage%20image-2496ED?logo=docker&logoColor=white)](./Dockerfile)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](./LICENSE)
-[![Tests](https://img.shields.io/badge/tests-222%20passed-brightgreen?logo=pytest&logoColor=white)](#тесты)
+[![Tests](https://img.shields.io/badge/tests-231%20passed-brightgreen?logo=pytest&logoColor=white)](#тесты)
 [![Ruff](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/astral-sh/ruff/main/assets/badge/v2.json)](https://github.com/astral-sh/ruff)
 
 AI-агент для диагностики инцидентов в Kubernetes.
@@ -91,11 +91,14 @@ Alertmanager → /diagnose → IncidentOrchestrator → [K8sTools, PrometheusToo
   лимит строк логов, секреты только через `.env`, non-root контейнер, `.dockerignore`,
   политика опасных действий: рекомендации с `delete`/`drop`/`rm -rf`/`scale 0`
   помечаются `requires_approval: true` и уходят на аппрув человеку в Slack.
+- **Helm-чарт** — production-ready `charts/ai-agent` (v0.1.0): Deployment с probes
+  и non-root securityContext, ClusterIP Service, least-privilege RBAC,
+  ConfigMap/Secret из `values.yaml`, `make helm-lint` / `make helm-install`.
 - **Дашборд оператора** — `make dashboard`: Streamlit-UI поверх журнала аудита
   (таблица инцидентов Timestamp/Namespace/Severity/Root Cause, метрики по severity,
   карточки аппрува с `suggested_fix` и кнопкой "Approve & Apply" для инцидентов с
   `requires_approval=true`); запускается отдельно от FastAPI, кластер не трогает.
-- **Тестирование** — 222 unit/интеграционных тестов (pytest + unittest.mock), покрытие ~92%
+- **Тестирование** — 236 unit/интеграционных тестов (pytest + unittest.mock), покрытие ~92%
   (гейт в CI `--cov-fail-under=85`): инструменты, оркестратор, LLM-клиент (мок HTTP),
   FastAPI-эндпоинты (TestClient), конфигурация и логирование, chaos-скрипт.
 - **DevOps-практики** — многоступенчатый Docker-образ, docker-compose, идемпотентный
@@ -159,6 +162,8 @@ ai_agent_DevOps/
 │   ├── agent-rbac.yaml      # least-privilege SA/Role/RoleBinding (только чтение)
 │   └── policies/            # Kyverno ClusterPolicies: lockdown kube-system,
 │                            # гейт agent-managed=true для write-действий
+├── charts/ai-agent/         # production Helm-чарт (v0.1.0): deployment, service,
+│                            # SA/RBAC, configmap, secret, helpers
 ├── ui/
 │   └── dashboard.py         # Streamlit-UI оператора поверх audit.jsonl (make dashboard)
 ├── docs/
@@ -684,6 +689,34 @@ registry path/credentials (imagePullSecrets), then delete the pod to force a fre
 
 > Пример сгенерирован реальным пайплайном оркестратора (мок инструментов + LLM-ответ уровня
 > qwen-max); фактический текст LLM может отличаться в зависимости от модели.
+
+## Деплой в Kubernetes (Helm)
+
+В репозитории — production-ready Helm-чарт (`charts/ai-agent`, версия 0.1.0):
+
+```bash
+make helm-lint          # helm lint charts/ai-agent
+make helm-install       # helm upgrade --install ai-agent charts/ai-agent -f charts/ai-agent/values.yaml
+# или с ключом LLM:
+helm upgrade --install ai-agent charts/ai-agent \
+  --namespace ai-agent --create-namespace \
+  --set secrets.llmApiKey="$QWEN_API_KEY"
+
+kubectl -n ai-agent port-forward svc/ai-agent 8000:8000
+curl -s localhost:8000/health
+```
+
+Из коробки: Deployment с liveness (`/health`) и readiness (`/ready`) probes,
+checksum-аннотациями ConfigMap/Secret (смена конфига перекатывает поды),
+`runAsNonRoot: true` (UID 10001), `readOnlyRootFilesystem`, dropped capabilities,
+requests/limits и emptyDir под журнал аудита; Service (ClusterIP, порт 8000);
+ServiceAccount + Role/RoleBinding только с read-verb'ами (согласовано с
+Kyverno-политиками в `manifests/`, имя SA `ai-agent`); ConfigMap со всеми
+не-секретными настройками `src/config.py`; Secret для API-ключей
+(`secrets.llmApiKey` → `QWEN_API_KEY`). В production используйте External
+Secrets/Vault: задайте `secrets.existingSecret` — и чарт не создаёт Secret сам.
+Все настройки — в `charts/ai-agent/values.yaml`; CI гоняет `helm lint` +
+`helm template` на каждый push.
 
 ## Интерактивный дашборд
 

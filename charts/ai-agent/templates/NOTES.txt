@@ -1,0 +1,11 @@
+AI Agent DevOps установлен как {{ include "ai-agent.fullname" . }} (namespace: {{ .Release.Namespace }}).
+
+1. Проверить статус:
+   kubectl -n {{ .Release.Namespace }} get pods -l app.kubernetes.io/instance={{ .Release.Name }}
+2. Пробросить API локально:
+   kubectl -n {{ .Release.Namespace }} port-forward svc/{{ include "ai-agent.fullname" . }} 8000:{{ .Values.service.port }}
+   curl -s localhost:8000/health
+3. Дашборд оператора (на вашей машине, читает audit.jsonl):
+   make dashboard
+4. Без LLM-ключа pod будет отвечать 503 на /diagnose: задайте
+   helm upgrade {{ .Release.Name }} charts/ai-agent --set secrets.llmApiKey=...

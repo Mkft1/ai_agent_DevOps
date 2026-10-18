@@ -30,6 +30,21 @@ jobs:
       - name: Run ruff check
         run: ruff check src tests scripts eval ui
 
+  helm:
+    name: Helm lint & template
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      - name: Install Helm
+        run: curl -fsSL https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
+      - name: helm lint
+        run: helm lint charts/ai-agent
+      - name: helm template (render + YAML validation)
+        run: |
+          helm template ai-agent charts/ai-agent --set secrets.llmApiKey=ci-placeholder \
+            | python3 -c 'import sys, yaml; docs=[d for d in yaml.safe_load_all(sys.stdin) if d]; kinds=sorted({d["kind"] for d in docs}); print(kinds); assert "Deployment" in kinds and "Secret" in kinds'
+
   test:
     name: Tests (pytest + coverage)
     runs-on: ubuntu-latest

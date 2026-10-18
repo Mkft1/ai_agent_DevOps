@@ -1,0 +1,28 @@
+apiVersion: v2
+name: ai-agent
+description: >-
+  Production-ready chart for the K8s Incident Diagnosis AI Agent: FastAPI service
+  with LLM-powered RCA, hybrid RAG over runbooks, Prometheus metrics, OTel tracing,
+  Alertmanager webhook and audit journal. Read-only by default (least-privilege RBAC).
+type: application
+version: 0.1.0
+appVersion: "0.1.0"
+# Поддерживаемые версии Kubernetes (RBAC v1, probes, seccompProfile RuntimeDefault)
+kubeVersion: ">=1.24.0-0"
+keywords:
+  - ai
+  - llm
+  - sre
+  - kubernetes
+  - incident-response
+  - rag
+  - observability
+home: https://github.com/Mkft1/ai_agent_DevOps
+sources:
+  - https://github.com/Mkft1/ai_agent_DevOps
+maintainers:
+  - name: Mkft1
+annotations:
+  # Типы workload'ов, для которых предназначен чарт: stateless API-сервис
+  category: "application"
+  licenses: "MIT"

@@ -30,8 +30,9 @@ The agent is strictly **read-only by default**: it never mutates the cluster (`E
 | 📊 **Observability** | `/metrics` endpoint (`prometheus-fastapi-instrumentator`) + custom counters/histograms: `diagnose_requests_total`, `diagnose_duration_seconds`, `k8s_api_errors_total`, `llm_fallback_total`. `X-Request-ID` correlation (echoed/generated per request), optional structured JSON logging (`LOG_FORMAT=json`) for Loki/CloudWatch, an append-only audit journal (`AUDIT_LOG_PATH`, JSON Lines) of every diagnosis, and **OpenTelemetry distributed tracing** (auto HTTP spans + manual spans per K8s/Prometheus/logs/RAG/LLM call, OTLP export to Jaeger/Tempo). |
 | 🚨 **Alertmanager webhook** | `POST /webhook/alertmanager` accepts the standard Alertmanager payload, diagnoses every `firing` alert (namespace/pod from labels, text from `annotations.summary`/`description`), skips `resolved`, and answers `400` on malformed payloads. |
 | 🔁 **Chaos self-test** | `scripts/chaos_test.py` creates an ImagePullBackOff pod, asks the agent to diagnose it, asserts the RCA mentions "image"/"pull", and cleans up. Idempotent. |
+| ☸️ **Helm chart** | Production-ready `charts/ai-agent` (v0.1.0): Deployment with probes & non-root securityContext, ClusterIP Service, least-privilege RBAC, ConfigMap/Secret from `values.yaml`, `make helm-lint` / `make helm-install`. |
 | 🖥️ **Operator dashboard** | `make dashboard` — Streamlit UI over the audit journal: incident table (Timestamp/Namespace/Severity/Root Cause), severity metrics, and approval cards with `suggested_fix` + "Approve & Apply" for every `requires_approval` incident. |
-| 🧪 **Testing & CI/CD** | 222 unit/integration tests with mocked clients (92% coverage, CI gate `--cov-fail-under=85`, SentenceTransformer mocked so tests never download models), plus an offline **evaluation framework** (`make eval`) with a golden dataset and LLM-as-a-judge scoring; | GitHub Actions pipeline: lint → test+coverage → Docker build+smoke → kind-based e2e on `main` (auto-skipped when no LLM secret is configured). |
+| 🧪 **Testing & CI/CD** | 231 unit/integration tests with mocked clients (92% coverage, CI gate `--cov-fail-under=85`, SentenceTransformer mocked so tests never download models), plus an offline **evaluation framework** (`make eval`) with a golden dataset and LLM-as-a-judge scoring; | GitHub Actions pipeline: lint → test+coverage → Docker build+smoke → kind-based e2e on `main` (auto-skipped when no LLM secret is configured). |
 | 🐳 **Containerized** | Multi-stage `python:3.12-slim` image, non-root user, healthcheck, no secrets baked into the image. |
 
 ---
@@ -473,6 +474,45 @@ tests/
 
 ---
 
+## Kubernetes Deployment
+
+The repo ships a production-ready Helm chart (`charts/ai-agent`, version 0.1.0):
+
+```bash
+# 1. Validate the chart
+make helm-lint          # helm lint charts/ai-agent
+
+# 2. Install / upgrade (values file is the single source of truth)
+make helm-install       # helm upgrade --install ai-agent charts/ai-agent -f charts/ai-agent/values.yaml
+# or with your LLM key:
+helm upgrade --install ai-agent charts/ai-agent \
+  --namespace ai-agent --create-namespace \
+  --set secrets.llmApiKey="$QWEN_API_KEY"
+
+# 3. Reach the API
+kubectl -n ai-agent port-forward svc/ai-agent 8000:8000
+curl -s localhost:8000/health
+```
+
+What the chart gives you out of the box:
+
+* **Deployment** with liveness (`/health`) and readiness (`/ready`) probes,
+  checksum-annotated ConfigMap/Secret (config changes roll the pods),
+  `runAsNonRoot: true` (UID 10001), `readOnlyRootFilesystem`, dropped capabilities,
+  resource requests/limits and an emptyDir for the audit journal;
+* **Service** (ClusterIP) exposing the API on port 8000;
+* **ServiceAccount + Role/RoleBinding** — read-only verbs (`get/list/watch`) only,
+  matching the Kyverno policies in `manifests/` (SA name `ai-agent`);
+* **ConfigMap** with all non-secret settings from `src/config.py`
+  (`PROMETHEUS_URL`, `LOG_LEVEL`, guardrails, RAG, OTel, audit path);
+* **Secret** for API keys (`secrets.llmApiKey` → `QWEN_API_KEY`, etc.).
+  In production prefer External Secrets/Vault: set `secrets.existingSecret`
+  and the chart will not create the Secret itself.
+
+All knobs live in `charts/ai-agent/values.yaml` (replicas, image tag, resources,
+env, probes, securityContexts, nodeSelector/tolerations/affinity). CI runs
+`helm lint` + `helm template` on every push, so the chart cannot silently rot.
+
 ## Interactive Dashboard
 
 A lightweight Streamlit UI for on-call operators (runs **separately** from the FastAPI
@@ -579,7 +619,9 @@ ai_agent_DevOps/
 │       ├── logger.py            # stdlib logging setup
 │       ├── metrics.py           # custom Prometheus metrics
 │       └── text_utils.py        # truncate_context (bounded, JSON-safe)
-└── tests/                       # 222 tests, fully mocked externals
+├── charts/ai-agent/             # production Helm chart (v0.1.0): deployment,
+│                                # service, SA/RBAC, configmap, secret, helpers
+└── tests/                       # 231 tests, fully mocked externals
 ```
 
 ---

@@ -119,3 +119,19 @@ class TestDegradedModeWithoutKubeconfig:
             degraded.get_container_logs(namespace="default", pod_name="web-1", container="app")
             == ""
         )
+
+
+class TestInClusterConfigFallback:
+    def test_incluster_used_when_kubeconfig_missing(self) -> None:
+        with patch(
+            "src.agent.tools.logs_tools.kubernetes.config.load_kube_config",
+            side_effect=Exception("no kubeconfig"),
+        ), patch(
+            "src.agent.tools.logs_tools.kubernetes.config.load_incluster_config",
+        ) as incluster, patch(
+            "src.agent.tools.logs_tools.kubernetes.client.CoreV1Api"
+        ) as core_cls:
+            tools = LogsTools(kubeconfig_path="/nonexistent")
+        incluster.assert_called_once()
+        assert tools.available is True
+        assert tools._core is core_cls.return_value
