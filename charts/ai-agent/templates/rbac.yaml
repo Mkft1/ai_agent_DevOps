@@ -1,0 +1,28 @@
+{{- if .Values.rbac.create }}
+# Read-only Role: агент диагностирует (читает), но не изменяет кластер.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ include "ai-agent.fullname" . }}-read-only
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "ai-agent.labels" . | nindent 4 }}
+rules:
+  {{- toYaml .Values.rbac.rules | nindent 2 }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ include "ai-agent.fullname" . }}-read-only
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "ai-agent.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ include "ai-agent.fullname" . }}-read-only
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "ai-agent.serviceAccountName" . }}
+    namespace: {{ .Release.Namespace }}
+{{- end }}
