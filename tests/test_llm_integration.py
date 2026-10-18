@@ -20,7 +20,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 import requests
 
-from src.agent.llm_client import LLMClient, LLMError
+from src.agent.llm_client import LLMAuthError, LLMClient, LLMError
 from src.agent.orchestrator import (
     SYSTEM_PROMPT,
     Diagnosis,
@@ -131,11 +131,29 @@ class TestLLMClientHTTP:
 
     @patch("src.agent.llm_client.requests.post")
     def test_non_retryable_4xx_raises_llmerror(self, post: MagicMock):
-        post.return_value = http_response(401)
+        post.return_value = http_response(400)
         client = make_client()
         with pytest.raises(LLMError):
             client.generate(system_prompt="s", user_prompt="u")
-        assert post.call_count == 1  # 401 не ретраится
+        assert post.call_count == 1  # 400 не ретраится
+
+    @patch("src.agent.llm_client.requests.post")
+    def test_auth_401_raises_llmautherror_no_retry(self, post: MagicMock):
+        """401 — неверный ключ: отдельный тип ошибки, без ретраев."""
+        post.return_value = http_response(401)
+        client = make_client()
+        with pytest.raises(LLMAuthError):
+            client.generate(system_prompt="s", user_prompt="u")
+        assert post.call_count == 1
+
+    @patch("src.agent.llm_client.requests.post")
+    def test_auth_403_raises_llmautherror_no_retry(self, post: MagicMock):
+        """403 — ключ без прав/заблокирован: тоже LLMAuthError, без ретраев."""
+        post.return_value = http_response(403)
+        client = make_client()
+        with pytest.raises(LLMAuthError):
+            client.generate(system_prompt="s", user_prompt="u")
+        assert post.call_count == 1
 
     def test_missing_api_key_raises(self):
         with pytest.raises(LLMError):

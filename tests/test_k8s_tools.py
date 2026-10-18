@@ -174,3 +174,20 @@ def test_init_loads_kubeconfig_from_settings() -> None:
     load_cfg.assert_called_once()
     assert load_cfg.call_args.kwargs["config_file"].endswith("custom-config")
     assert "~" not in load_cfg.call_args.kwargs["config_file"]
+
+
+class TestDegradedModeWithoutKubeconfig:
+    """Нет kubeconfig — инструменты не роняют сервис, а возвращают пусто."""
+
+    def test_init_does_not_raise_and_methods_return_empty(self) -> None:
+        with patch(
+            "src.agent.tools.k8s_tools.kubernetes.config.load_kube_config",
+            side_effect=Exception("kubeconfig not found"),
+        ):
+            degraded = K8sTools(kubeconfig_path="/nonexistent/config")
+
+        assert degraded.available is False
+        assert degraded.get_pods(namespace="default") == []
+        assert degraded.get_events(namespace="default") == []
+        assert degraded.get_deployments(namespace="default") == []
+        assert degraded.get_nodes() == []

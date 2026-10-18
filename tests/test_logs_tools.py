@@ -101,3 +101,21 @@ class TestSearchErrors:
     def test_empty_input(self, tools: LogsTools) -> None:
         """Пустой вход -> пустой список."""
         assert LogsTools.search_errors("") == []
+
+
+class TestDegradedModeWithoutKubeconfig:
+    """Нет kubeconfig — чтение логов деградирует до пустой строки без исключений."""
+
+    def test_init_does_not_raise_and_methods_return_empty(self) -> None:
+        with patch(
+            "src.agent.tools.logs_tools.kubernetes.config.load_kube_config",
+            side_effect=Exception("kubeconfig not found"),
+        ):
+            degraded = LogsTools(kubeconfig_path="/nonexistent/config")
+
+        assert degraded.available is False
+        assert degraded.get_pod_logs(namespace="default", pod_name="web-1") == ""
+        assert (
+            degraded.get_container_logs(namespace="default", pod_name="web-1", container="app")
+            == ""
+        )
