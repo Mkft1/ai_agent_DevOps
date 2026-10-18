@@ -10,3 +10,7 @@ pytest
 tenacity
 prometheus-fastapi-instrumentator
 scikit-learn
+opentelemetry-api
+opentelemetry-sdk
+opentelemetry-instrumentation-fastapi
+opentelemetry-exporter-otlp

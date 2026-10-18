@@ -20,6 +20,12 @@ from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
+from opentelemetry import trace
+from opentelemetry.exporter.otlp.proto.grpc.trace_exporter import OTLPSpanExporter
+from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
+from opentelemetry.sdk.resources import Resource
+from opentelemetry.sdk.trace import TracerProvider
+from opentelemetry.sdk.trace.export import BatchSpanProcessor
 from prometheus_fastapi_instrumentator import Instrumentator
 from pydantic import BaseModel, Field, ValidationError
 from starlette.middleware.base import BaseHTTPMiddleware
@@ -77,6 +83,42 @@ class RequestIDMiddleware(BaseHTTPMiddleware):
 
 
 app.add_middleware(RequestIDMiddleware)
+
+
+# ----------------------------------------------------------------------
+# OpenTelemetry: распределённый трейсинг (Jaeger/Tempo через OTLP gRPC).
+# Экспорт включается только при заданном OTEL_EXPORTER_OTLP_ENDPOINT;
+# без него спаны собираются in-process и никуда не отправляются.
+# ----------------------------------------------------------------------
+def setup_tracing(settings: Settings) -> TracerProvider:
+    """Инициализировать OTel TracerProvider и OTLP-экспорт (если настроен).
+
+    Args:
+        settings: конфигурация приложения (``otel_service_name``,
+            ``otel_exporter_otlp_endpoint``).
+
+    Returns:
+        Активный :class:`TracerProvider` (SDK) — тесты могут добавлять
+        в него своих span-процессоров (например, InMemorySpanExporter).
+    """
+    provider = TracerProvider(
+        resource=Resource.create({"service.name": settings.otel_service_name})
+    )
+    if settings.otel_exporter_otlp_endpoint:
+        # Jaeger all-in-one слушает gRPC OTLP на 4317 (схема http -> insecure).
+        provider.add_span_processor(
+            BatchSpanProcessor(OTLPSpanExporter(endpoint=settings.otel_exporter_otlp_endpoint))
+        )
+        logger.info("OTel tracing: exporting to %s", settings.otel_exporter_otlp_endpoint)
+    else:
+        logger.info("OTel tracing: OTEL_EXPORTER_OTLP_ENDPOINT not set — export disabled")
+    trace.set_tracer_provider(provider)
+    return provider
+
+
+setup_tracing(settings)
+# Авто-спаны на каждый HTTP-запрос (method, path, status, latency).
+FastAPIInstrumentor.instrument_app(app)
 
 # Prometheus: стандартные HTTP-метрики (информационные) + эндпоинт /metrics.
 # Кастомные метрики агента объявлены в src/utils/metrics.py и попадают в
