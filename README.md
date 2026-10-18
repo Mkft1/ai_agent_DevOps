@@ -32,6 +32,13 @@ AI-агент для диагностики инцидентов в Kubernetes.
                                                  |
                                        структурированный контекст (dict)
                                                  v
+                       структурированный контекст (+ relevant_runbooks из RAG)
+                                                 v
+                                    +--------------------------+
+                                    | RunbookRAG (TF-IDF по    |
+                                    | docs/runbooks/*.md)      |
+                                    +------------+-------------+
+                                                 v
                                     +--------------------------+
                                     | LLMClient (Qwen/OpenAI-  |
                                     | совместимый API, retries)|
@@ -47,7 +54,7 @@ AI-агент для диагностики инцидентов в Kubernetes.
 Поток простыми словами:
 
 ```
-Alertmanager → /diagnose → IncidentOrchestrator → [K8sTools, PrometheusTools, LogsTools] → LLM → RCA → Report
+Alertmanager → /diagnose → IncidentOrchestrator → [K8sTools, PrometheusTools, LogsTools] → RunbookRAG(docs) → LLM → RCA → Report
 ```
 
 ## Что демонстрирует проект
@@ -74,6 +81,8 @@ Alertmanager → /diagnose → IncidentOrchestrator → [K8sTools, PrometheusToo
 - Читает **метрики** из Prometheus (загрузка CPU/RAM, ошибки, задержки).
 - Собирает и анализирует **логи** контейнеров и компонентов кластера.
 - Проверяет **состояние подов**, деплоев и других ресурсов Kubernetes.
+- Подтягивает релевантные **runbook'и** (RAG по `docs/runbooks/`, TF-IDF) —
+  найденные инструкции попадают в контекст LLM как `relevant_runbooks`.
 - Формирует гипотезу о причине инцидента и предлагает **RCA** (Root Cause Analysis)
   с рекомендациями для on-call инженера.
 
@@ -96,6 +105,7 @@ ai_agent_DevOps/
 │   ├── agent/
 │   │   ├── orchestrator.py  # Оркестрация шагов диагностики (K8s -> контекст -> LLM -> RCA)
 │   │   ├── llm_client.py    # Реальный LLM-клиент (Qwen / OpenAI-совместимый API, ретраи tenacity)
+│   │   ├── rag.py           # RunbookRAG: TF-IDF поиск релевантных runbook'ов по симптомам
 │   │   └── tools/
 │   │       ├── k8s_tools.py         # Инструменты Kubernetes
 │   │       ├── prometheus_tools.py  # Инструменты Prometheus
@@ -106,6 +116,8 @@ ai_agent_DevOps/
 │       ├── logger.py      # Базовое логирование
 │       ├── metrics.py     # Кастомные Prometheus-метрики агента
 │       └── text_utils.py  # truncate_context: рекурсивная обрезка контекста для LLM
+├── docs/
+│   └── runbooks/            # Markdown-runbook'и для RAG (OOMKilled, ImagePullBackOff, CrashLoopBackOff)
 ├── tests/
 ├── scripts/
 │   └── chaos_test.py      # chaos-эксперимент: ImagePullBackOff -> /diagnose (идемпотентный)
@@ -260,6 +272,25 @@ curl -X POST http://localhost:8000/diagnose \
 ```
 
 Swagger UI доступен на `/docs`. CORS открыт для всех origins (dev-режим).
+
+## RAG по runbook'ам
+
+Агент умеет подтягивать локальные инструкции (runbook'и) в контекст LLM:
+
+- `RunbookRAG` (`src/agent/rag.py`) при старте читает все `docs/runbooks/*.md`
+  и строит TF-IDF индекс (scikit-learn, без внешних сервисов и эмбеддингов).
+- После сбора логов и событий оркестратор формирует поисковый запрос
+  (описание алерта + статус пода + последние 10 строк логов) и вызывает
+  `find_relevant(query, top_k=2)`.
+- Найденные runbook'и добавляются в контекст как поле `relevant_runbooks`;
+  системный промт (`src/prompts/sre_system.txt`) инструктирует модель опираться
+  на них при формировании `suggested_fix`.
+- **Graceful degradation:** если директория отсутствует, индекс пуст, ничего не
+  найдено или поиск упал — агент работает как раньше (без `relevant_runbooks`).
+
+Чтобы обогатить агента знаниями о вашей инфраструктуре, просто добавьте новый
+`.md`-файл в `docs/runbooks/` — пересборка образа не требуется при монтировании
+директории, либо достаточно перезапуска контейнера.
 
 ## Chaos-тест (проверка диагностики искусственного сбоя)
 
