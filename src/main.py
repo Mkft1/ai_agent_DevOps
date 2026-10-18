@@ -3,6 +3,7 @@
 Эндпоинты:
     GET  /health    — живность процесса (без внешних зависимостей).
     GET  /ready     — проверка доступности K8s API и Prometheus (200/503).
+    GET  /metrics   — Prometheus-метрики (HTTP-метрики + кастомные метрики агента).
     POST /diagnose  — приём инцидента, запуск IncidentOrchestrator, возврат RCA.
 
 Логика диагностики целиком в оркестраторе — здесь только HTTP-обвязка.
@@ -16,6 +17,7 @@ import requests
 from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
+from prometheus_fastapi_instrumentator import Instrumentator
 from pydantic import BaseModel, Field, ValidationError
 
 from src.agent.orchestrator import (
@@ -45,6 +47,16 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# Prometheus: стандартные HTTP-метрики (информационные) + эндпоинт /metrics.
+# Кастомные метрики агента объявлены в src/utils/metrics.py и попадают в
+# тот же дефолтный REGISTRY — будут видны на /metrics автоматически.
+instrumentator = Instrumentator(
+    should_group_status_codes=True,
+    should_ignore_untemplated=True,
+    excluded_handlers=["/metrics"],
+)
+instrumentator.instrument(app).expose(app, endpoint="/metrics", include_in_schema=False)
 
 
 # ----------------------------------------------------------------------

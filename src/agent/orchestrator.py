@@ -11,6 +11,7 @@ LLM: по умолчанию используется реальный клие�
 from __future__ import annotations
 
 import json
+import time
 from typing import Any, Protocol, runtime_checkable
 
 from pydantic import BaseModel, Field, ValidationError
@@ -21,6 +22,11 @@ from src.agent.tools.logs_tools import LogsTools
 from src.agent.tools.prometheus_tools import PrometheusTools
 from src.config import Settings, get_settings
 from src.utils.logger import get_logger
+from src.utils.metrics import (
+    inc_diagnose_request,
+    inc_llm_fallback,
+    observe_diagnose_duration,
+)
 
 logger = get_logger(__name__)
 
@@ -210,6 +216,32 @@ class IncidentOrchestrator:
     # Основной цикл диагностики
     # ------------------------------------------------------------------
     def diagnose(self, incident: dict | Incident) -> dict:
+        """Публичный вход диагностики с Prometheus-метриками.
+
+        Оборачивает :meth:`_diagnose_impl` в таймер ``diagnose_duration_seconds``
+        (label namespace), после получения
+        результата инкрементирует ``diagnose_requests_total``
+        (labels namespace, severity).
+
+        Args:
+            incident: словарь или модель :class:`Incident`.
+
+        Returns:
+            Словарь-диагноз (см. :meth:`_diagnose_impl`).
+        """
+        ns = (
+            incident.get("namespace") if isinstance(incident, dict)
+            else getattr(incident, "namespace", None)
+        )
+        started = time.perf_counter()
+        try:
+            result = self._diagnose_impl(incident)
+        finally:
+            observe_diagnose_duration(ns, time.perf_counter() - started)
+        inc_diagnose_request(ns, result.get("severity"))
+        return result
+
+    def _diagnose_impl(self, incident: dict | Incident) -> dict:
         """Диагностировать инцидент и вернуть диагноз (dict для API-слоя).
 
         Шаги:
@@ -403,6 +435,7 @@ class IncidentOrchestrator:
         # Fallback: валидного ответа нет — возвращаем диагностируемый результат
         # с пометкой, чтобы API/отчёт были честными перед оператором.
         logger.error("LLM answer still invalid after retry: %s", error2)
+        inc_llm_fallback()
         fallback = {
             "root_cause": (
                 "Не удалось получить валидный RCA от LLM: ответ не прошёл "
