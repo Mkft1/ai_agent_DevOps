@@ -8,7 +8,7 @@
   <img src="docs/assets/demo.gif" alt="Demo: agent diagnosing a Kubernetes incident via /diagnose" width="720"/>
 </p>
 
-# K8s Incident Diagnosis AI Agent
+
 
 [![CI](https://github.com/Mkft1/ai_agent_DevOps/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/Mkft1/ai_agent_DevOps/actions/workflows/ci.yml)
 ![Coverage](https://img.shields.io/badge/coverage-89%25-brightgreen)
