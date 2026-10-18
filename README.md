@@ -1,4 +1,12 @@
-**English | [Русский](./README.ru.md)**
+<p align="center">
+  <a href="./README.md"><b>🇬🇧 English</b></a> &nbsp;|&nbsp; <a href="./README.ru.md"><b>🇷🇺 Читать на русском (Read in Russian)</b></a>
+</p>
+
+<h1 align="center">K8s Incident Diagnosis AI Agent</h1>
+
+<p align="center">
+  <img src="docs/assets/demo.gif" alt="Demo: agent diagnosing a Kubernetes incident via /diagnose" width="720"/>
+</p>
 
 # K8s Incident Diagnosis AI Agent
 
