@@ -1,0 +1,11 @@
+# kind cluster configuration for integration tests (scripts/run_integration_test.sh)
+name: agent-e2e
+nodes:
+  # 1 control-plane node (single-node cluster keeps CI fast and cheap)
+  - role: control-plane
+    kubeadmConfigPatches:
+      - |
+        kind: JoinConfiguration
+        nodeRegistration:
+          kubeletExtraArgs:
+            node-labels: "agent-e2e=true"
