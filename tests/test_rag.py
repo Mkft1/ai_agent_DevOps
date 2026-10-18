@@ -219,3 +219,20 @@ class TestExpandedRunbookLibrary:
             top_k=2,
         )
         assert any("kubelet" in doc.lower() for doc in node)
+
+    def test_config_error_and_eviction_runbooks_retrievable(self):
+        """Новые runbook'и (CreateContainerConfigError, Evicted) находятся RAG'ом."""
+        rag = RunbookRAG()  # реальный docs/runbooks из репозитория
+        assert rag.document_count >= 8
+
+        cfg = rag.find_relevant(
+            'container waiting reason: CreateContainerConfigError, Error: secret "db-creds" not found',
+            top_k=2,
+        )
+        assert any("CreateContainerConfigError" in doc for doc in cfg)
+
+        evicted = rag.find_relevant(
+            "Pod status Failed reason Evicted: node was low on resource memory, MemoryPressure",
+            top_k=2,
+        )
+        assert any("Evicted" in doc for doc in evicted)

@@ -32,22 +32,34 @@ class LogsTools:
     def __init__(self, kubeconfig_path: str | None = None) -> None:
         """Загружает kubeconfig и создаёт CoreV1Api клиент.
 
+        Graceful degradation: если kubeconfig отсутствует/повреждён — клиент
+        остаётся ``None`` (``available is False``), а публичные методы
+        возвращают пустую строку с ошибкой в логах, не роняя приложение.
+
         Args:
             kubeconfig_path: явный путь к kubeconfig; если не задан —
                 берётся из ``get_settings().kubeconfig_path``.
-
-        Raises:
-            Exception: если kubeconfig не найден или повреждён.
         """
         path = kubeconfig_path or get_settings().kubeconfig_path
         path = os.path.expanduser(path)
+        self._core: kubernetes.client.CoreV1Api | None = None
         try:
             kubernetes.config.load_kube_config(config_file=path)
         except Exception as exc:  # ConfigException и пр. ошибки чтения файла
-            logger.error("Не удалось загрузить kubeconfig '%s': %s", path, exc)
-            raise
+            logger.error(
+                "Не удалось загрузить kubeconfig '%s': %s — логи подов "
+                "недоступны (degraded-режим, пустые строки)",
+                path,
+                exc,
+            )
+            return
         self._core = kubernetes.client.CoreV1Api()
         logger.debug("LogsTools инициализирован (kubeconfig: %s)", path)
+
+    @property
+    def available(self) -> bool:
+        """True, если kubeconfig загружен и клиент Kubernetes создан."""
+        return self._core is not None
 
     # ------------------------------------------------------------------
     # Публичные методы
@@ -69,8 +81,17 @@ class LogsTools:
                 (полезно после рестарта/OOMKilled).
 
         Returns:
-            Текст лога; пустая строка при ошибке API или отсутствии логов.
+            Текст лога; пустая строка при ошибке API, отсутствии логов
+            или недоступном kubeconfig.
         """
+        if self._core is None:
+            logger.error(
+                "K8s client not initialized (no kubeconfig) — get_pod_logs "
+                "returns empty string (%s/%s)",
+                namespace,
+                pod_name,
+            )
+            return ""
         kwargs: dict = {
             "name": pod_name,
             "namespace": namespace,
@@ -120,8 +141,18 @@ class LogsTools:
             previous: читать лог предыдущей инкарнации контейнера.
 
         Returns:
-            Текст лога; пустая строка при ошибке API.
+            Текст лога; пустая строка при ошибке API или недоступном
+            kubeconfig.
         """
+        if self._core is None:
+            logger.error(
+                "K8s client not initialized (no kubeconfig) — get_container_logs "
+                "returns empty string (%s/%s:%s)",
+                namespace,
+                pod_name,
+                container,
+            )
+            return ""
         kwargs: dict = {
             "name": pod_name,
             "namespace": namespace,
