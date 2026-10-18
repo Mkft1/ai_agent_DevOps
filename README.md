@@ -25,12 +25,12 @@ The agent is strictly **read-only by default**: it never mutates the cluster (`E
 | 📚 **Hybrid RAG over runbooks** | Local Markdown runbooks (`docs/runbooks/*.md`) ranked by **hybrid search**: `0.5 × TF-IDF` (exact terms) + `0.5 × cosine similarity` of sentence-transformers embeddings (`all-MiniLM-L6-v2`, semantic match). No vector DB, no external service; if the model is unavailable the agent gracefully falls back to pure TF-IDF. Top playbooks are injected into the LLM context as `relevant_runbooks` and drive `suggested_fix`. |
 | ☸️ **Kubernetes integration** | Official Python client: pods, events, deployments, nodes, container logs (including pre-restart logs for OOMKilled/CrashLoopBackOff). |
 | 📈 **Prometheus integration** | instant & range queries, per-pod CPU/memory usage via `container_*` cAdvisor metrics. |
-| 🛡️ **Guardrails** | Namespace allow-list (`ALLOWED_NAMESPACES`), log-size cap (`MAX_LOG_LINES`), context-size cap (`MAX_CONTEXT_CHARS`), read-only mode (`ENABLE_WRITE_ACTIONS`). All configurable via `.env`, nothing hardcoded. |
+| 🛡️ **Guardrails** | Namespace allow-list (`ALLOWED_NAMESPACES`), log-size cap (`MAX_LOG_LINES`), context-size cap (`MAX_CONTEXT_CHARS`), read-only mode (`ENABLE_WRITE_ACTIONS`), and **dangerous-action policy**: fixes mentioning `delete`/`drop`/`rm -rf`/`scale 0` are flagged `requires_approval: true` and routed to a human via Slack. All configurable via `.env`, nothing hardcoded. |
 | 🩹 **Graceful degradation** | If any data source fails (K8s API down, Prometheus unreachable, empty logs), the agent records a warning in the report and continues diagnosing with whatever data it has — it never crashes the pipeline. |
 | 📊 **Observability** | `/metrics` endpoint (`prometheus-fastapi-instrumentator`) + custom counters/histograms: `diagnose_requests_total`, `diagnose_duration_seconds`, `k8s_api_errors_total`, `llm_fallback_total`. `X-Request-ID` correlation (echoed/generated per request), optional structured JSON logging (`LOG_FORMAT=json`) for Loki/CloudWatch, an append-only audit journal (`AUDIT_LOG_PATH`, JSON Lines) of every diagnosis, and **OpenTelemetry distributed tracing** (auto HTTP spans + manual spans per K8s/Prometheus/logs/RAG/LLM call, OTLP export to Jaeger/Tempo). |
 | 🚨 **Alertmanager webhook** | `POST /webhook/alertmanager` accepts the standard Alertmanager payload, diagnoses every `firing` alert (namespace/pod from labels, text from `annotations.summary`/`description`), skips `resolved`, and answers `400` on malformed payloads. |
 | 🔁 **Chaos self-test** | `scripts/chaos_test.py` creates an ImagePullBackOff pod, asks the agent to diagnose it, asserts the RCA mentions "image"/"pull", and cleans up. Idempotent. |
-| 🧪 **Testing & CI/CD** | 170 unit/integration tests with mocked clients (92% coverage, CI gate `--cov-fail-under=85`, SentenceTransformer mocked so tests never download models); GitHub Actions pipeline: lint → test+coverage → Docker build+smoke → kind-based e2e on `main` (auto-skipped when no LLM secret is configured). |
+| 🧪 **Testing & CI/CD** | 189 unit/integration tests with mocked clients (92% coverage, CI gate `--cov-fail-under=85`, SentenceTransformer mocked so tests never download models); GitHub Actions pipeline: lint → test+coverage → Docker build+smoke → kind-based e2e on `main` (auto-skipped when no LLM secret is configured). |
 | 🐳 **Containerized** | Multi-stage `python:3.12-slim` image, non-root user, healthcheck, no secrets baked into the image. |
 
 ---
@@ -114,6 +114,7 @@ cp .env.example .env
 | `LOG_FORMAT` | `text` | `text` (human-readable) or `json` (one JSON object per line for log aggregators). |
 | `LLM_OFFLINE` | `false` | Demo/offline mode: without an LLM key `/diagnose` answers with the deterministic `LLMClientStub` instead of an honest `503`. Keep `false` in production. |
 | `AUDIT_LOG_PATH` | `audit.jsonl` | Append-only audit journal (JSON Lines): one record per diagnosis / guardrail rejection / webhook batch. |
+| `SLACK_WEBHOOK_URL` | — (disabled) | Incoming webhook for human approval of dangerous fixes; unset = WARNING in logs, `requires_approval` still set. |
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | — (disabled) | OTLP/gRPC endpoint for trace export, e.g. `http://localhost:4317` (Jaeger). Unset = tracing collects spans in-process, no export. |
 | `OTEL_SERVICE_NAME` | `ai-agent-devops` | `service.name` resource attribute shown in Jaeger/Tempo. |
 | `ENABLE_HYBRID_RAG` | `true` | Hybrid retrieval (TF-IDF + embeddings). `false` = pure TF-IDF. |
@@ -274,6 +275,38 @@ receivers:
 
 Behaviour: `labels.namespace` → incident namespace (default `default`), `labels.pod`/`labels.pod_name` → pod, `annotations.summary` (else `annotations.description`, else `alertname`) → description; each diagnosis is written to the audit journal (`AUDIT_LOG_PATH`) and returned in `diagnoses[]` together with the Slack/Telegram-ready `report`. Malformed JSON or schema violations return `400`; a guardrail-rejected namespace skips that alert (`skipped++`) instead of failing the whole batch.
 
+## Security Policies & Approvals
+
+The agent never mutates the cluster — but its *suggestions* can be dangerous.
+Before an operator acts on them, a role-based policy gate runs:
+
+1. `src/agent/policies.py::check_policy(suggested_fix)` scans the LLM's recommendation
+   for dangerous commands: `delete`, `drop`, `rm -rf`, `scale 0` (case-insensitive).
+2. If a dangerous pattern is found while the agent is read-only
+   (`ENABLE_WRITE_ACTIONS=false`), the diagnosis is flagged
+   **`requires_approval: true`** (visible in `POST /diagnose` and
+   `POST /webhook/alertmanager` responses, in the audit journal and as a 🔔 line
+   in the Slack/Telegram report).
+3. If `SLACK_WEBHOOK_URL` is configured, the agent posts an approval request to an
+   incoming webhook:
+
+   ```
+   ⚠️ Action Required: Agent suggests dangerous fix: kubectl delete pod bad-pod -n default. Approve or Reject?
+   ```
+
+   Without the webhook the agent logs a `WARNING` (approval still required in the
+   diagnosis) — it never crashes. A Slack outage also cannot break diagnosis:
+   send failures are logged and the response is returned as usual.
+4. Every approval request increments the `approval_requests_total` Prometheus metric.
+
+```bash
+# .env
+SLACK_WEBHOOK_URL=https://hooks.slack.com/services/T000/B000/XXXX
+```
+
+Safe recommendations (raise limits, fix image tags, add probes...) skip the gate:
+`requires_approval: false`, no Slack message.
+
 ## Tracing (OpenTelemetry)
 
 The agent emits **distributed traces** so you can see exactly where milliseconds go:
@@ -341,6 +374,7 @@ tests/
 ├── test_logger.py            # JSON structured logging + request_id correlation
 ├── test_webhook_alertmanager.py  # Alertmanager payload parsing, 400s, resolved-skip, audit journal
 ├── test_tracing.py           # OTel provider, FastAPI auto-spans, manual tool/LLM spans
+├── test_policies.py          # dangerous-fix policy, Slack approval flow, no-webhook fallback
 └── test_api.py               # FastAPI TestClient: /health /ready /diagnose /metrics, CORS, errors, X-Request-ID
 ```
 
@@ -406,6 +440,7 @@ ai_agent_DevOps/
 │   ├── prompts/sre_system.txt   # system prompt for the LLM (loaded at init, fallback in code)
 │   ├── agent/
 │   │   ├── orchestrator.py      # IncidentOrchestrator: pipeline, guardrails, degradation, reporting
+│   │   ├── policies.py          # dangerous-fix policy (delete/drop/rm -rf/scale 0) -> approval
 │   │   ├── llm_client.py        # OpenAI-compatible client: tenacity retries, 30s timeout
 │   │   ├── rag.py               # RunbookRAG: hybrid retrieval (TF-IDF + embeddings) over docs/runbooks
 │   │   └── tools/               # k8s_tools.py, prometheus_tools.py, logs_tools.py
@@ -414,7 +449,7 @@ ai_agent_DevOps/
 │       ├── logger.py            # stdlib logging setup
 │       ├── metrics.py           # custom Prometheus metrics
 │       └── text_utils.py        # truncate_context (bounded, JSON-safe)
-└── tests/                       # 170 tests, fully mocked externals
+└── tests/                       # 189 tests, fully mocked externals
 ```
 
 ---
