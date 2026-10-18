@@ -11,7 +11,7 @@ AI-агент для диагностики инцидентов в Kubernetes. 
 [![Python 3.12](https://img.shields.io/badge/python-3.12-blue?logo=python&logoColor=white)](https://www.python.org/downloads/)
 [![Docker](https://img.shields.io/badge/docker-multistage%20image-2496ED?logo=docker&logoColor=white)](./Dockerfile)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](./LICENSE)
-[![Tests](https://img.shields.io/badge/tests-208%20passed-brightgreen?logo=pytest&logoColor=white)](#тесты)
+[![Tests](https://img.shields.io/badge/tests-213%20passed-brightgreen?logo=pytest&logoColor=white)](#тесты)
 [![Ruff](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/astral-sh/ruff/main/assets/badge/v2.json)](https://github.com/astral-sh/ruff)
 
 AI-агент для диагностики инцидентов в Kubernetes.
@@ -91,7 +91,11 @@ Alertmanager → /diagnose → IncidentOrchestrator → [K8sTools, PrometheusToo
   лимит строк логов, секреты только через `.env`, non-root контейнер, `.dockerignore`,
   политика опасных действий: рекомендации с `delete`/`drop`/`rm -rf`/`scale 0`
   помечаются `requires_approval: true` и уходят на аппрув человеку в Slack.
-- **Тестирование** — 208 unit/интеграционных тестов (pytest + unittest.mock), покрытие ~92%
+- **Дашборд оператора** — `make dashboard`: Streamlit-UI поверх журнала аудита
+  (таблица инцидентов Timestamp/Namespace/Severity/Root Cause, метрики по severity,
+  карточки аппрува с `suggested_fix` и кнопкой "Approve & Apply" для инцидентов с
+  `requires_approval=true`); запускается отдельно от FastAPI, кластер не трогает.
+- **Тестирование** — 213 unit/интеграционных тестов (pytest + unittest.mock), покрытие ~92%
   (гейт в CI `--cov-fail-under=85`): инструменты, оркестратор, LLM-клиент (мок HTTP),
   FastAPI-эндпоинты (TestClient), конфигурация и логирование, chaos-скрипт.
 - **DevOps-практики** — многоступенчатый Docker-образ, docker-compose, идемпотентный
@@ -151,6 +155,8 @@ ai_agent_DevOps/
 ├── eval/
 │   ├── golden_dataset.json  # золотые инциденты: ожидаемый root cause + runbook
 │   └── evaluate.py          # harness LLM-as-a-judge (make eval), без кластера
+├── ui/
+│   └── dashboard.py         # Streamlit-UI оператора поверх audit.jsonl (make dashboard)
 ├── docs/
 │   ├── assets/              # демо-ассеты (placeholder под будущий demo.gif)
 │   └── runbooks/            # RAG-база: 8 runbook'ов (OOMKilled, ImagePullBackOff, CrashLoop, DNS, NodeNotReady, PVCPending, CreateContainerConfigError, Evicted)
@@ -191,6 +197,8 @@ make run           # uvicorn src.main:app --host 0.0.0.0 --port 8000 --reload
 make docker-build  # docker build -t ai-agent-devops:local .
 make chaos         # python scripts/chaos_test.py (ImagePullBackOff self-test)
 make e2e           # bash scripts/run_integration_test.sh (kind cluster, end-to-end)
+make eval          # python eval/evaluate.py (quality-гейт LLM-as-a-judge)
+make dashboard     # streamlit run ui/dashboard.py (UI оператора на :8501)
 ```
 
 ### В Docker
@@ -559,7 +567,7 @@ ruff check src tests scripts
 python -m pytest --cov=src --cov-report=xml tests/
 ```
 
-Текущий набор: **208 passed**, покрытие **~92%** (инструменты K8s/Prometheus/логов,
+Текущий набор: **213 passed**, покрытие **~92%** (инструменты K8s/Prometheus/логов,
 оркестратор, LLM-клиент с моками HTTP, FastAPI-эндпоинты через TestClient (включая
 webhook Alertmanager и журнал аудита), валидация конфигурации, JSON-логирование,
 трейсинг OpenTelemetry, chaos-скрипт).
@@ -640,6 +648,30 @@ registry path/credentials (imagePullSecrets), then delete the pod to force a fre
 
 > Пример сгенерирован реальным пайплайном оркестратора (мок инструментов + LLM-ответ уровня
 > qwen-max); фактический текст LLM может отличаться в зависимости от модели.
+
+## Интерактивный дашборд
+
+Лёгкий Streamlit-UI для дежурных (запускается **отдельно** от FastAPI-сервиса,
+только читает журнал аудита):
+
+```bash
+make dashboard           # или: streamlit run ui/dashboard.py
+# открыть http://localhost:8501
+```
+
+Что внутри:
+
+* **таблица инцидентов** — все диагностики из журнала аудита (`AUDIT_LOG_PATH`,
+  по умолчанию `audit.jsonl`): Timestamp, Namespace, Severity, Root Cause
+  (свежие сверху) + плитки-метрики по severity;
+* **карточки аппрува** — для инцидентов с `requires_approval: true`: namespace/pod,
+  root cause, опасный `suggested_fix` в code-блоке, warnings сбора данных и кнопка
+  **"Approve & Apply"** (демо-подтверждение: дашборд не трогает кластер — apply
+  выполняет человек через kubectl/GitOps после dry-run);
+* expander **Raw audit events** и кнопка Refresh в сайдбаре.
+
+Если журнала аудита ещё нет — дашборд показывает предупреждение с подсказками
+(запустить агент и отправить несколько `/diagnose` или webhook-запросов), а не падает.
 
 ## Документация
 

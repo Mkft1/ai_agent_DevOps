@@ -15,3 +15,5 @@ opentelemetry-sdk
 opentelemetry-instrumentation-fastapi
 opentelemetry-exporter-otlp
 sentence-transformers
+streamlit
+pandas
