@@ -46,13 +46,17 @@ class LogsTools:
         try:
             kubernetes.config.load_kube_config(config_file=path)
         except Exception as exc:  # ConfigException и пр. ошибки чтения файла
-            logger.error(
-                "Не удалось загрузить kubeconfig '%s': %s — логи подов "
-                "недоступны (degraded-режим, пустые строки)",
-                path,
-                exc,
-            )
-            return
+            try:
+                kubernetes.config.load_incluster_config()
+                logger.info("LogsTools: using in-cluster config (ServiceAccount)")
+            except Exception:
+                logger.error(
+                    "Не удалось загрузить kubeconfig '%s' (%s) и in-cluster "
+                    "config — логи подов недоступны (degraded-режим, пустые строки)",
+                    path,
+                    exc,
+                )
+                return
         self._core = kubernetes.client.CoreV1Api()
         logger.debug("LogsTools инициализирован (kubeconfig: %s)", path)
 

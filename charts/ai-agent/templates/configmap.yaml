@@ -1,0 +1,11 @@
+# Не-секретные настройки приложения (ключи = env-переменные src/config.py).
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "ai-agent.configMapName" . }}
+  labels:
+    {{- include "ai-agent.labels" . | nindent 4 }}
+data:
+  {{- range $key, $value := .Values.env }}
+  {{ $key }}: {{ $value | quote }}
+  {{- end }}
