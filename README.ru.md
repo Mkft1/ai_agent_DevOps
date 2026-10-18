@@ -1,6 +1,9 @@
-**[English](./README.md) | Русский**
+<p align="center">
+  <a href="./README.md"><b>🇬🇧 English </b></a> &nbsp;|&nbsp; <a href="./README.ru.md"><b>🇷🇺 Русский</b></a>
+</p>
 
-# ai_agent_DevOps
+<h1 align="center">ИИ-агент для диагностики инцидентов в K8s</h1>
+
 
 AI-агент для диагностики инцидентов в Kubernetes. Полная английская версия документации — в [README.md](./README.md). Ниже — оригинальная русская версия README по состоянию на момент перевода (разделы «Архитектура», «Метрики», «Graceful Degradation», «RAG» и др. актуальны; самые свежие детали, Mermaid-диаграмма и примеры реального вывода агента см. в англоязычном README).
 
