@@ -7,7 +7,7 @@ LLM: по умолчанию используется реальный клие�
 можно передать безтокенную заглушку :class:`LLMClientStub` — оба реализуют
 интерфейс ``generate(system_prompt=..., user_prompt=...) -> str``.
 """
-from src.utils.text_utils import estimate_tokens
+
 from __future__ import annotations
 
 import json
@@ -513,7 +513,8 @@ class IncidentOrchestrator:
             len(result.warnings),
         )
         return result.model_dump()
-        def _log_token_estimate(self, user_prompt: str) -> None:
+
+    def _log_token_estimate(self, user_prompt: str) -> None:
         """Залогировать грубую оценку токенов перед вызовом LLM.
 
         INFO-строка содержит оценку для системного промта, пользовательского

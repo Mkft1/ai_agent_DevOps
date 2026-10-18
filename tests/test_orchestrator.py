@@ -1,7 +1,7 @@
 """Unit-тесты IncidentOrchestrator: все инструменты и LLM под моками."""
 
-import logging
 import json
+import logging
 from unittest.mock import MagicMock
 
 import pytest
