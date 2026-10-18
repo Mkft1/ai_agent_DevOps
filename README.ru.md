@@ -11,7 +11,7 @@ AI-агент для диагностики инцидентов в Kubernetes. 
 [![Python 3.12](https://img.shields.io/badge/python-3.12-blue?logo=python&logoColor=white)](https://www.python.org/downloads/)
 [![Docker](https://img.shields.io/badge/docker-multistage%20image-2496ED?logo=docker&logoColor=white)](./Dockerfile)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](./LICENSE)
-[![Tests](https://img.shields.io/badge/tests-170%20passed-brightgreen?logo=pytest&logoColor=white)](#тесты)
+[![Tests](https://img.shields.io/badge/tests-189%20passed-brightgreen?logo=pytest&logoColor=white)](#тесты)
 [![Ruff](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/astral-sh/ruff/main/assets/badge/v2.json)](https://github.com/astral-sh/ruff)
 
 AI-агент для диагностики инцидентов в Kubernetes.
@@ -88,8 +88,10 @@ Alertmanager → /diagnose → IncidentOrchestrator → [K8sTools, PrometheusToo
   из `labels`, текст из `annotations.summary`/`description`), пропускает `resolved`
   и возвращает `400` на битом JSON/схеме.
 - **Безопасность (guardrails)** — read-only по умолчанию, белый список namespace'ов,
-  лимит строк логов, секреты только через `.env`, non-root контейнер, `.dockerignore`.
-- **Тестирование** — 170 unit/интеграционных тестов (pytest + unittest.mock), покрытие ~92%
+  лимит строк логов, секреты только через `.env`, non-root контейнер, `.dockerignore`,
+  политика опасных действий: рекомендации с `delete`/`drop`/`rm -rf`/`scale 0`
+  помечаются `requires_approval: true` и уходят на аппрув человеку в Slack.
+- **Тестирование** — 189 unit/интеграционных тестов (pytest + unittest.mock), покрытие ~92%
   (гейт в CI `--cov-fail-under=85`): инструменты, оркестратор, LLM-клиент (мок HTTP),
   FastAPI-эндпоинты (TestClient), конфигурация и логирование, chaos-скрипт.
 - **DevOps-практики** — многоступенчатый Docker-образ, docker-compose, идемпотентный
@@ -128,6 +130,7 @@ ai_agent_DevOps/
 │   ├── config.py          # Загрузка конфигурации из .env
 │   ├── agent/
 │   │   ├── orchestrator.py  # Оркестрация шагов диагностики (K8s -> контекст -> LLM -> RCA)
+│   │   ├── policies.py      # политика опасных фиксов (delete/drop/rm -rf/scale 0) -> аппрув
 │   │   ├── llm_client.py    # Реальный LLM-клиент (Qwen / OpenAI-совместимый API, ретраи tenacity)
 │   │   ├── rag.py           # RunbookRAG: гибридный поиск (TF-IDF + эмбеддинги) по runbook'ам
 │   │   └── tools/
@@ -235,6 +238,7 @@ curl http://localhost:8000/health
 | `LOG_FORMAT`      | `text`                                         | Формат логов: `text` (человекочитаемый) или `json` (structured logging для Loki/CloudWatch) |
 | `LLM_OFFLINE`     | `false`                                        | Демо/оффлайн-режим: без LLM-ключа `/diagnose` отвечает stub-диагнозом вместо честного `503`; в проде держите `false` |
 | `AUDIT_LOG_PATH`  | `audit.jsonl`                                  | Append-only журнал аудита (JSON Lines): по одной JSON-строке на диагностику / guardrail-отклонение / webhook-батч |
+| `SLACK_WEBHOOK_URL` | — (выключено)                          | Incoming webhook для аппрува опасных рекомендаций; без значения — WARNING в логах, `requires_approval` всё равно выставляется |
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | — (выключено)                   | OTLP/gRPC endpoint экспорта трейсов, напр. `http://localhost:4317` (Jaeger); без значения спаны не экспортируются |
 | `OTEL_SERVICE_NAME` | `ai-agent-devops`                            | Имя сервиса (`service.name`) в UI Jaeger/Tempo |
 | `ENABLE_HYBRID_RAG` | `true`                                       | Гибридный RAG-поиск (TF-IDF + эмбеддинги); `false` — только TF-IDF |
@@ -335,7 +339,37 @@ receivers:
 namespace пропускается (`skipped++`, событие `guardrail_rejected` в аудите),
 не роняя остальной батч.
 
-### Трейсинг (OpenTelemetry)
+### Политики безопасности и аппрувы
+
+Агент не выполняет изменения в кластере, но его *рекомендации* могут быть опасны.
+Перед применением человеком срабатывает policy-гейт:
+
+1. `src/agent/policies.py::check_policy(suggested_fix)` ищет в рекомендации LLM
+   опасные команды: `delete`, `drop`, `rm -rf`, `scale 0` (регистронезависимо).
+2. Если паттерн найден в read-only режиме (`ENABLE_WRITE_ACTIONS=false`), диагноз
+   помечается **`requires_approval: true`** — поле видно в ответах `/diagnose` и
+   `/webhook/alertmanager`, в журнале аудита и строкой 🔔 в отчёте для мессенджеров.
+3. При настроенном `SLACK_WEBHOOK_URL` агент отправляет запрос аппрува
+   во incoming webhook:
+
+   ```
+   ⚠️ Action Required: Agent suggests dangerous fix: kubectl delete pod bad-pod -n default. Approve or Reject?
+   ```
+
+   Без webhook'а агент пишет `WARNING` в логи (аппрув в диагнозе всё равно
+   требуется) и не падает; недоступность Slack диагностику тоже не роняет —
+   ошибка отправки только логируется.
+4. Каждый запрос аппрува инкрементирует Prometheus-метрику `approval_requests_total`.
+
+```bash
+# .env
+SLACK_WEBHOOK_URL=https://hooks.slack.com/services/T000/B000/XXXX
+```
+
+Безопасные рекомендации (поднять лимиты, поправить тег образа, добавить probes)
+гейт не проходят: `requires_approval: false`, сообщение в Slack не отправляется.
+
+## Трейсинг (OpenTelemetry)
 
 Трейсы показывают, куда уходят миллисекунды диагностики: K8s API, Prometheus,
 чтение логов, RAG-поиск или «раздумья» LLM.
@@ -489,7 +523,7 @@ ruff check src tests scripts
 python -m pytest --cov=src --cov-report=xml tests/
 ```
 
-Текущий набор: **170 passed**, покрытие **~92%** (инструменты K8s/Prometheus/логов,
+Текущий набор: **189 passed**, покрытие **~92%** (инструменты K8s/Prometheus/логов,
 оркестратор, LLM-клиент с моками HTTP, FastAPI-эндпоинты через TestClient (включая
 webhook Alertmanager и журнал аудита), валидация конфигурации, JSON-логирование,
 трейсинг OpenTelemetry, chaos-скрипт).

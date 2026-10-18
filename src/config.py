@@ -44,6 +44,10 @@ class Settings(BaseSettings):
     # Имя сервиса в трейсах (service.name в Jaeger/Tempo).
     otel_service_name: str = "ai-agent-devops"
 
+    # Slack incoming webhook для аппрува опасных рекомендаций агента.
+    # None (по умолчанию) — уведомление не отправляется, в логах WARNING.
+    slack_webhook_url: str | None = None
+
     # RAG: гибридный поиск (TF-IDF + векторные эмбеддинги sentence-transformers).
     # При недоступности модели агент молча деградирует до чистого TF-IDF.
     enable_hybrid_rag: bool = True
