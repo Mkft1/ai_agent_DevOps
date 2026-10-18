@@ -34,6 +34,9 @@ class Settings(BaseSettings):
     # вместо ошибки 503 на /diagnose (для демо, e2e-стендов и оффлайн-разработки).
     llm_offline: bool = False
 
+    # Журнал аудита диагностик (append-only JSON Lines); см. src/utils/audit.py.
+    audit_log_path: str = "audit.jsonl"
+
     # LLM API-ключи (используется один из провайдеров)
     openai_api_key: str | None = None
     qwen_api_key: str | None = None
