@@ -82,7 +82,15 @@ def make_orchestrator(llm: LLMClient) -> IncidentOrchestrator:
         llm_client=llm,
         # Guardrails: в тестах разрешаем namespace, используемый в фикстурах.
         settings=Settings(allowed_namespaces=["default", "prod"], _env_file=None),
+        rag=_disabled_rag(),
     )
+
+
+def _disabled_rag():
+    """RunbookRAG-заглушка: RAG выключён в интеграционных LLM-тестах."""
+    rag = MagicMock()
+    rag.find_relevant.return_value = []
+    return rag
 
 
 class TestLLMClientHTTP:
