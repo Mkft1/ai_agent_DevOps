@@ -236,3 +236,150 @@ class TestExpandedRunbookLibrary:
             top_k=2,
         )
         assert any("Evicted" in doc for doc in evicted)
+
+
+# ----------------------------------------------------------------------
+# Hybrid RAG (векторная ветка): SentenceTransformer мокается детерминированным
+# «эмбеддером»: синонимичные категории -> ортогональные one-hot векторы,
+# чтобы тесты не скачивали модель и оставались воспроизводимыми.
+# ----------------------------------------------------------------------
+_DIM = 9
+
+# Маркеры подобраны так, чтобы категории были уникальны и для фикстур,
+# и для реальной базы docs/runbooks (проверено grep'ом по корпусу).
+_CATEGORIES = (
+    (("evicted", "low on resource"), 0),
+    (("oomkilled", "ram shortage", "working set"), 1),
+    (("imagepullbackoff", "errimagepull"), 2),
+    (("crashloopbackoff",), 3),
+    (("no such host", "coredns"), 4),
+    (("storageclass",), 5),
+    (("notready",), 6),
+    (("createcontainerconfigerror",), 7),
+)
+
+
+def _category(text: str) -> int:
+    low = text.lower()
+    for keywords, idx in _CATEGORIES:
+        if any(k in low for k in keywords):
+            return idx
+    return 8  # «прочее» — ортогонально всем категориям
+
+
+def _one_hot(category: int) -> list[float]:
+    vec = [0.0] * _DIM
+    vec[category] = 1.0
+    return vec
+
+
+class FakeSentenceTransformer:
+    """Замена SentenceTransformer: embedding = one-hot категории симптомов."""
+
+    def __init__(self, model_name: str = "fake-model") -> None:
+        self.model_name = model_name
+
+    def encode(self, texts, normalize_embeddings: bool = False):  # noqa: ARG002
+        return [_one_hot(_category(t)) for t in texts]
+
+
+@pytest.fixture(autouse=True)
+def fake_embedder(monkeypatch: pytest.MonkeyPatch):
+    """Все тесты модуля работают с фейковым эмбеддером (без скачивания модели)."""
+    import src.agent.rag as rag_module
+
+    monkeypatch.setattr(rag_module, "SentenceTransformer", FakeSentenceTransformer)
+
+
+class TestHybridRag:
+    def test_config_defaults(self) -> None:
+        from src.config import Settings
+
+        s = Settings(_env_file=None)
+        assert s.enable_hybrid_rag is True
+        assert s.embedding_model == "all-MiniLM-L6-v2"
+
+    def test_hybrid_enabled_with_model(self, rag_dir: Path) -> None:
+        rag = RunbookRAG(rag_dir)
+        assert rag.hybrid_enabled is True
+
+    def test_vector_branch_finds_synonym_missed_by_tfidf(self, rag_dir: Path) -> None:
+        """«RAM shortage» нет в словаре TF-IDF runbook'а OOM — выручают эмбеддинги."""
+        rag = RunbookRAG(rag_dir)
+        query = "process terminated due to RAM shortage"
+        assert rag.find_relevant(query, top_k=1)  # гибрид находит
+        tfidf_only = RunbookRAG(rag_dir, enable_hybrid=False)
+        assert tfidf_only.hybrid_enabled is False
+        assert tfidf_only.find_relevant(query, top_k=1) == []  # чистый TF-IDF мимо
+
+    def test_hybrid_score_combines_tfidf_and_cosine(self, rag_dir: Path) -> None:
+        """Итоговый скор = 0.5*TF-IDF + 0.5*cosine: оба сигнала влияют на ранжирование."""
+        rag = RunbookRAG(rag_dir)
+        # Запрос и по терминам TF-IDF, и по смыслу бьёт в OOM-ранбук.
+        hits = rag.find_relevant("OOMKilled memory limit exceeded exit code 137", top_k=1)
+        assert hits and "OOMKilled" in hits[0]
+
+    def test_disable_hybrid_flag(self, rag_dir: Path) -> None:
+        rag = RunbookRAG(rag_dir, enable_hybrid=False)
+        assert rag.hybrid_enabled is False
+        # TF-IDF продолжает работать.
+        assert rag.find_relevant("OOMKilled memory limit", top_k=1)
+
+    def test_model_download_failure_falls_back_to_tfidf(self, rag_dir: Path, monkeypatch):
+        """Модель не скачалась (OSError) — graceful fallback на чистый TF-IDF."""
+        import src.agent.rag as rag_module
+
+        def boom(model_name: str):
+            raise OSError(f"network unreachable while downloading {model_name}")
+
+        monkeypatch.setattr(rag_module, "SentenceTransformer", boom)
+        rag = RunbookRAG(rag_dir)
+        assert rag.hybrid_enabled is False
+        assert rag.find_relevant("OOMKilled memory limit", top_k=1)  # TF-IDF живой
+
+    def test_package_missing_falls_back_to_tfidf(self, rag_dir: Path, monkeypatch):
+        """sentence-transformers не установлен (None) — приложение не падает."""
+        import src.agent.rag as rag_module
+
+        monkeypatch.setattr(rag_module, "SentenceTransformer", None)
+        rag = RunbookRAG(rag_dir)
+        assert rag.hybrid_enabled is False
+        assert rag.find_relevant("Failed to pull image manifest unknown", top_k=1)
+
+    def test_encode_failure_at_query_time_uses_tfidf(self, rag_dir: Path) -> None:
+        """Сбой encode запроса в рантайме -> ответ только по TF-IDF, без падения."""
+        rag = RunbookRAG(rag_dir)
+
+        def broken_encode(texts, normalize_embeddings: bool = False):
+            raise RuntimeError("embedder exploded")
+
+        rag._embedder.encode = broken_encode
+        assert rag.find_relevant("OOMKilled memory limit", top_k=1)
+
+    def test_empty_corpus_does_not_load_model(self, tmp_path: Path, monkeypatch) -> None:
+        """Пустая директория runbook'ов: модель не грузим (быстрый оффлайн-старт)."""
+        import src.agent.rag as rag_module
+
+        calls = []
+
+        class Spy(FakeSentenceTransformer):
+            def __init__(self, model_name: str = "fake-model") -> None:
+                calls.append(model_name)
+                super().__init__(model_name)
+
+        monkeypatch.setattr(rag_module, "SentenceTransformer", Spy)
+        empty = tmp_path / "no-runbooks"
+        empty.mkdir()
+        rag = RunbookRAG(empty)
+        assert calls == []
+        assert rag.hybrid_enabled is False
+        assert rag.find_relevant("anything") == []
+
+    def test_real_runbooks_still_retrievable_with_hybrid(self) -> None:
+        """Гибрид на реальной базе docs/runbooks: OOM и ImagePullBackOff находятся."""
+        rag = RunbookRAG()  # реальные docs/runbooks репозитория
+        assert rag.hybrid_enabled is True
+        oom = rag.find_relevant("OOMKilled exit code 137", top_k=1)
+        assert oom and "OOMKilled" in oom[0]
+        pull = rag.find_relevant("ErrImagePull: manifest unknown", top_k=1)
+        assert pull and "ImagePullBackOff" in pull[0]
