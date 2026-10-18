@@ -38,6 +38,14 @@ class LLMError(RuntimeError):
     """LLM API недоступен или вернул некорректный ответ после ретраев."""
 
 
+class LLMAuthError(LLMError):
+    """HTTP 401/403 от LLM API: неверный/отсутствующий API-ключ.
+
+    Не ретраится (tenacity): повторные попытки с тем же ключом бесполезны;
+    сообщение подсказывает оператору проверить ``QWEN_API_KEY``/``OPENAI_API_KEY``.
+    """
+
+
 def _is_retryable(exc: BaseException) -> bool:
     """Ретраим только сетевые ошибки и HTTP 429/5xx; 4xx (кроме 429) — нет."""
     if isinstance(exc, (requests.ConnectionError, requests.Timeout)):
@@ -128,6 +136,11 @@ class LLMClient:
             response.raise_for_status()
         except requests.HTTPError as exc:
             status = getattr(exc.response, "status_code", "?")
+            if status in (401, 403):
+                raise LLMAuthError(
+                    f"LLM API authentication failed (HTTP {status}): "
+                    "check QWEN_API_KEY / OPENAI_API_KEY in .env"
+                ) from exc
             if not _is_retryable(exc):
                 raise LLMError(f"LLM API HTTP {status}: {exc}") from exc
             logger.warning("LLM API HTTP %s, retrying...", status)

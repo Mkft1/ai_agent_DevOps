@@ -17,15 +17,16 @@ LLM) в тестах подменяются моками. Для ручных п
 ## Как запускать тесты и линтер
 
 ```bash
-ruff check src tests                                # линтер (job "lint" в CI)
+ruff check src tests scripts                        # линтер (job "lint" в CI)
 python -m pytest --cov=src --cov-report=xml tests/  # тесты с покрытием (job "test")
 python -m pytest tests/test_api.py                  # только HTTP-слой
 python -m pytest -k "guardrails"                    # точечный прогон по имени
 ```
 
 Перед отправкой PR убедитесь, что **линтер чистый** и **все тесты зелёные** —
-то же самое проверяет GitHub Actions (`.github/workflows/ci.yml`: lint → test → build),
-который запускается на каждый push/PR в `main`. Приложение при этом должно стартовать
+то же самое проверяет GitHub Actions (`.github/workflows/ci.yml`: lint → test → build,
+а на push в `main` ещё и integration-test на kind-кластере), который запускается
+на каждый push/PR в `main`. Приложение при этом должно стартовать
 (`uvicorn src.main:app`, затем `curl localhost:8000/health`).
 
 ## Процесс контрибьюшена

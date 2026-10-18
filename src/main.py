@@ -12,6 +12,7 @@
 from __future__ import annotations
 
 import os
+import uuid
 
 import requests
 from fastapi import Depends, FastAPI, HTTPException, Request
@@ -19,18 +20,21 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from prometheus_fastapi_instrumentator import Instrumentator
 from pydantic import BaseModel, Field, ValidationError
+from starlette.middleware.base import BaseHTTPMiddleware
 
+from src.agent.llm_client import LLMClient, LLMError
 from src.agent.orchestrator import (
     Diagnosis,
     Incident,
     IncidentOrchestrator,
+    LLMClientStub,
     NamespaceNotAllowedError,
 )
 from src.config import Settings, get_settings
-from src.utils.logger import get_logger, setup_logging
+from src.utils.logger import get_logger, request_id_var, setup_logging
 
 settings = get_settings()
-setup_logging(settings.log_level)
+setup_logging(settings.log_level, settings.log_format)
 logger = get_logger(__name__)
 
 app = FastAPI(
@@ -47,6 +51,28 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+class RequestIDMiddleware(BaseHTTPMiddleware):
+    """Корреляция логов и запросов: заголовок ``X-Request-ID``.
+
+    Берёт ID из входящего заголовка (если его прислал клиент/балансер)
+    либо генерирует новый; кладёт в :data:`~src.utils.logger.request_id_var`
+    (попадает в JSON-логи) и возвращает в ответе для трейсинга клиентом.
+    """
+
+    async def dispatch(self, request: Request, call_next):  # type: ignore[no-untyped-def]
+        request_id = request.headers.get("X-Request-ID") or uuid.uuid4().hex[:16]
+        token = request_id_var.set(request_id)
+        try:
+            response = await call_next(request)
+        finally:
+            request_id_var.reset(token)
+        response.headers["X-Request-ID"] = request_id
+        return response
+
+
+app.add_middleware(RequestIDMiddleware)
 
 # Prometheus: стандартные HTTP-метрики (информационные) + эндпоинт /metrics.
 # Кастомные метрики агента объявлены в src/utils/metrics.py и попадают в
@@ -99,10 +125,31 @@ _orchestrator: IncidentOrchestrator | None = None
 
 
 def get_orchestrator() -> IncidentOrchestrator:
-    """Возвращает singleton оркестратора (создаётся при первом запросе)."""
+    """Возвращает singleton оркестратора (создаётся при первом запросе).
+
+    Raises:
+        HTTPException 503: LLM-ключ не задан и ``LLM_OFFLINE`` выключен —
+            сервис честно сообщает, что не сконфигурирован, вместо 500.
+    """
     global _orchestrator
     if _orchestrator is None:
-        _orchestrator = IncidentOrchestrator()
+        llm: LLMClient | LLMClientStub
+        try:
+            llm = LLMClient()
+        except LLMError as exc:
+            if not settings.llm_offline:
+                raise HTTPException(
+                    status_code=503,
+                    detail=(
+                        "LLM is not configured: set QWEN_API_KEY or OPENAI_API_KEY "
+                        "in .env (or start with LLM_OFFLINE=true for stub/demo mode)."
+                    ),
+                ) from exc
+            logger.warning(
+                "No LLM API key and LLM_OFFLINE=true — falling back to LLMClientStub"
+            )
+            llm = LLMClientStub()
+        _orchestrator = IncidentOrchestrator(llm_client=llm)
     return _orchestrator
 
 

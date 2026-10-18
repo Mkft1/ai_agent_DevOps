@@ -4,12 +4,8 @@
 
 <h1 align="center">K8s Incident Diagnosis AI Agent</h1>
 
-<p align="center">
-  <img src="docs/assets/demo.gif" alt="Demo: agent diagnosing a Kubernetes incident via /diagnose" width="720"/>
-</p>
-
 [![CI](https://github.com/Mkft1/ai_agent_DevOps/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/Mkft1/ai_agent_DevOps/actions/workflows/ci.yml)
-![Coverage](https://img.shields.io/badge/coverage-89%25-brightgreen)
+![Coverage](https://img.shields.io/badge/coverage-92%25-brightgreen)
 ![Python](https://img.shields.io/badge/python-3.12-blue?logo=python&logoColor=white)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](./LICENSE)
 [![Docker](https://img.shields.io/badge/docker-multistage-2496ED?logo=docker&logoColor=white)](./Dockerfile)
@@ -31,9 +27,9 @@ The agent is strictly **read-only by default**: it never mutates the cluster (`E
 | 📈 **Prometheus integration** | instant & range queries, per-pod CPU/memory usage via `container_*` cAdvisor metrics. |
 | 🛡️ **Guardrails** | Namespace allow-list (`ALLOWED_NAMESPACES`), log-size cap (`MAX_LOG_LINES`), context-size cap (`MAX_CONTEXT_CHARS`), read-only mode (`ENABLE_WRITE_ACTIONS`). All configurable via `.env`, nothing hardcoded. |
 | 🩹 **Graceful degradation** | If any data source fails (K8s API down, Prometheus unreachable, empty logs), the agent records a warning in the report and continues diagnosing with whatever data it has — it never crashes the pipeline. |
-| 📊 **Observability** | `/metrics` endpoint (`prometheus-fastapi-instrumentator`) + custom counters/histograms: `diagnose_requests_total`, `diagnose_duration_seconds`, `k8s_api_errors_total`, `llm_fallback_total`. |
+| 📊 **Observability** | `/metrics` endpoint (`prometheus-fastapi-instrumentator`) + custom counters/histograms: `diagnose_requests_total`, `diagnose_duration_seconds`, `k8s_api_errors_total`, `llm_fallback_total`. `X-Request-ID` correlation (echoed/generated per request) and optional structured JSON logging (`LOG_FORMAT=json`) for Loki/CloudWatch. |
 | 🔁 **Chaos self-test** | `scripts/chaos_test.py` creates an ImagePullBackOff pod, asks the agent to diagnose it, asserts the RCA mentions "image"/"pull", and cleans up. Idempotent. |
-| 🧪 **Testing & CI/CD** | 111 unit/integration tests with mocked clients; GitHub Actions pipeline: lint → test+coverage → Docker build → kind-based e2e on `main`. |
+| 🧪 **Testing & CI/CD** | 139 unit/integration tests with mocked clients (92% coverage, CI gate `--cov-fail-under=85`); GitHub Actions pipeline: lint → test+coverage → Docker build+smoke → kind-based e2e on `main` (auto-skipped when no LLM secret is configured). |
 | 🐳 **Containerized** | Multi-stage `python:3.12-slim` image, non-root user, healthcheck, no secrets baked into the image. |
 
 ---
@@ -114,6 +110,8 @@ cp .env.example .env
 | `MAX_LOG_LINES` | `200` | Hard cap on `tail_lines` for log retrieval. |
 | `MAX_CONTEXT_CHARS` | `16000` | Max serialized size of the LLM context (long strings get truncated with `... [truncated]`). |
 | `ENABLE_WRITE_ACTIONS` | `false` | Read-only mode. No write path exists in the codebase today. |
+| `LOG_FORMAT` | `text` | `text` (human-readable) or `json` (one JSON object per line for log aggregators). |
+| `LLM_OFFLINE` | `false` | Demo/offline mode: without an LLM key `/diagnose` answers with the deterministic `LLMClientStub` instead of an honest `503`. Keep `false` in production. |
 
 ### 2. Run locally
 
@@ -192,6 +190,8 @@ docker compose up --build
 | `POST` | `/diagnose` | Accepts an incident, returns `{diagnosis, report}`. |
 | `GET` | `/metrics` | Prometheus exposition format (HTTP + custom metrics). |
 
+All responses carry an `X-Request-ID` header (echoed when provided by the client/LB, generated otherwise); the same id appears in JSON logs (`LOG_FORMAT=json`) for request/log correlation.
+
 ### Example: `POST /diagnose`
 
 Request:
@@ -259,7 +259,7 @@ All limits are configuration-driven (see table above), enforced **before** any c
 2. **Read-only by design** — with `ENABLE_WRITE_ACTIONS=false` the agent only reads data and *suggests* fixes. There is no delete/exec/apply code path in the repository; the flag guards future action-proposing features.
 3. **Bounded context** — log tails capped by `MAX_LOG_LINES`; the whole LLM context is recursively trimmed to `MAX_CONTEXT_CHARS` (long values keep their tail — the freshest log lines — and are marked `... [truncated]`).
 4. **No secrets anywhere** — API keys come exclusively from `.env` (never committed, excluded from the Docker image via `.dockerignore`); prompt/response logging at DEBUG never includes auth headers.
-5. **Graceful degradation** — a failing tool produces a warning in the report ("K8s API unavailable, using only Prometheus metrics"), not a crash.
+5. **Graceful degradation** — a failing tool produces a warning in the report ("K8s API unavailable, using only Prometheus metrics"), not a crash; even a missing kubeconfig at startup only degrades K8s/log tools to empty results, and an unconfigured LLM key yields an actionable `503` (or stub mode via `LLM_OFFLINE=true`), never a bare `500`.
 6. **Non-root container** — the runtime image runs as `appuser` (UID 10001) with a read-only kubeconfig mount.
 
 ---
@@ -276,13 +276,15 @@ tests/
 ├── test_rag.py               # RunbookRAG on fixture md-files + orchestrator integration
 ├── test_text_utils.py        # truncate_context recursion & guarantees
 ├── test_chaos_test.py        # chaos script logic (mocked k8s + requests)
-└── test_api.py               # FastAPI TestClient: /health /ready /diagnose /metrics, CORS, errors
+├── test_config.py            # Settings validators: fail-fast on bad LOG_LEVEL/LOG_FORMAT/limits
+├── test_logger.py            # JSON structured logging + request_id correlation
+└── test_api.py               # FastAPI TestClient: /health /ready /diagnose /metrics, CORS, errors, X-Request-ID
 ```
 
 - **Unit tests**: every external boundary (Kubernetes API, Prometheus HTTP, LLM HTTP) is mocked — the suite runs offline in ~2 seconds.
-- **Coverage**: `pytest --cov=src --cov-report=xml` — currently **~89%** (uploaded as a CI artifact every run).
+- **Coverage**: `pytest --cov=src --cov-report=xml --cov-fail-under=85` — currently **~92%** (uploaded as a CI artifact every run; the CI fails if coverage drops below 85%).
 - **Integration (end-to-end)**: `scripts/run_integration_test.sh` spins up a real [kind](https://kind.sigs.k8s.io/) cluster, creates a pod with a bad image tag, runs the agent under uvicorn, sends a real `POST /diagnose`, and asserts the RCA mentions *"image"*/*"pull"* (via `jq`). Idempotent: leftover clusters/pods are removed before each run; cleanup happens even on failure.
-- **CI jobs** (GitHub Actions): `lint` (ruff) → `test` (pytest + coverage) → `build` (Docker, load + smoke-test) → `integration-test` (kind, push to `main` only, so PRs stay fast).
+- **CI jobs** (GitHub Actions): `lint` (`ruff check src tests scripts`) → `test` (pytest + coverage, gate ≥85%) → `build` (Docker, load + smoke-test) → `integration-test` (kind e2e, push to `main` / manual dispatch only, so PRs stay fast; gracefully skipped when the repository has no `QWEN_API_KEY`/`OPENAI_API_KEY` secret).
 
 ---
 
@@ -329,7 +331,7 @@ ai_agent_DevOps/
 ├── Dockerfile                   # multi-stage, non-root, healthcheck
 ├── docker-compose.yml           # local stack: agent + kubeconfig/.env mounts
 ├── Makefile                     # dev shortcuts: install/lint/test/run/docker-build/chaos/e2e
-├── docs/runbooks/               # RAG knowledge base (oom_killed, image_pull_backoff, crash_loop)
+├── docs/runbooks/               # RAG knowledge base: 8 runbooks (OOMKilled, ImagePullBackOff, CrashLoop, DNS, NodeNotReady, PVCPending, CreateContainerConfigError, Evicted)
 ├── scripts/
 │   ├── chaos_test.py            # ImagePullBackOff chaos experiment vs /diagnose
 │   ├── run_integration_test.sh  # kind-based end-to-end test
@@ -347,7 +349,7 @@ ai_agent_DevOps/
 │       ├── logger.py            # stdlib logging setup
 │       ├── metrics.py           # custom Prometheus metrics
 │       └── text_utils.py        # truncate_context (bounded, JSON-safe)
-└── tests/                       # 111 tests, fully mocked externals
+└── tests/                       # 139 tests, fully mocked externals
 ```
 
 ---
