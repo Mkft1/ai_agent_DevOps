@@ -1,5 +1,6 @@
 """Unit-тесты IncidentOrchestrator: все инструменты и LLM под моками."""
 
+import json
 from unittest.mock import MagicMock
 
 import pytest
@@ -424,5 +425,72 @@ class TestContextLimit:
             {"namespace": "default", "pod_name": "api-7d9f-x2kq", "description": "x"}
         )
         user_prompt = llm.generate.call_args.kwargs["user_prompt"]
-        assert "[context truncated]" in user_prompt
-        assert len(user_prompt) < 1500
+        # Рекурсивная обрезка держит промт в лимите; маркеры усечения присутствуют.
+        assert "... [truncated]" in user_prompt or "[context truncated]" in user_prompt
+        assert len(user_prompt) <= 1500
+
+
+class TestGracefulDegradation:
+    """K8s API недоступен — диагностика продолжается только по Prometheus."""
+
+    def test_k8s_empty_pods_continues_with_prometheus(self) -> None:
+        """get_pods вернул [] (внутренняя ошибка, видна в логах): агент не прерывается,
+        возвращает диагноз и warning 'K8s API unavailable, using only Prometheus metrics'."""
+        orch, k8s, prom, _, _ = make_orchestrator(pods=[])
+        result = orch.diagnose(
+            {"namespace": "prod", "pod_name": "api-7d9f-x2kq",
+             "description": "Pod in ImagePullBackOff"}
+        )
+
+        # Диагностика завершена, RCA получен.
+        assert result["root_cause"] != ""
+        assert result["severity"] == "high"
+        # Обязательное предупреждение из ТЗ.
+        assert any(
+            w == "K8s API unavailable, using only Prometheus metrics"
+            for w in result["warnings"]
+        )
+        # Prometheus-шаги выполнены (pod_name известен из алерта).
+        prom.get_pod_cpu_usage.assert_called_once_with(
+            namespace="prod", pod_name="api-7d9f-x2kq"
+        )
+        prom.get_pod_memory_usage.assert_called_once_with(
+            namespace="prod", pod_name="api-7d9f-x2kq"
+        )
+        # Лишние K8s-вызовы (events) в degraded-режиме не выполняются.
+        k8s.get_events.assert_not_called()
+        # Целевой под помечен как известный из алерта.
+        assert result["raw_data"]["target_pod"] == {
+            "name": "api-7d9f-x2kq", "source": "alert"
+        }
+        # Предупреждение попадает в отчёт для Slack/Telegram.
+        report = orch.format_report(result)
+        assert "K8s API unavailable, using only Prometheus metrics" in report
+
+    def test_k8s_exception_degrades_to_prometheus_only(self) -> None:
+        """get_pods бросает исключение — тот же degraded-путь с warning."""
+        orch, k8s, prom, _, _ = make_orchestrator()
+        k8s.get_pods.side_effect = RuntimeError("connection refused")
+        result = orch.diagnose(
+            {"namespace": "prod", "pod_name": "api-7d9f-x2kq"}
+        )
+        assert any(
+            "K8s API unavailable" in w for w in result["warnings"]
+        )
+        prom.get_pod_cpu_usage.assert_called_once()
+        Diagnosis.model_validate(result)  # диагноз остаётся валидным
+
+    def test_context_truncated_before_llm_call(self) -> None:
+        """truncate_context вызывается на контексте до отправки в LLM (маркер ... [truncated])."""
+        settings = Settings(max_context_chars=1000, allowed_namespaces=["*"], _env_file=None)
+        orch, _, _, _, llm = make_orchestrator(settings=settings)
+        orch.logs.get_pod_logs.return_value = "\n".join(
+            f"log line number {i} " + "spam " * 40 for i in range(500)
+        )
+        orch.diagnose({"namespace": "default", "pod_name": "api-7d9f-x2kq"})
+
+        user_prompt = llm.generate.call_args.kwargs["user_prompt"]
+        context_arg = llm.generate.call_args.kwargs["context"]
+        # Контекст, переданный LLM, уже обрезан рекурсивно (не просто срезан хвост JSON).
+        assert "... [truncated]" in json.dumps(context_arg, ensure_ascii=False)
+        assert len(user_prompt) <= 1500
