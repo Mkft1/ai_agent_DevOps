@@ -109,6 +109,22 @@ uvicorn src.main:app --reload --host 0.0.0.0 --port 8000
 
 Interactive API docs (Swagger UI): **http://localhost:8000/docs**
 
+#### Developer shortcuts with `make`
+
+A `Makefile` in the repo root wraps the most common commands so you don't have to remember them:
+
+```bash
+make install       # pip install -r requirements.txt -r requirements-dev.txt
+make lint          # ruff check src tests scripts
+make test          # pytest --cov=src --cov-report=term-missing tests/
+make run           # uvicorn src.main:app --host 0.0.0.0 --port 8000 --reload
+make docker-build  # docker build -t ai-agent-devops:local .
+make chaos         # python scripts/chaos_test.py (ImagePullBackOff self-test)
+make e2e           # bash scripts/run_integration_test.sh (kind cluster, end-to-end)
+```
+
+The Makefile is a convenience wrapper only — it does not change or replace CI/CD.
+
 ### 3. Run with Docker
 
 ```bash
@@ -273,6 +289,7 @@ ai_agent_DevOps/
 ├── .github/workflows/ci.yml     # lint → test → build → integration-test (kind)
 ├── Dockerfile                   # multi-stage, non-root, healthcheck
 ├── docker-compose.yml           # local stack: agent + kubeconfig/.env mounts
+├── Makefile                     # dev shortcuts: install/lint/test/run/docker-build/chaos/e2e
 ├── docs/runbooks/               # RAG knowledge base (oom_killed, image_pull_backoff, crash_loop)
 ├── scripts/
 │   ├── chaos_test.py            # ImagePullBackOff chaos experiment vs /diagnose
