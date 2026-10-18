@@ -2,7 +2,12 @@
 
 import json
 
-from src.utils.text_utils import TRUNCATION_MARKER, estimate_json_size, truncate_context
+from src.utils.text_utils import (
+    TRUNCATION_MARKER,
+    estimate_json_size,
+    estimate_tokens,
+    truncate_context,
+)
 
 
 class TestTruncateContext:
@@ -81,3 +86,21 @@ class TestTruncateContext:
             pass
 
         assert estimate_json_size({"obj": Weird()}) > 0
+
+
+class TestEstimateTokens:
+    """Грубая оценка токенов (1 токен ~ 4 символа)."""
+
+    def test_empty_string_is_zero(self):
+        assert estimate_tokens("") == 0
+
+    def test_rough_four_chars_per_token(self):
+        assert estimate_tokens("a" * 400) == 100
+
+    def test_short_text_at_least_one_token(self):
+        assert estimate_tokens("ab") == 1
+
+    def test_estimate_scales_with_prompt_size(self):
+        small = estimate_tokens("error: oom killed")
+        big = estimate_tokens("oom killed container " * 500)
+        assert big > small
