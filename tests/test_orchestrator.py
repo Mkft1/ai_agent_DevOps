@@ -1,5 +1,6 @@
 """Unit-тесты IncidentOrchestrator: все инструменты и LLM под моками."""
 
+import logging
 import json
 from unittest.mock import MagicMock
 
@@ -507,3 +508,44 @@ class TestGracefulDegradation:
         # Контекст, переданный LLM, уже обрезан рекурсивно (не просто срезан хвост JSON).
         assert "... [truncated]" in json.dumps(context_arg, ensure_ascii=False)
         assert len(user_prompt) <= 1500
+
+
+class TestTokenEstimateLogging:
+    """INFO-лог оценки токенов перед LLM + WARNING при >8000 (без блокировки)."""
+
+    def test_info_logs_token_breakdown(self, caplog):
+        orch, *_ = make_orchestrator()
+        with caplog.at_level(logging.INFO, logger="src.agent.orchestrator"):
+            result = orch.diagnose({"namespace": "default", "pod_name": "api-7d9f-x2kq"})
+        assert "LLM token estimate:" in caplog.text
+        for key in ("system=", "context=", "expected_response=", "total="):
+            assert key in caplog.text
+        # Обычный маленький контекст — предупреждения нет, запрос выполнен.
+        assert "soft token limit" not in caplog.text
+        assert result["root_cause"]
+
+    def test_warning_when_over_soft_limit_but_not_blocked(self, caplog):
+        big_settings = Settings(
+            allowed_namespaces=["default"],
+            max_context_chars=60000,  # >8000 токенов (1 токен ~ 4 символа)
+            _env_file=None,
+        )
+        orch, k8s, prom, logs_tools, llm = make_orchestrator(settings=big_settings)
+        k8s.get_pods.return_value = [
+            {
+                "name": "api-7d9f-x2kq",
+                "status": "ImagePullBackOff",
+                "restarts": 3,
+                "node": "worker-1",
+                "age": 600,
+                "labels": {"app": "api"},
+            }
+        ]
+        logs_tools.get_pod_logs.return_value = "pull error: manifest unknown\n" * 4000
+        with caplog.at_level(logging.WARNING, logger="src.agent.orchestrator"):
+            result = orch.diagnose({"namespace": "default", "pod_name": "api-7d9f-x2kq"})
+        assert "soft token limit" in caplog.text
+        assert "8000" in caplog.text
+        # Запрос НЕ заблокирован: LLM был вызван и диагноз получен.
+        assert llm.generate.called
+        assert result["severity"] == "high"
