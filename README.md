@@ -88,6 +88,8 @@ A few deliberate trade-offs worth knowing about:
 3. **Strict JSON output validated by Pydantic, with one retry and an honest fallback.** Instead of trusting free-form LLM prose, the system prompt demands a fixed JSON schema; invalid responses trigger a single correction retry, then a deterministic fallback diagnosis (`severity="unknown"`) — the pipeline never returns garbage or crashes because of the model.
 4. **Read-only by default + graceful degradation.** The agent suggests fixes rather than executing them (`ENABLE_WRITE_ACTIONS=false`), and any failing data source becomes a warning in the report instead of an exception — safe to wire directly into production alert pipelines.
 5. **OpenAI-compatible client over raw HTTP (requests + tenacity).** No heavyweight SDK lock-in: works with Qwen/DashScope, OpenAI, or any self-hosted compatible gateway by changing two env vars (`LLM_BASE_URL`, `LLM_MODEL`).
+6. **Multi-stage Docker build (base → builder → runtime).** Security and size: the runtime image is a clean `python:3.12-slim` with only installed packages plus `src/` — no compilers, no pip cache, no repo history, no tests/docs; it runs as non-root `appuser` (UID 10001). Copying `requirements.txt` as its own layer keeps the heavy dependency layer cached across code changes, and `cache-to: type=gha,mode=min` in CI exports only final layers so the cache upload stays small.
+7. **CPU-only PyTorch in the image.** The agent embeds runbooks with sentence-transformers — it never trains and never uses a GPU. Installing `torch` from `https://download.pytorch.org/whl/cpu` *before* `requirements.txt` pins the CPU wheel (~200 MB) and stops `sentence-transformers` from pulling the CUDA build (+2 GB of drivers/libs): smaller image, faster CI, identical inference.
 ---
 
 ## Quick Start
@@ -508,7 +510,7 @@ pytest --cov=src tests/               # all tests must pass
 ```
 ai_agent_DevOps/
 ├── .github/workflows/ci.yml     # lint → test → build → integration-test (kind)
-├── Dockerfile                   # multi-stage, non-root, healthcheck
+├── Dockerfile                   # multi-stage (base/builder/runtime), CPU-only torch, non-root, healthcheck
 ├── docker-compose.yml           # local stack: agent + kubeconfig/.env mounts
 ├── Makefile                     # dev shortcuts: install/lint/test/run/docker-build/chaos/e2e
 ├── docs/runbooks/               # RAG knowledge base: 8 runbooks (OOMKilled, ImagePullBackOff, CrashLoop, DNS, NodeNotReady, PVCPending, CreateContainerConfigError, Evicted)

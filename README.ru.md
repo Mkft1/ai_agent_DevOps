@@ -167,7 +167,7 @@ ai_agent_DevOps/
 │   └── kind/
 │       └── cluster.yaml   # конфигурация kind-кластера для интеграционного теста
 ├── Makefile               # dev-команды: install/lint/test/run/docker-build/chaos/e2e
-├── Dockerfile             # многоступенчатый образ (builder + runtime, non-root)
+├── Dockerfile             # multi-stage (base/builder/runtime), CPU-only torch, non-root, healthcheck
 ├── docker-compose.yml     # локальный запуск сервиса agent (порт 8000)
 ├── .dockerignore          # .git/.env/tests/.venv/__pycache__ не попадают в образ
 ├── LICENSE                # MIT

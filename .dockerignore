@@ -7,6 +7,7 @@ __pycache__/
 *.py[cod]
 *.egg-info/
 .pytest_cache/
+.ruff_cache/
 .coverage
 htmlcov/
 
@@ -20,8 +21,18 @@ env/
 .env.*
 !.env.example
 
-# Тесты и документация не нужны в runtime-образе
+# В образ попадает ТОЛЬКО код src/ и нужные конфиги (COPY в Dockerfile явный);
+# всё остальное исключается из build-контекста ради скорости и размера.
 tests/
+docs/
+eval/
+ui/
+scripts/
+.github/
+audit.jsonl
+*.md
+Makefile
+pyproject.toml
 Dockerfile
 docker-compose.yml
 .dockerignore
