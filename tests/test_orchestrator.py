@@ -15,6 +15,15 @@ from src.agent.orchestrator import (
 )
 from src.config import Settings
 
+
+def _disabled_rag():
+    """RunbookRAG-заглушка: find_relevant всегда пустой (RAG выключен)."""
+    from unittest.mock import MagicMock
+
+    rag = MagicMock()
+    rag.find_relevant.return_value = []
+    return rag
+
 # Тестовые настройки: разрешаем namespace'ы default/prod/monitoring (как в fixture).
 TEST_SETTINGS = Settings(
     allowed_namespaces=["default", "prod", "monitoring"], _env_file=None
@@ -82,6 +91,9 @@ def make_orchestrator(
             logs_tools=logs_tools,
             llm_client=llm,
             settings=settings,
+            # RAG по умолчанию отключён в unit-тестах (тестируется отдельно
+            # в tests/test_rag.py и TestRagIntegration).
+            rag=_disabled_rag(),
         ),
         k8s,
         prom,
@@ -302,6 +314,7 @@ class TestLLMClientStub:
             prometheus_tools=MagicMock(),
             logs_tools=MagicMock(),
             llm_client=RealLLMClient(api_key="test-key"),
+            rag=_disabled_rag(),
         )
         assert isinstance(orch.llm, RealLLMClient)
         assert not isinstance(orch.llm, LLMClientStub)

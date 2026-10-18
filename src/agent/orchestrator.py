@@ -18,6 +18,7 @@ from typing import Any, Protocol, runtime_checkable
 from pydantic import BaseModel, Field, ValidationError
 
 from src.agent.llm_client import LLMClient
+from src.agent.rag import RunbookRAG
 from src.agent.tools.k8s_tools import K8sTools
 from src.agent.tools.logs_tools import LogsTools
 from src.agent.tools.prometheus_tools import PrometheusTools
@@ -39,6 +40,8 @@ class NamespaceNotAllowedError(ValueError):
 
 # Количество строк лога по умолчанию (ограничивается MAX_LOG_LINES из конфига).
 DEFAULT_TAIL_LINES = 50
+# Число runbook'ов, подтягиваемых RAG в контекст LLM (top_k).
+RAG_TOP_K = 2
 
 # Fallback-версия системного промта senior SRE (используется, если файл
 # src/prompts/sre_system.txt отсутствует или нечитаем — см. load_system_prompt).
@@ -47,7 +50,8 @@ DEFAULT_SYSTEM_PROMPT = (
     "события. Верни строго JSON без markdown-обёртки с полями: root_cause "
     "(строка), evidence (массив строк), suggested_fix (строка), severity "
     "(low/medium/high/critical). Если данных недостаточно, укажи это в "
-    "root_cause и поставь severity='unknown'."
+    "root_cause и поставь severity='unknown'. Опирайся на relevant_runbooks, "
+    "если они предоставлены, чтобы предложить suggested_fix."
 )
 
 PROMPTS_DIR = Path(__file__).resolve().parent.parent / "prompts"
@@ -186,6 +190,7 @@ class IncidentOrchestrator:
         logs_tools: LogsTools | None = None,
         llm_client: LLMClientProtocol | None = None,
         settings: Settings | None = None,
+        rag: RunbookRAG | None = None,
     ) -> None:
         """Создать оркестратор.
 
@@ -199,6 +204,10 @@ class IncidentOrchestrator:
                 :class:`LLMClientStub`.
             settings: настройки приложения (guardrails); по умолчанию —
                 :func:`~src.config.get_settings` из ``.env``.
+            rag: RAG-поиск по runbook'ам; по умолчанию — новый
+                :class:`~src.agent.rag.RunbookRAG` над ``docs/runbooks``.
+                Передавайте экземпляр с пустой директорией (или mock), чтобы
+                отключить RAG в тестах/оффлайне.
         """
         self.k8s = k8s_tools if k8s_tools is not None else K8sTools()
         self.prometheus = (
@@ -207,6 +216,7 @@ class IncidentOrchestrator:
         self.logs = logs_tools if logs_tools is not None else LogsTools()
         self.llm = llm_client if llm_client is not None else LLMClient()
         self.settings = settings if settings is not None else get_settings()
+        self.rag = rag if rag is not None else RunbookRAG()
 
     # ------------------------------------------------------------------
     # Guardrails
@@ -262,6 +272,26 @@ class IncidentOrchestrator:
         )
         marker = "\n...[context truncated]"
         return context_json[: limit - len(marker)] + marker
+
+    @staticmethod
+    def _build_rag_query(context: dict[str, Any], log_text: str) -> str:
+        """Сформировать поисковый запрос для RAG по runbook'ам.
+
+        Объединяет описание инцидента, статус целевого пода и последние 10
+        строк логов — этого набора симптомов достаточно TF-IDF-ранжированию,
+        чтобы отличить OOMKilled от ImagePullBackOff/CrashLoopBackOff.
+        """
+        parts: list[str] = []
+        incident = context.get("incident") or {}
+        if incident.get("description"):
+            parts.append(str(incident["description"]))
+        target_pod = context.get("target_pod") or {}
+        if target_pod.get("status"):
+            parts.append(str(target_pod["status"]))
+        if log_text:
+            tail = [line for line in log_text.splitlines() if line.strip()][-10:]
+            parts.extend(tail)
+        return "\n".join(parts)
 
     # ------------------------------------------------------------------
     # Основной цикл диагностики
@@ -431,6 +461,19 @@ class IncidentOrchestrator:
             context["pod_logs_tail"] = log_text
             if not log_text:
                 warnings.append(f"Логи пода {target_pod} не получены")
+
+            # d2. RAG: поиск релевантных runbook'ов по симптомам (статус пода +
+            # последние 10 строк логов). Ошибки/пустой результат не влияют на
+            # диагностику — агент работает как раньше без relevant_runbooks.
+            try:
+                runbooks = self.rag.find_relevant(
+                    self._build_rag_query(context, log_text), top_k=RAG_TOP_K
+                )
+            except Exception as exc:
+                logger.error("RAG lookup failed: %s", exc)
+                runbooks = []
+            if runbooks:
+                context["relevant_runbooks"] = runbooks
         else:
             warnings.append("pod_name не указан и не выводится из incident — skip per-pod steps")
 
