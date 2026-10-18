@@ -39,10 +39,10 @@ app = FastAPI(
     version="0.1.0",
 )
 
-# CORS: для dev-режима разрешаем все origins.
+# CORS: origins берутся из конфига (CORS_ORIGINS в .env); по умолчанию "*" для dev.
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=list(settings.cors_origins or ["*"]),
     allow_credentials=False,  # при allow_origins=["*"] браузеры всё равно не отдадут cookies
     allow_methods=["*"],
     allow_headers=["*"],
