@@ -30,7 +30,8 @@ The agent is strictly **read-only by default**: it never mutates the cluster (`E
 | 📊 **Observability** | `/metrics` endpoint (`prometheus-fastapi-instrumentator`) + custom counters/histograms: `diagnose_requests_total`, `diagnose_duration_seconds`, `k8s_api_errors_total`, `llm_fallback_total`. `X-Request-ID` correlation (echoed/generated per request), optional structured JSON logging (`LOG_FORMAT=json`) for Loki/CloudWatch, an append-only audit journal (`AUDIT_LOG_PATH`, JSON Lines) of every diagnosis, and **OpenTelemetry distributed tracing** (auto HTTP spans + manual spans per K8s/Prometheus/logs/RAG/LLM call, OTLP export to Jaeger/Tempo). |
 | 🚨 **Alertmanager webhook** | `POST /webhook/alertmanager` accepts the standard Alertmanager payload, diagnoses every `firing` alert (namespace/pod from labels, text from `annotations.summary`/`description`), skips `resolved`, and answers `400` on malformed payloads. |
 | 🔁 **Chaos self-test** | `scripts/chaos_test.py` creates an ImagePullBackOff pod, asks the agent to diagnose it, asserts the RCA mentions "image"/"pull", and cleans up. Idempotent. |
-| 🧪 **Testing & CI/CD** | 208 unit/integration tests with mocked clients (92% coverage, CI gate `--cov-fail-under=85`, SentenceTransformer mocked so tests never download models), plus an offline **evaluation framework** (`make eval`) with a golden dataset and LLM-as-a-judge scoring; | GitHub Actions pipeline: lint → test+coverage → Docker build+smoke → kind-based e2e on `main` (auto-skipped when no LLM secret is configured). |
+| 🖥️ **Operator dashboard** | `make dashboard` — Streamlit UI over the audit journal: incident table (Timestamp/Namespace/Severity/Root Cause), severity metrics, and approval cards with `suggested_fix` + "Approve & Apply" for every `requires_approval` incident. |
+| 🧪 **Testing & CI/CD** | 213 unit/integration tests with mocked clients (92% coverage, CI gate `--cov-fail-under=85`, SentenceTransformer mocked so tests never download models), plus an offline **evaluation framework** (`make eval`) with a golden dataset and LLM-as-a-judge scoring; | GitHub Actions pipeline: lint → test+coverage → Docker build+smoke → kind-based e2e on `main` (auto-skipped when no LLM secret is configured). |
 | 🐳 **Containerized** | Multi-stage `python:3.12-slim` image, non-root user, healthcheck, no secrets baked into the image. |
 
 ---
@@ -142,6 +143,8 @@ make run           # uvicorn src.main:app --host 0.0.0.0 --port 8000 --reload
 make docker-build  # docker build -t ai-agent-devops:local .
 make chaos         # python scripts/chaos_test.py (ImagePullBackOff self-test)
 make e2e           # bash scripts/run_integration_test.sh (kind cluster, end-to-end)
+make eval          # python eval/evaluate.py (LLM-as-a-judge quality gate)
+make dashboard     # streamlit run ui/dashboard.py (operator UI on :8501)
 ```
 
 The Makefile is a convenience wrapper only — it does not change or replace CI/CD.
@@ -421,6 +424,7 @@ tests/
 ├── test_tracing.py           # OTel provider, FastAPI auto-spans, manual tool/LLM spans
 ├── test_policies.py          # dangerous-fix policy, Slack approval flow, no-webhook fallback
 ├── test_evaluate.py          # eval harness: dataset schema, judge parsing, exit codes
+├── test_dashboard.py         # audit journal parsing, table build, approval filter
 └── test_api.py               # FastAPI TestClient: /health /ready /diagnose /metrics, CORS, errors, X-Request-ID
 ```
 
@@ -430,6 +434,30 @@ tests/
 - **CI jobs** (GitHub Actions): `lint` (`ruff check src tests scripts`) → `test` (pytest + coverage, gate ≥85%) → `build` (Docker, load + smoke-test) → `integration-test` (kind e2e, push to `main` / manual dispatch only, so PRs stay fast; gracefully skipped when the repository has no `QWEN_API_KEY`/`OPENAI_API_KEY` secret).
 
 ---
+
+## Interactive Dashboard
+
+A lightweight Streamlit UI for on-call operators (runs **separately** from the FastAPI
+service, read-only over the audit journal):
+
+```bash
+make dashboard           # or: streamlit run ui/dashboard.py
+# open http://localhost:8501
+```
+
+What you see there:
+
+* **Incidents table** — every diagnosis from the audit journal (`AUDIT_LOG_PATH`,
+  default `audit.jsonl`): Timestamp, Namespace, Severity, Root Cause (newest first),
+  plus per-severity metric tiles;
+* **Approval cards** — for each incident with `requires_approval: true`: namespace/pod,
+  root cause, the dangerous `suggested_fix` in a code block, data-collection warnings
+  and an **"Approve & Apply"** button (demo confirmation: the dashboard never touches
+  the cluster — the human applies the change via kubectl/GitOps after a dry-run);
+* **Raw audit events** expander and a sidebar Refresh button.
+
+If the audit journal does not exist yet, the dashboard shows a warning with hints
+(run the agent and send a few `/diagnose` or Alertmanager requests) instead of crashing.
 
 ## Documentation
 
@@ -487,6 +515,8 @@ ai_agent_DevOps/
 ├── eval/
 │   ├── golden_dataset.json      # golden incidents: expected root cause + runbook
 │   └── evaluate.py              # LLM-as-a-judge harness (make eval), no cluster needed
+├── ui/
+│   └── dashboard.py             # Streamlit operator UI over audit.jsonl (make dashboard)
 ├── scripts/
 │   ├── chaos_test.py            # ImagePullBackOff chaos experiment vs /diagnose
 │   ├── run_integration_test.sh  # kind-based end-to-end test
@@ -507,7 +537,7 @@ ai_agent_DevOps/
 │       ├── logger.py            # stdlib logging setup
 │       ├── metrics.py           # custom Prometheus metrics
 │       └── text_utils.py        # truncate_context (bounded, JSON-safe)
-└── tests/                       # 208 tests, fully mocked externals
+└── tests/                       # 213 tests, fully mocked externals
 ```
 
 ---

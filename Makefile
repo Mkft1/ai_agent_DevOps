@@ -1,13 +1,13 @@
 PYTHON=python3
 PIP=pip
 
-.PHONY: install lint test run docker-build chaos e2e jaeger eval
+.PHONY: install lint test run docker-build chaos e2e jaeger eval dashboard
 
 install:
 	$(PIP) install -r requirements.txt -r requirements-dev.txt
 
 lint:
-	ruff check src tests scripts eval
+	ruff check src tests scripts eval ui
 
 test:
 	pytest --cov=src --cov-report=term-missing tests/
@@ -31,3 +31,6 @@ jaeger:
 
 eval:
 	$(PYTHON) eval/evaluate.py
+
+dashboard:
+	streamlit run ui/dashboard.py
