@@ -1,0 +1,76 @@
+# Least-privilege RBAC для AI-агента диагностики (namespace: default).
+#
+# Агент read-only: ему нужны ТОЛЬКО get/list/watch на ресурсы, которые он
+# читает при диагностике (поды, логи, события, деплойменты и т.д.).
+# Никаких create/update/delete/patch — это гарантирует кластерный уровень
+# защиты даже при баге или компрометации приложения.
+#
+# Применение: kubectl apply -f manifests/agent-rbac.yaml
+# Использование: смонтировать SA-токен в деплой агента
+#   spec.serviceAccountName: ai-agent
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: ai-agent
+  namespace: default
+  labels:
+    app.kubernetes.io/name: ai-agent
+    app.kubernetes.io/component: sre-agent
+  annotations:
+    ai-agent-devops/purpose: >-
+      Read-only ServiceAccount for the K8s incident diagnosis agent
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: ai-agent-read-only
+  namespace: default
+  labels:
+    app.kubernetes.io/name: ai-agent
+  annotations:
+    ai-agent-devops/purpose: >-
+      Read-only access (get/list/watch) to workload resources and events
+      in the namespace; no write verbs by design
+rules:
+  # Core: поды, их логи, события, сервисы, PVC, репликасеты-контроллеры
+  - apiGroups: [""]
+    resources:
+      - pods
+      - pods/log
+      - events
+      - services
+      - configmaps
+      - persistentvolumeclaims
+      - replicationcontrollers
+    verbs: ["get", "list", "watch"]
+  # Workloads: деплойменты, стейтфулсеты, демонсеты, репликасеты
+  - apiGroups: ["apps"]
+    resources:
+      - deployments
+      - replicasets
+      - statefulsets
+      - daemonsets
+    verbs: ["get", "list", "watch"]
+  # Batch: jobs/cronjobs (частый источник инцидентов)
+  - apiGroups: ["batch"]
+    resources:
+      - jobs
+      - cronjobs
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: ai-agent-read-only
+  namespace: default
+  labels:
+    app.kubernetes.io/name: ai-agent
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: ai-agent-read-only
+subjects:
+  - kind: ServiceAccount
+    name: ai-agent
+    namespace: default
