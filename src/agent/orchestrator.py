@@ -7,7 +7,7 @@ LLM: по умолчанию используется реальный клие�
 можно передать безтокенную заглушку :class:`LLMClientStub` — оба реализуют
 интерфейс ``generate(system_prompt=..., user_prompt=...) -> str``.
 """
-
+from src.utils.text_utils import estimate_tokens
 from __future__ import annotations
 
 import json
