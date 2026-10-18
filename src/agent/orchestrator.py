@@ -28,6 +28,7 @@ from src.utils.metrics import (
     inc_llm_fallback,
     observe_diagnose_duration,
 )
+from src.utils.text_utils import truncate_context
 
 logger = get_logger(__name__)
 
@@ -321,16 +322,35 @@ class IncidentOrchestrator:
         if not self.settings.enable_write_actions:
             context["mode"] = "read-only"
 
-        # a. Список подов в namespace.
+        # a. Список подов в namespace (Graceful Degradation: ошибка K8s API не
+        # прерывает диагностику — продолжаем только по Prometheus-метрикам).
+        k8s_unavailable = False
         try:
             pods = self.k8s.get_pods(namespace=incident.namespace)
         except Exception as exc:  # защита от непредвиденных ошибок инструмента
             logger.error("get_pods failed: %s", exc)
             pods = []
+            k8s_unavailable = True
+        if not pods and not incident.pod_name:
+            # Инструмент «съел» ApiException и вернул [] — сам факт ошибки виден
+            # только в логах; считаем K8s API недоступным (degraded mode).
+            logger.error(
+                "K8s API unavailable: get_pods returned empty list in ns/%s",
+                incident.namespace,
+            )
+            k8s_unavailable = True
         if pods:
             context["pods"] = pods
         else:
             warnings.append(f"Не удалось получить список подов в ns/{incident.namespace}")
+
+        # Graceful Degradation: если K8s API недоступен (исключение или пустой
+        # ответ с ошибкой в логах) — продолжаем диагностику только по Prometheus.
+        k8s_unavailable = k8s_unavailable or not pods
+        if k8s_unavailable:
+            warnings.append(
+                "K8s API unavailable, using only Prometheus metrics"
+            )
 
         # b. Целевой под: статус, рестарты, события.
         target_pod = incident.pod_name
@@ -353,25 +373,32 @@ class IncidentOrchestrator:
                     "restarts": pod_info.get("restarts"),
                     "node": pod_info.get("node"),
                 }
+            elif k8s_unavailable or not pods:
+                # Graceful Degradation: под известен из алерта, но K8s API
+                # недоступен/не вернул данных — берём цель из алерта.
+                context["target_pod"] = {"name": target_pod, "source": "alert"}
             else:
                 warnings.append(f"Под {target_pod} не найден в ns/{incident.namespace}")
 
-            try:
-                events = self.k8s.get_events(namespace=incident.namespace)
-            except Exception as exc:
-                logger.error("get_events failed: %s", exc)
-                events = []
-            relevant = [
-                e
-                for e in events
-                if target_pod in str(e.get("involved_object", ""))
-                or e.get("type") == "Warning"
-            ]
-            context["events"] = relevant[:20]
-            if not events:
-                warnings.append("События Kubernetes не получены (пусто или ошибка)")
+            # K8s-события запрашиваем только если API заведомо доступен (есть поды).
+            if pods:
+                try:
+                    events = self.k8s.get_events(namespace=incident.namespace)
+                except Exception as exc:
+                    logger.error("get_events failed: %s", exc)
+                    events = []
+                relevant = [
+                    e
+                    for e in events
+                    if target_pod in str(e.get("involved_object", ""))
+                    or e.get("type") == "Warning"
+                ]
+                context["events"] = relevant[:20]
+                if not events:
+                    warnings.append("События Kubernetes не получены (пусто или ошибка)")
 
-            # c. CPU и память через Prometheus.
+            # c. CPU и память через Prometheus (работает даже при K8s outage —
+            # kubelet/cAdvisor метрики независимы от API-сервера).
             try:
                 cpu = self.prometheus.get_pod_cpu_usage(
                     namespace=incident.namespace, pod_name=target_pod
@@ -408,6 +435,9 @@ class IncidentOrchestrator:
             warnings.append("pod_name не указан и не выводится из incident — skip per-pod steps")
 
         # e/f. Контекст -> LLM: системный промт отдельно, данные — в user-сообщении.
+        # truncate_context рекурсивно обрезает длинные строки (логи), чтобы JSON
+        # не превышал MAX_CONTEXT_CHARS; _limit_context — финальная гарантия лимита.
+        context = truncate_context(context, self.settings.max_context_chars)
         context_json = json.dumps(context, ensure_ascii=False, default=str)
         user_prompt = (
             f"Данные диагностики:\n{self._limit_context(context_json)}"
