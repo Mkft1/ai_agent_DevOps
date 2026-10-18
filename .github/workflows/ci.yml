@@ -111,16 +111,21 @@ jobs:
           python-version: "3.12"
           cache: pip
       - name: Install dependencies
+        if: ${{ env.QWEN_API_KEY != '' || env.OPENAI_API_KEY != '' }}
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
       - name: Install kind and kubectl (pinned versions)
+        if: ${{ env.QWEN_API_KEY != '' || env.OPENAI_API_KEY != '' }}
         run: |
-          curl -fsSL -o /usr/local/bin/kind https://kind.sigs.k8s.io/dl/v0.24.0/kind-linux-amd64
-          chmod +x /usr/local/bin/kind
-          curl -fsSL -o /usr/local/bin/kubectl "https://dl.k8s.io/release/v1.31.1/bin/linux/amd64/kubectl"
-          chmod +x /usr/local/bin/kubectl
-          kind version && kubectl version --client
+          # /usr/local/bin на новых раннерах может быть недоступен для chmod —
+          # ставим в $HOME/.local/bin и добавляем в PATH следующего шага.
+          mkdir -p "$HOME/.local/bin"
+          curl -fsSL -o "$HOME/.local/bin/kind" https://kind.sigs.k8s.io/dl/v0.24.0/kind-linux-amd64
+          curl -fsSL -o "$HOME/.local/bin/kubectl" "https://dl.k8s.io/release/v1.31.1/bin/linux/amd64/kubectl"
+          chmod +x "$HOME/.local/bin/kind" "$HOME/.local/bin/kubectl"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          "$HOME/.local/bin/kind" version && "$HOME/.local/bin/kubectl" version --client
       - name: Run kind e2e test (real cluster + real /diagnose)
         if: ${{ env.QWEN_API_KEY != '' || env.OPENAI_API_KEY != '' }}
         run: bash scripts/run_integration_test.sh
