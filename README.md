@@ -1,5 +1,5 @@
 <p align="center">
-  <a href="./README.md"><b>🇬🇧 English</b></a> &nbsp;|&nbsp; <a href="./README.ru.md"><b>🇷🇺 Читать на русском </b></a>
+  <a href="./README.md"><b>🇬🇧 English</b></a> &nbsp;|&nbsp; <a href="./README.ru.md"><b>🇷🇺 Русский </b></a>
 </p>
 
 <h1 align="center">K8s Incident Diagnosis AI Agent</h1>
