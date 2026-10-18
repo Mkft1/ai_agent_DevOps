@@ -11,7 +11,7 @@ AI-агент для диагностики инцидентов в Kubernetes. 
 [![Python 3.12](https://img.shields.io/badge/python-3.12-blue?logo=python&logoColor=white)](https://www.python.org/downloads/)
 [![Docker](https://img.shields.io/badge/docker-multistage%20image-2496ED?logo=docker&logoColor=white)](./Dockerfile)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](./LICENSE)
-[![Tests](https://img.shields.io/badge/tests-189%20passed-brightgreen?logo=pytest&logoColor=white)](#тесты)
+[![Tests](https://img.shields.io/badge/tests-208%20passed-brightgreen?logo=pytest&logoColor=white)](#тесты)
 [![Ruff](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/astral-sh/ruff/main/assets/badge/v2.json)](https://github.com/astral-sh/ruff)
 
 AI-агент для диагностики инцидентов в Kubernetes.
@@ -91,11 +91,15 @@ Alertmanager → /diagnose → IncidentOrchestrator → [K8sTools, PrometheusToo
   лимит строк логов, секреты только через `.env`, non-root контейнер, `.dockerignore`,
   политика опасных действий: рекомендации с `delete`/`drop`/`rm -rf`/`scale 0`
   помечаются `requires_approval: true` и уходят на аппрув человеку в Slack.
-- **Тестирование** — 189 unit/интеграционных тестов (pytest + unittest.mock), покрытие ~92%
+- **Тестирование** — 208 unit/интеграционных тестов (pytest + unittest.mock), покрытие ~92%
   (гейт в CI `--cov-fail-under=85`): инструменты, оркестратор, LLM-клиент (мок HTTP),
   FastAPI-эндпоинты (TestClient), конфигурация и логирование, chaos-скрипт.
 - **DevOps-практики** — многоступенчатый Docker-образ, docker-compose, идемпотентный
   chaos-эксперимент (ImagePullBackOff) как end-to-end проверка качества диагностики.
+- **Evaluation-фреймворк** — `make eval`: золотой датасет инцидентов прогоняется через
+  реальный пайплайн (RAG + LLM) без кластера, а второй LLM-вызов выступает судьёй
+  (LLM-as-a-judge, шкала 1–5 по смыслу); метрики — средний балл и runbook hit-rate,
+  exit code работает как regression-гейт для промптов/ранбуков/моделей.
 
 ## Что делает агент
 
@@ -144,6 +148,9 @@ ai_agent_DevOps/
 │       ├── logger.py      # Базовое логирование
 │       ├── metrics.py     # Кастомные Prometheus-метрики агента
 │       └── text_utils.py  # truncate_context: рекурсивная обрезка контекста для LLM
+├── eval/
+│   ├── golden_dataset.json  # золотые инциденты: ожидаемый root cause + runbook
+│   └── evaluate.py          # harness LLM-as-a-judge (make eval), без кластера
 ├── docs/
 │   ├── assets/              # демо-ассеты (placeholder под будущий demo.gif)
 │   └── runbooks/            # RAG-база: 8 runbook'ов (OOMKilled, ImagePullBackOff, CrashLoop, DNS, NodeNotReady, PVCPending, CreateContainerConfigError, Evicted)
@@ -369,6 +376,35 @@ SLACK_WEBHOOK_URL=https://hooks.slack.com/services/T000/B000/XXXX
 Безопасные рекомендации (поднять лимиты, поправить тег образа, добавить probes)
 гейт не проходят: `requires_approval: false`, сообщение в Slack не отправляется.
 
+## Оценка качества (Evaluation, LLM-as-a-judge)
+
+Промты, runbook'и и модели меняются — без измерителя качества изменения слепы.
+`make eval` прогоняет **золотой датасет** инцидентов через реальный пайплайн агента
+(RAG + LLM) и оценивает ответы вторым LLM-вызовом в роли судьи:
+
+```bash
+make eval                # или: python eval/evaluate.py --min-score 4.0
+```
+
+* **Датасет** — `eval/golden_dataset.json`: 3 кейса (OOMKilled, ImagePullBackOff,
+  CrashLoopBackOff) с полями `incident` (namespace/pod_name/description),
+  `expected_root_cause` и `expected_runbook`; схема валидируется при загрузке,
+  новые кейсы добавляются просто дописыванием в JSON.
+* **Кластер не нужен** — K8s/Prometheus/логи замоканы внутри скрипта реалистичными
+  симптомами сценариев (события, хвосты логов, метрики): измеряется логика
+  **RAG + LLM**, а не доступность инфраструктуры.
+* **Судья** — LLM сравнивает ожидаемый и фактический root cause по смыслу:
+  «Сравни expected_root_cause: … и actual_root_cause: … Оцени по шкале от 1 до 5,
+  где 5 - полное совпадение по смыслу. Верни только цифру.»
+* **Метрики** — средний балл судьи (1–5) и **runbook hit-rate** (доля кейсов, где RAG
+  подтянул ожидаемый runbook в `relevant_runbooks`).
+* **Гейт** — exit code 0 только если средний балл ≥ `--min-score` (по умолчанию 4.0)
+  **и** hit-rate = 100%; 1 = качество ниже порога (regression-гейт перед правками
+  промптов/ранбуков/моделей); 2 = ошибка окружения (нет LLM-ключа, битый датасет).
+
+Требуется LLM-ключ (`QWEN_API_KEY`/`OPENAI_API_KEY`); для судьи можно указать ту же
+или более сильную модель через `LLM_BASE_URL`/`LLM_MODEL`.
+
 ## Трейсинг (OpenTelemetry)
 
 Трейсы показывают, куда уходят миллисекунды диагностики: K8s API, Prometheus,
@@ -523,7 +559,7 @@ ruff check src tests scripts
 python -m pytest --cov=src --cov-report=xml tests/
 ```
 
-Текущий набор: **189 passed**, покрытие **~92%** (инструменты K8s/Prometheus/логов,
+Текущий набор: **208 passed**, покрытие **~92%** (инструменты K8s/Prometheus/логов,
 оркестратор, LLM-клиент с моками HTTP, FastAPI-эндпоинты через TestClient (включая
 webhook Alertmanager и журнал аудита), валидация конфигурации, JSON-логирование,
 трейсинг OpenTelemetry, chaos-скрипт).

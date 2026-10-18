@@ -30,7 +30,7 @@ The agent is strictly **read-only by default**: it never mutates the cluster (`E
 | 📊 **Observability** | `/metrics` endpoint (`prometheus-fastapi-instrumentator`) + custom counters/histograms: `diagnose_requests_total`, `diagnose_duration_seconds`, `k8s_api_errors_total`, `llm_fallback_total`. `X-Request-ID` correlation (echoed/generated per request), optional structured JSON logging (`LOG_FORMAT=json`) for Loki/CloudWatch, an append-only audit journal (`AUDIT_LOG_PATH`, JSON Lines) of every diagnosis, and **OpenTelemetry distributed tracing** (auto HTTP spans + manual spans per K8s/Prometheus/logs/RAG/LLM call, OTLP export to Jaeger/Tempo). |
 | 🚨 **Alertmanager webhook** | `POST /webhook/alertmanager` accepts the standard Alertmanager payload, diagnoses every `firing` alert (namespace/pod from labels, text from `annotations.summary`/`description`), skips `resolved`, and answers `400` on malformed payloads. |
 | 🔁 **Chaos self-test** | `scripts/chaos_test.py` creates an ImagePullBackOff pod, asks the agent to diagnose it, asserts the RCA mentions "image"/"pull", and cleans up. Idempotent. |
-| 🧪 **Testing & CI/CD** | 189 unit/integration tests with mocked clients (92% coverage, CI gate `--cov-fail-under=85`, SentenceTransformer mocked so tests never download models); GitHub Actions pipeline: lint → test+coverage → Docker build+smoke → kind-based e2e on `main` (auto-skipped when no LLM secret is configured). |
+| 🧪 **Testing & CI/CD** | 208 unit/integration tests with mocked clients (92% coverage, CI gate `--cov-fail-under=85`, SentenceTransformer mocked so tests never download models), plus an offline **evaluation framework** (`make eval`) with a golden dataset and LLM-as-a-judge scoring; | GitHub Actions pipeline: lint → test+coverage → Docker build+smoke → kind-based e2e on `main` (auto-skipped when no LLM secret is configured). |
 | 🐳 **Containerized** | Multi-stage `python:3.12-slim` image, non-root user, healthcheck, no secrets baked into the image. |
 
 ---
@@ -307,6 +307,51 @@ SLACK_WEBHOOK_URL=https://hooks.slack.com/services/T000/B000/XXXX
 Safe recommendations (raise limits, fix image tags, add probes...) skip the gate:
 `requires_approval: false`, no Slack message.
 
+## Evaluation & Quality Assurance
+
+Prompts, runbooks and models evolve — without a measurement harness every change is
+blind. `make eval` runs a **golden dataset** of incidents through the real agent
+pipeline (RAG + LLM) and scores the answers with **LLM-as-a-judge**:
+
+```bash
+make eval                # or: python eval/evaluate.py --min-score 4.0
+```
+
+* **Dataset** — `eval/golden_dataset.json`: 3 cases (OOMKilled, ImagePullBackOff,
+  CrashLoopBackOff), each with `incident` (namespace/pod_name/description),
+  `expected_root_cause` and `expected_runbook`. Add cases freely — the schema is
+  validated at load.
+* **No cluster needed** — K8s/Prometheus/logs tools are mocked inside the script with
+  realistic per-scenario symptoms (events, log tails, metrics), so the evaluation
+  measures what matters: **RAG retrieval + LLM reasoning**, not cluster availability.
+* **Judge** — a second LLM call compares expected vs actual root cause semantically:
+  «Сравни expected_root_cause: … и actual_root_cause: … Оцени по шкале от 1 до 5,
+  где 5 — полное совпадение по смыслу. Верни только цифру.»
+* **Metrics** — average judge score (1–5) and **runbook hit-rate** (share of cases where
+  RAG retrieved the expected runbook into `relevant_runbooks`).
+* **Gate** — exit code 0 only if avg score ≥ `--min-score` (default 4.0) **and**
+  hit-rate is 100%; 1 = quality below threshold (use as a regression gate before
+  prompt/RAG/model changes), 2 = environment error (missing LLM key, bad dataset).
+
+```
+==============================================================================
+                 EVALUATION REPORT — LLM-as-a-judge (golden dataset)
+==============================================================================
+ CASE (runbook)             JUDGE 1-5  RUNBOOK  ACTUAL ROOT CAUSE
+------------------------------------------------------------------------------
+ oom_killed.md                    5/5  ✅       Container OOMKilled: memory limit…
+ image_pull_backoff.md            5/5  ✅       Image pull failure: manifest un…
+ crash_loop.md                    4/5  ✅       CrashLoopBackOff: missing DATABASE…
+------------------------------------------------------------------------------
+ Average judge score : 4.67 / 5  (порог: 4.0)
+ Runbook hit-rate    : 100%  (3/3)
+ Verdict             : ✅ PASS
+==============================================================================
+```
+
+Requires an LLM key (`QWEN_API_KEY`/`OPENAI_API_KEY`) — the same model family can be
+used for diagnosis and judging, or point `LLM_BASE_URL`/`LLM_MODEL` at a stronger judge.
+
 ## Tracing (OpenTelemetry)
 
 The agent emits **distributed traces** so you can see exactly where milliseconds go:
@@ -375,6 +420,7 @@ tests/
 ├── test_webhook_alertmanager.py  # Alertmanager payload parsing, 400s, resolved-skip, audit journal
 ├── test_tracing.py           # OTel provider, FastAPI auto-spans, manual tool/LLM spans
 ├── test_policies.py          # dangerous-fix policy, Slack approval flow, no-webhook fallback
+├── test_evaluate.py          # eval harness: dataset schema, judge parsing, exit codes
 └── test_api.py               # FastAPI TestClient: /health /ready /diagnose /metrics, CORS, errors, X-Request-ID
 ```
 
@@ -429,6 +475,9 @@ ai_agent_DevOps/
 ├── docker-compose.yml           # local stack: agent + kubeconfig/.env mounts
 ├── Makefile                     # dev shortcuts: install/lint/test/run/docker-build/chaos/e2e
 ├── docs/runbooks/               # RAG knowledge base: 8 runbooks (OOMKilled, ImagePullBackOff, CrashLoop, DNS, NodeNotReady, PVCPending, CreateContainerConfigError, Evicted)
+├── eval/
+│   ├── golden_dataset.json      # golden incidents: expected root cause + runbook
+│   └── evaluate.py              # LLM-as-a-judge harness (make eval), no cluster needed
 ├── scripts/
 │   ├── chaos_test.py            # ImagePullBackOff chaos experiment vs /diagnose
 │   ├── run_integration_test.sh  # kind-based end-to-end test
@@ -449,7 +498,7 @@ ai_agent_DevOps/
 │       ├── logger.py            # stdlib logging setup
 │       ├── metrics.py           # custom Prometheus metrics
 │       └── text_utils.py        # truncate_context (bounded, JSON-safe)
-└── tests/                       # 189 tests, fully mocked externals
+└── tests/                       # 208 tests, fully mocked externals
 ```
 
 ---
