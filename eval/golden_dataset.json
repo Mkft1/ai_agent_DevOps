@@ -1,0 +1,29 @@
+[
+  {
+    "incident": {
+      "namespace": "default",
+      "pod_name": "payments-api-7d9f4b-x2kq",
+      "description": "Pod payments-api restarts repeatedly, alert: ContainerOOMKilling"
+    },
+    "expected_root_cause": "OOMKilled due to memory limit",
+    "expected_runbook": "oom_killed.md"
+  },
+  {
+    "incident": {
+      "namespace": "default",
+      "pod_name": "bad-pod",
+      "description": "Pod in ImagePullBackOff after rollout, alert: ImagePullFailed"
+    },
+    "expected_root_cause": "Image pull failure: the image tag does not exist in the registry",
+    "expected_runbook": "image_pull_backoff.md"
+  },
+  {
+    "incident": {
+      "namespace": "default",
+      "pod_name": "web-1",
+      "description": "Pod web-1 crash loops after deploy, alert: CrashLoopBackOff"
+    },
+    "expected_root_cause": "Application crashes at startup (CrashLoopBackOff): missing configuration causes repeated container exits",
+    "expected_runbook": "crash_loop.md"
+  }
+]

@@ -138,7 +138,10 @@ class RunbookRAG:
             ]
             logger.debug("RAG hybrid scoring active (model=%s)", self.embedding_model)
 
-        ranked = sorted(scores, key=lambda s: s[1], reverse=True)
+        # Ранжируем по итоговому скору (элемент кортежа #2), НЕ по тексту:
+        # сортировка по s[1] (тексту) — исторический баг, из-за которого топ
+        # выдачи определялся алфавитом, а не релевантностью.
+        ranked = sorted(scores, key=lambda s: s[2], reverse=True)
         results = [text for name, text, score in ranked if score >= self.min_score][:top_k]
         if results:
             logger.debug(
