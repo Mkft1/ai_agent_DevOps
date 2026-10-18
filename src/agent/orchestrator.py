@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import json
 import time
+from pathlib import Path
 from typing import Any, Protocol, runtime_checkable
 
 from pydantic import BaseModel, Field, ValidationError
@@ -38,14 +39,46 @@ class NamespaceNotAllowedError(ValueError):
 # Количество строк лога по умолчанию (ограничивается MAX_LOG_LINES из конфига).
 DEFAULT_TAIL_LINES = 50
 
-# Системный промт senior SRE (по ТЗ).
-SYSTEM_PROMPT = (
+# Fallback-версия системного промта senior SRE (используется, если файл
+# src/prompts/sre_system.txt отсутствует или нечитаем — см. load_system_prompt).
+DEFAULT_SYSTEM_PROMPT = (
     "Ты — senior SRE. Тебе дан контекст инцидента в Kubernetes: метрики, логи, "
     "события. Верни строго JSON без markdown-обёртки с полями: root_cause "
     "(строка), evidence (массив строк), suggested_fix (строка), severity "
     "(low/medium/high/critical). Если данных недостаточно, укажи это в "
     "root_cause и поставь severity='unknown'."
 )
+
+PROMPTS_DIR = Path(__file__).resolve().parent.parent / "prompts"
+SYSTEM_PROMPT_FILE = PROMPTS_DIR / "sre_system.txt"
+
+
+def load_system_prompt(path: Path | None = None) -> str:
+    """Надёжно загрузить системный промт для LLM из текстового файла.
+
+    Args:
+        path: путь к файлу промта; по умолчанию — ``src/prompts/sre_system.txt``.
+
+    Returns:
+        Содержимое файла. Если файл отсутствует или пуст — возвращает
+        :data:`DEFAULT_SYSTEM_PROMPT` с логированием ошибки (приложение не падает).
+    """
+    prompt_path = path if path is not None else SYSTEM_PROMPT_FILE
+    try:
+        text = prompt_path.read_text(encoding="utf-8").strip()
+        if not text:
+            raise ValueError(f"prompt file is empty: {prompt_path}")
+        return text
+    except Exception as exc:  # noqa: BLE001 - fallback обязателен по ТЗ
+        logger.error(
+            "Failed to load system prompt from %s (%s); using built-in fallback",
+            prompt_path,
+            exc,
+        )
+        return DEFAULT_SYSTEM_PROMPT
+
+
+SYSTEM_PROMPT = load_system_prompt()
 
 SEVERITY_LEVELS = ("critical", "high", "medium", "low", "info", "unknown")
 
@@ -212,6 +245,23 @@ class IncidentOrchestrator:
             )
         return clamped
 
+    def _limit_context(self, context_json: str) -> str:
+        """Ограничить размер контекста для LLM значением MAX_CONTEXT_CHARS.
+
+        Если сериализованный контекст длиннее лимита — обрезаем с хвоста и
+        добавляем пометку, чтобы модель понимала неполноту данных.
+        """
+        limit = max(int(self.settings.max_context_chars), 1000)
+        if len(context_json) <= limit:
+            return context_json
+        logger.warning(
+            "Context truncated to MAX_CONTEXT_CHARS=%d (was %d chars)",
+            limit,
+            len(context_json),
+        )
+        marker = "\n...[context truncated]"
+        return context_json[: limit - len(marker)] + marker
+
     # ------------------------------------------------------------------
     # Основной цикл диагностики
     # ------------------------------------------------------------------
@@ -358,9 +408,9 @@ class IncidentOrchestrator:
             warnings.append("pod_name не указан и не выводится из incident — skip per-pod steps")
 
         # e/f. Контекст -> LLM: системный промт отдельно, данные — в user-сообщении.
+        context_json = json.dumps(context, ensure_ascii=False, default=str)
         user_prompt = (
-            f"Данные диагностики:\n"
-            f"{json.dumps(context, ensure_ascii=False, default=str)}"
+            f"Данные диагностики:\n{self._limit_context(context_json)}"
         )
         llm_raw = ""
         try:

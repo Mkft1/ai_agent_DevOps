@@ -368,3 +368,61 @@ class TestGuardrails:
         forbidden = ("delete", "exec", "apply", "patch", "scale", "restart")
         methods = [m for m in dir(IncidentOrchestrator) if not m.startswith("__")]
         assert not [m for m in methods if any(f in m.lower() for f in forbidden)]
+
+
+
+class TestSystemPromptLoading:
+    """Загрузка системного промта из src/prompts/sre_system.txt + fallback."""
+
+    def test_prompt_file_exists_and_loaded(self) -> None:
+        from src.agent.orchestrator import SYSTEM_PROMPT, SYSTEM_PROMPT_FILE
+
+        assert SYSTEM_PROMPT_FILE.exists()
+        assert "senior SRE" in SYSTEM_PROMPT
+        assert "root_cause" in SYSTEM_PROMPT
+
+    def test_fallback_when_file_missing(self, tmp_path) -> None:
+        from src.agent.orchestrator import DEFAULT_SYSTEM_PROMPT, load_system_prompt
+
+        missing = tmp_path / "no_such_prompt.txt"
+        assert load_system_prompt(missing) == DEFAULT_SYSTEM_PROMPT
+
+    def test_fallback_when_file_empty(self, tmp_path) -> None:
+        from src.agent.orchestrator import DEFAULT_SYSTEM_PROMPT, load_system_prompt
+
+        empty = tmp_path / "empty.txt"
+        empty.write_text("   \n", encoding="utf-8")
+        assert load_system_prompt(empty) == DEFAULT_SYSTEM_PROMPT
+
+    def test_custom_prompt_file_is_used(self, tmp_path) -> None:
+        from src.agent.orchestrator import load_system_prompt
+
+        custom = tmp_path / "custom.txt"
+        custom.write_text("  Тестовый промт  ", encoding="utf-8")
+        assert load_system_prompt(custom) == "Тестовый промт"
+
+
+class TestContextLimit:
+    """MAX_CONTEXT_CHARS: ограничение размера контекста для LLM."""
+
+    def test_small_context_not_truncated(self) -> None:
+        orch, _, _, _, llm = make_orchestrator()
+        result = orch.diagnose(
+            {"namespace": "default", "pod_name": "api-7d9f-x2kq", "description": "x"}
+        )
+        assert result is not None
+        user_prompt = llm.generate.call_args.kwargs["user_prompt"]
+        assert "[context truncated]" not in user_prompt
+
+    def test_large_context_truncated(self) -> None:
+        settings = Settings(max_context_chars=1000, allowed_namespaces=["*"], _env_file=None)
+        orch, _, _, _, llm = make_orchestrator(settings=settings)
+        # Добавляем большой pod_logs, чтобы контекст превысил лимит
+        big_logs = "\n".join([f"log line {i}" for i in range(500)])
+        orch.logs.get_pod_logs.return_value = big_logs
+        orch.diagnose(
+            {"namespace": "default", "pod_name": "api-7d9f-x2kq", "description": "x"}
+        )
+        user_prompt = llm.generate.call_args.kwargs["user_prompt"]
+        assert "[context truncated]" in user_prompt
+        assert len(user_prompt) < 1500
