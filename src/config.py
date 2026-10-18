@@ -44,6 +44,11 @@ class Settings(BaseSettings):
     # Имя сервиса в трейсах (service.name в Jaeger/Tempo).
     otel_service_name: str = "ai-agent-devops"
 
+    # RAG: гибридный поиск (TF-IDF + векторные эмбеддинги sentence-transformers).
+    # При недоступности модели агент молча деградирует до чистого TF-IDF.
+    enable_hybrid_rag: bool = True
+    embedding_model: str = "all-MiniLM-L6-v2"
+
     # LLM API-ключи (используется один из провайдеров)
     openai_api_key: str | None = None
     qwen_api_key: str | None = None
