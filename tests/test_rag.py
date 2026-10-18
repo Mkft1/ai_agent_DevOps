@@ -193,3 +193,29 @@ class TestOrchestratorRagIntegration:
         )
         assert result["root_cause"] == "oom"
         assert "relevant_runbooks" not in result["raw_data"]
+
+
+class TestExpandedRunbookLibrary:
+    """Новые runbook'и (DNS/PVC/Node) должны индексироваться и находится."""
+
+    def test_new_runbooks_are_retrievable(self):
+        rag = RunbookRAG()  # реальный docs/runbooks из репозитория
+        assert rag.document_count >= 6
+
+        dns = rag.find_relevant(
+            "lookup my-service.default.svc.cluster.local: no such host SERVFAIL",
+            top_k=2,
+        )
+        assert any("CoreDNS" in doc for doc in dns)
+
+        pvc = rag.find_relevant(
+            "persistentvolumeclaim stuck Pending ProvisioningFailed storageclass not found",
+            top_k=2,
+        )
+        assert any("StorageClass" in doc for doc in pvc)
+
+        node = rag.find_relevant(
+            "node NotReady Kubelet stopped posting node status DiskPressure",
+            top_k=2,
+        )
+        assert any("kubelet" in doc.lower() for doc in node)
