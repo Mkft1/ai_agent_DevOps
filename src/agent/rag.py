@@ -1,9 +1,15 @@
-"""RAG по локальным runbook'ам (docs/runbooks/*.md).
+"""RAG по локальным runbook'ам (docs/runbooks/*.md): гибридный поиск.
 
-Простой retrieval без внешних сервисов: все markdown-файла читаются в память,
-релевантность запросу ранжируется TF-IDF (sklearn.feature_extraction.text).
-Используется инкрементально: если runbook'и не найдены (или директория
-отсутствует / sklearn недоступен) — агент работает как раньше, без контекста.
+Retrieval без внешних сервисов (ничего не деплоим, индекс в процессе):
+    * TF-IDF (sklearn) — точное совпадение терминов;
+    * векторный поиск (sentence-transformers, ``all-MiniLM-L6-v2``) — поиск
+      по смыслу (синонимы, перефразирования);
+    * гибридный скор = 0.5 * TF-IDF + 0.5 * cosine_similarity(эмбеддингов).
+
+Graceful degradation: если sentence-transformers не установлен или модель не
+скачалась (нет сети/диска) — ``RunbookRAG`` молча падает обратно на чистый
+TF-IDF (``hybrid_enabled is False``); если нет и sklearn / runbook'ов —
+поиск возвращает [] и агент работает без контекста, как раньше.
 """
 
 from __future__ import annotations
@@ -11,6 +17,11 @@ from __future__ import annotations
 import logging
 import re
 from pathlib import Path
+
+try:  # тяжёлая опциональная зависимость: без неё работаем на чистом TF-IDF
+    from sentence_transformers import SentenceTransformer
+except ImportError:  # pragma: no cover - зависит от окружения деплоя
+    SentenceTransformer = None  # type: ignore[assignment]
 
 logger = logging.getLogger(__name__)
 
@@ -20,6 +31,10 @@ DEFAULT_RUNBOOKS_DIR = Path(__file__).resolve().parents[2] / "docs" / "runbooks"
 # Минимальный порог косинусной близости TF-IDF, ниже которого runbook
 # считается нерелевантным (шумовой совпадений отдельных слов).
 DEFAULT_MIN_SCORE = 0.05
+
+# Веса гибридного ранжирования (TF-IDF + векторный cosine similarity).
+HYBRID_TFIDF_WEIGHT = 0.5
+HYBRID_VECTOR_WEIGHT = 0.5
 
 
 class RunbookRAG:
@@ -34,12 +49,29 @@ class RunbookRAG:
         self,
         runbooks_dir: str | Path | None = None,
         min_score: float = DEFAULT_MIN_SCORE,
+        enable_hybrid: bool | None = None,
+        embedding_model: str | None = None,
     ) -> None:
+        """Args:
+            runbooks_dir: директория с ``*.md``; по умолчанию ``docs/runbooks``.
+            min_score: порог итогового (гибридного) скора релевантности.
+            enable_hybrid: включить векторную ветку; по умолчанию флаг
+                ``ENABLE_HYBRID_RAG`` из конфигурации.
+            embedding_model: имя модели sentence-transformers; по умолчанию
+                ``EMBEDDING_MODEL`` из конфигурации (``all-MiniLM-L6-v2``).
+        """
+        from src.config import get_settings  # локально: избежать циклов импорта
+
+        settings = get_settings()
         self.runbooks_dir = Path(runbooks_dir) if runbooks_dir else DEFAULT_RUNBOOKS_DIR
         self.min_score = min_score
+        self.enable_hybrid = settings.enable_hybrid_rag if enable_hybrid is None else enable_hybrid
+        self.embedding_model = embedding_model or settings.embedding_model
         self._documents: list[tuple[str, str]] = []  # (filename, text)
         self._vectorizer = None
         self._matrix = None
+        self._embedder = None
+        self._embed_matrix = None  # numpy array (n_docs, dim), нормированный
         self.load_runbooks()
 
     # ------------------------------------------------------------------
@@ -71,6 +103,7 @@ class RunbookRAG:
 
         self._documents = documents
         self._build_index(documents)
+        self._build_embedding_index(documents)
         logger.debug("Loaded %d runbook(s) from %s", len(documents), self.runbooks_dir)
         return documents
 
@@ -96,6 +129,15 @@ class RunbookRAG:
             logger.debug("RAG query produced no features: %s", exc)
             return []
 
+        vector_scores = self._vector_scores(query)
+        if vector_scores is not None:
+            # Hybrid search: 0.5 * TF-IDF + 0.5 * cosine similarity эмбеддингов.
+            scores = [
+                (name, text, HYBRID_TFIDF_WEIGHT * tf + HYBRID_VECTOR_WEIGHT * vs)
+                for (name, text, tf), vs in zip(scores, vector_scores)
+            ]
+            logger.debug("RAG hybrid scoring active (model=%s)", self.embedding_model)
+
         ranked = sorted(scores, key=lambda s: s[1], reverse=True)
         results = [text for name, text, score in ranked if score >= self.min_score][:top_k]
         if results:
@@ -111,6 +153,75 @@ class RunbookRAG:
     def document_count(self) -> int:
         """Число загруженных runbook'ов."""
         return len(self._documents)
+
+    @property
+    def hybrid_enabled(self) -> bool:
+        """True, если векторная ветка активна (модель загружена и индекс построен)."""
+        return self._embedder is not None and self._embed_matrix is not None
+
+    # ------------------------------------------------------------------
+    # Векторная (embedding) ветка гибридного поиска
+    # ------------------------------------------------------------------
+    def _load_embedder(self):
+        """Загрузить SentenceTransformer; при любой ошибке — None (fallback TF-IDF)."""
+        if not self.enable_hybrid:
+            logger.debug("Hybrid RAG disabled by config (ENABLE_HYBRID_RAG=false)")
+            return None
+        if SentenceTransformer is None:
+            logger.error(
+                "sentence-transformers is not installed — RAG falls back to pure TF-IDF"
+            )
+            return None
+        try:
+            return SentenceTransformer(self.embedding_model)
+        except Exception as exc:  # noqa: BLE001 - сеть/диск/кэш модели недоступны
+            logger.error(
+                "Embedding model %s unavailable (%s) — RAG falls back to pure TF-IDF",
+                self.embedding_model,
+                exc,
+            )
+            return None
+
+    def _build_embedding_index(self, documents: list[tuple[str, str]]) -> None:
+        """Эмбеддинги всех runbook'ов (нормированный numpy array (n_docs, dim))."""
+        self._embedder = None
+        self._embed_matrix = None
+        if not documents:
+            return  # пустой корпус: модель не грузим вовсе (быстрый старт оффлайн)
+        embedder = self._load_embedder()
+        if embedder is None:
+            return
+        try:
+            import numpy as np
+
+            matrix = np.asarray(
+                embedder.encode(
+                    [text for _, text in documents], normalize_embeddings=True
+                ),
+                dtype=float,
+            )
+        except Exception as exc:  # noqa: BLE001 - сбой encode не роняет агент
+            logger.error("Embedding index build failed (%s) — fallback to TF-IDF", exc)
+            return
+        self._embedder = embedder
+        self._embed_matrix = matrix
+        logger.info(
+            "Hybrid RAG enabled: %d runbook(s) embedded with %s",
+            len(documents),
+            self.embedding_model,
+        )
+
+    def _vector_scores(self, query: str) -> list[float] | None:
+        """Косинусные близости запроса к runbook'ам по эмбеддингам (или None)."""
+        if self._embedder is None or self._embed_matrix is None:
+            return None
+        try:
+            q_vec = self._embedder.encode([query], normalize_embeddings=True)[0]
+            sims = self._embed_matrix @ q_vec  # эмбеддинги нормированы -> cosine
+            return [float(x) for x in sims]
+        except Exception as exc:  # noqa: BLE001 - сбой encode запроса -> только TF-IDF
+            logger.error("Query embedding failed (%s) — using TF-IDF only", exc)
+            return None
 
     def _build_index(self, documents: list[tuple[str, str]]) -> None:
         """Построить TF-IDF матрицу; при недоступности sklearn — оставить пустой."""
