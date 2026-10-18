@@ -1,3 +1,5 @@
+**English | [Русский](./README.ru.md)**
+
 # K8s Incident Diagnosis AI Agent
 
 [![CI](https://github.com/Mkft1/ai_agent_DevOps/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/Mkft1/ai_agent_DevOps/actions/workflows/ci.yml)
@@ -166,7 +168,7 @@ Response (excerpt — produced by the real orchestrator pipeline; deterministic 
     "severity": "high",
     "warnings": []
   },
-  "report": "🟠 *Инцидент: диагностика* (severity: high)\n*Namespace:* `default`, *Pod:* `payments-api-7d9f4b-x2kq`\n..."
+  "report": "🟠 *Incident: diagnosis* (severity: high)\n*Namespace:* `default`, *Pod:* `payments-api-7d9f4b-x2kq`\n..."
 }
 ```
 
