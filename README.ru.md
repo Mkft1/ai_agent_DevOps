@@ -740,14 +740,18 @@ make dashboard           # или: streamlit run ui/dashboard.py
 
 Что внутри:
 
+* **верхние метрики** — три плитки: Total Incidents, Critical Incidents
+  (`severity=critical`) и Pending Approvals (`requires_approval=true`);
 * **таблица инцидентов** — все диагностики из журнала аудита (`AUDIT_LOG_PATH`,
-  по умолчанию `audit.jsonl`): Timestamp, Namespace, Severity, Root Cause
-  (свежие сверху) + плитки-метрики по severity;
-* **карточки аппрува** — для инцидентов с `requires_approval: true`: namespace/pod,
-  root cause, опасный `suggested_fix` в code-блоке, warnings сбора данных и кнопка
-  **"Approve & Apply"** (демо-подтверждение: дашборд не трогает кластер — apply
-  выполняет человек через kubectl/GitOps после dry-run);
-* expander **Raw audit events** и кнопка Refresh в сайдбаре.
+  по умолчанию `audit.jsonl`, читается построчно через `json`): Time в читаемом
+  формате (`19 Oct, 10:00`), Namespace, Pod, Severity с цветовым кодом
+  (🔴 critical / 🟠 high / 🟡 medium / 🟢 low) и Root Cause — свежие сверху;
+* **карточки аппрува** — для инцидентов с `requires_approval: true`: root cause,
+  опасный `suggested_fix` в code-блоке, warnings сбора данных и кнопка
+  **"✅ Approve & Apply"** (демо-подтверждение с 🎈: дашборд не трогает кластер —
+  apply выполняет человек через kubectl/GitOps после dry-run);
+* expander **🔍 View Raw Audit Log** с распарсенными JSON-событиями и кнопка
+  Refresh в сайдбаре.
 
 Если журнала аудита ещё нет — дашборд показывает предупреждение с подсказками
 (запустить агент и отправить несколько `/diagnose` или webhook-запросов), а не падает.
