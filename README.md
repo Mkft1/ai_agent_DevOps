@@ -36,7 +36,7 @@ The agent is strictly **read-only by default**: it never mutates the cluster (`E
 | 🔁 **Chaos self-test** | `scripts/chaos_test.py` creates an ImagePullBackOff pod, asks the agent to diagnose it, asserts the RCA mentions "image"/"pull", and cleans up. Idempotent. |
 | ☸️ **Helm chart** | Production-ready `charts/ai-agent` (v0.1.0): Deployment with probes & non-root securityContext, ClusterIP Service, least-privilege RBAC, ConfigMap/Secret from `values.yaml`, `make helm-lint` / `make helm-install`. |
 | 🖥️ **Operator dashboard** | `make dashboard` — Streamlit UI over the audit journal: incident table (Timestamp/Namespace/Severity/Root Cause), severity metrics, and approval cards with `suggested_fix` + "Approve & Apply" for every `requires_approval` incident. |
-| 🧪 **Testing & CI/CD** | 258 unit/integration tests with mocked clients (93% coverage, CI gate `--cov-fail-under=85`, SentenceTransformer mocked so tests never download models), plus an offline **evaluation framework** (`make eval`) with a golden dataset and LLM-as-a-judge scoring; | GitHub Actions pipeline: lint → test+coverage → Docker build+smoke → kind-based e2e on `main` (auto-skipped when no LLM secret is configured). |
+| 🧪 **Testing & CI/CD** | 265 unit/integration tests with mocked clients (93% coverage, CI gate `--cov-fail-under=85`, SentenceTransformer mocked so tests never download models), plus an offline **evaluation framework** (`make eval`) with a golden dataset and LLM-as-a-judge scoring; | GitHub Actions pipeline: lint → test+coverage → Docker build+smoke → kind-based e2e on `main` (auto-skipped when no LLM secret is configured). |
 | 🐳 **Containerized** | Multi-stage `python:3.12-slim` image, non-root user, healthcheck, no secrets baked into the image. |
 
 ---
@@ -157,6 +157,7 @@ make chaos         # python scripts/chaos_test.py (ImagePullBackOff self-test)
 make e2e           # bash scripts/run_integration_test.sh (kind cluster, end-to-end)
 make eval          # python eval/evaluate.py (LLM-as-a-judge quality gate)
 make dashboard     # streamlit run ui/dashboard.py (operator UI on :8501)
+make docs-check    # python scripts/check_docs_metrics.py (README vs pytest)
 ```
 
 The Makefile is a convenience wrapper only — it does not change or replace CI/CD.
@@ -478,6 +479,8 @@ tests/
 
 - **Unit tests**: every external boundary (Kubernetes API, Prometheus HTTP, LLM HTTP) is mocked — the suite runs offline in ~2 seconds.
 - **Coverage**: `pytest --cov=src --cov-report=xml --cov-fail-under=85` — currently **~93%** (uploaded as a CI artifact every run; the CI fails if coverage drops below 85%).
+- **Docs drift guard**: `make docs-check` (и шаг CI после pytest) сверяет числа
+  тестов/покрытия в этом README с реальным прогоном — расхождение роняет CI.
 - **Integration (end-to-end)**: `scripts/run_integration_test.sh` spins up a real [kind](https://kind.sigs.k8s.io/) cluster, creates a pod with a bad image tag, runs the agent under uvicorn, sends a real `POST /diagnose`, and asserts the RCA mentions *"image"*/*"pull"* (via `jq`). Idempotent: leftover clusters/pods are removed before each run; cleanup happens even on failure.
 - **CI jobs** (GitHub Actions): `lint` (`ruff check src tests scripts`) → `test` (pytest + coverage, gate ≥85%) → `build` (Docker, load + smoke-test) → `integration-test` (kind e2e, push to `main` / manual dispatch only, so PRs stay fast; gracefully skipped when the repository has no `QWEN_API_KEY`/`OPENAI_API_KEY` secret).
 
@@ -637,7 +640,7 @@ ai_agent_DevOps/
 │       └── text_utils.py        # truncate_context (bounded, JSON-safe)
 ├── charts/ai-agent/             # production Helm chart (v0.1.0): deployment,
 │                                # service, SA/RBAC, configmap, secret, helpers
-└── tests/                       # 258 tests, fully mocked externals
+└── tests/                       # 265 tests, fully mocked externals
 ```
 
 ---
