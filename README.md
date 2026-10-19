@@ -2,6 +2,10 @@
   <a href="./README.md"><b>🇬🇧 English</b></a> &nbsp;|&nbsp; <a href="./README.ru.md"><b>🇷🇺 Русский </b></a>
 </p>
 
+| Interactive Dashboard | API Documentation (Swagger) |
+|---|---|
+| ![Dashboard](docs/assets/dashboard.png) | ![Swagger](docs/assets/swagger.png) |
+
 <h1 align="center">K8s Incident Diagnosis AI Agent</h1>
 
 [![CI](https://github.com/Mkft1/ai_agent_DevOps/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/Mkft1/ai_agent_DevOps/actions/workflows/ci.yml)
@@ -32,7 +36,7 @@ The agent is strictly **read-only by default**: it never mutates the cluster (`E
 | 🔁 **Chaos self-test** | `scripts/chaos_test.py` creates an ImagePullBackOff pod, asks the agent to diagnose it, asserts the RCA mentions "image"/"pull", and cleans up. Idempotent. |
 | ☸️ **Helm chart** | Production-ready `charts/ai-agent` (v0.1.0): Deployment with probes & non-root securityContext, ClusterIP Service, least-privilege RBAC, ConfigMap/Secret from `values.yaml`, `make helm-lint` / `make helm-install`. |
 | 🖥️ **Operator dashboard** | `make dashboard` — Streamlit UI over the audit journal: incident table (Timestamp/Namespace/Severity/Root Cause), severity metrics, and approval cards with `suggested_fix` + "Approve & Apply" for every `requires_approval` incident. |
-| 🧪 **Testing & CI/CD** | 231 unit/integration tests with mocked clients (92% coverage, CI gate `--cov-fail-under=85`, SentenceTransformer mocked so tests never download models), plus an offline **evaluation framework** (`make eval`) with a golden dataset and LLM-as-a-judge scoring; | GitHub Actions pipeline: lint → test+coverage → Docker build+smoke → kind-based e2e on `main` (auto-skipped when no LLM secret is configured). |
+| 🧪 **Testing & CI/CD** | 233 unit/integration tests with mocked clients (92% coverage, CI gate `--cov-fail-under=85`, SentenceTransformer mocked so tests never download models), plus an offline **evaluation framework** (`make eval`) with a golden dataset and LLM-as-a-judge scoring; | GitHub Actions pipeline: lint → test+coverage → Docker build+smoke → kind-based e2e on `main` (auto-skipped when no LLM secret is configured). |
 | 🐳 **Containerized** | Multi-stage `python:3.12-slim` image, non-root user, healthcheck, no secrets baked into the image. |
 
 ---
@@ -94,6 +98,11 @@ A few deliberate trade-offs worth knowing about:
 ---
 
 ## Quick Start
+
+> 🎬 **Demo GIF placeholder.** A recorded terminal demo will live at
+> `docs/assets/demo.gif` (see [docs/assets/demo_placeholder.md](docs/assets/demo_placeholder.md)
+> for how to record it with terminalizer/asciinema). Until then the previews above and
+> the real `/diagnose` outputs below show the agent in action.
 
 ### 1. Configure environment
 
@@ -621,7 +630,7 @@ ai_agent_DevOps/
 │       └── text_utils.py        # truncate_context (bounded, JSON-safe)
 ├── charts/ai-agent/             # production Helm chart (v0.1.0): deployment,
 │                                # service, SA/RBAC, configmap, secret, helpers
-└── tests/                       # 231 tests, fully mocked externals
+└── tests/                       # 233 tests, fully mocked externals
 ```
 
 ---
