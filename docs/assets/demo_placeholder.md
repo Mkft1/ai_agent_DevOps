@@ -9,3 +9,7 @@ response" / "Пример реального вывода агента" sections
 text examples of `/diagnose` responses (OOMKilled + ImagePullBackOff scenarios).
 
 When recording: `make run` + `make chaos` against a kind cluster makes a good script.
+
+Static previews already shipped alongside: `docs/assets/dashboard.png`
+(Streamlit operator UI) and `docs/assets/swagger.png` (OpenAPI/Swagger endpoint
+list) — referenced from the top of both READMEs.
