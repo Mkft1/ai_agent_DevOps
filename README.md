@@ -558,6 +558,8 @@ If the audit journal does not exist yet, the dashboard shows a warning with hint
 | [`docs/OPERATIONS.md`](./docs/OPERATIONS.md) | **On-call engineers** | Incident response flow for `severity: critical` and safe-fix verification, handling `warnings` (degraded data sources), adding runbooks, updating the golden dataset, troubleshooting (LLM 429, embedding model load failures) |
 | [`docs/runbooks/`](./docs/runbooks/) | SRE knowledge base | 8 peer-reviewed runbooks retrieved by the agent's hybrid RAG |
 | [`CONTRIBUTING.md`](./CONTRIBUTING.md) | Developers | Dev environment, tests/lint rules, PR process |
+| [`CHANGELOG.md`](./CHANGELOG.md) | Everyone | Keep a Changelog: что вошло в каждый релиз |
+| [`.github/pull_request_template.md`](./.github/pull_request_template.md) | Contributors | Чек-лист PR: тесты, линтер, docs, тесты на новую логику |
 | [`README.ru.md`](./README.ru.md) | Русскоязычная версия | Полная синхронная версия этого README |
 
 ## Contributing
