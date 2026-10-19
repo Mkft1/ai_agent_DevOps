@@ -6,7 +6,7 @@ description: >-
   Alertmanager webhook and audit journal. Read-only by default (least-privilege RBAC).
 type: application
 version: 0.1.0
-appVersion: "0.1.0"
+appVersion: "1.0.0"
 # Поддерживаемые версии Kubernetes (RBAC v1, probes, seccompProfile RuntimeDefault)
 kubeVersion: ">=1.24.0-0"
 keywords:

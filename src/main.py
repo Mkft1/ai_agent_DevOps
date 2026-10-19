@@ -47,10 +47,62 @@ settings = get_settings()
 setup_logging(settings.log_level, settings.log_format)
 logger = get_logger(__name__)
 
+# ----------------------------------------------------------------------
+# OpenAPI: enterprise-метаданные Swagger UI (/docs)
+# ----------------------------------------------------------------------
+API_DESCRIPTION = """
+**AI DevOps Agent** — LLM-агент для диагностики инцидентов в Kubernetes.
+
+Принимает инциденты (алерты) через REST и Alertmanager-webhook, собирает живые
+сигналы кластера — состояние подов и события Kubernetes, метрики Prometheus,
+логи контейнеров — обогащает анализ retrieval'ом по локальным runbook'ам
+(**hybrid RAG**: TF-IDF + vector embeddings) и возвращает структурированный
+**Root Cause Analysis (RCA)** плюс человекочитаемый отчёт для Slack/Telegram.
+
+## Как это работает
+`Alertmanager / curl / chat-bot → POST /diagnose → IncidentOrchestrator →
+[K8sTools, PrometheusTools, LogsTools] → RunbookRAG → LLM (Qwen /
+OpenAI-compatible) → RCA → Report`. Ответ LLM валидируется pydantic-схемой
+с одним корректирующим retry и честным fallback-диагнозом.
+
+## Guardrails (безопасность по умолчанию)
+* **Read-only**: агент не выполняет изменений в кластере (`ENABLE_WRITE_ACTIONS=false`);
+* **Namespace allow-list** (`ALLOWED_NAMESPACES`): запросы вне списка → `403` до любых обращений к кластеру;
+* **Policy-as-Code**: опасные рекомендации (`delete`, `drop`, `rm -rf`, `scale 0`)
+  помечаются `requires_approval: true` и уходят на аппрув человеку в Slack;
+* **Bounded context**: лимиты `MAX_LOG_LINES` / `MAX_CONTEXT_CHARS`; секреты только из `.env`.
+
+## Наблюдаемость
+`/metrics` (Prometheus), structured JSON-логи (`LOG_FORMAT=json`), `X-Request-ID`
+в ответах, OpenTelemetry-трейсы (OTLP), журнал аудита `audit.jsonl` и Streamlit-
+дашборд оператора (`make dashboard`). Эксплуатация — `docs/OPERATIONS.md`.
+"""
+
+OPENAPI_TAGS = [
+    {
+        "name": "Health & Status",
+        "description": "Пробы живости/готовности и статус внешних зависимостей "
+        "(Kubernetes API, Prometheus).",
+    },
+    {
+        "name": "Diagnostics",
+        "description": "AI-диагностика инцидентов: сбор сигналов кластера, RAG по "
+        "runbook'ам, RCA от LLM.",
+    },
+    {
+        "name": "Webhooks",
+        "description": "Приёмники внешних систем алертинга (Prometheus Alertmanager).",
+    },
+]
+
 app = FastAPI(
-    title="AI Agent DevOps",
-    description="AI-агент для диагностики инцидентов в Kubernetes (метрики, логи, состояние подов, RCA).",
-    version="0.1.0",
+    title="AI DevOps Agent API",
+    description=API_DESCRIPTION,
+    version="1.0.0",
+    contact={"name": "AI DevOps Team", "url": "https://github.com/Mkft1/ai_agent_DevOps"},
+    license_info={"name": "MIT", "url": "https://opensource.org/licenses/MIT"},
+    openapi_tags=OPENAPI_TAGS,
+    swagger_ui_parameters={"syntaxHighlight.theme": "obsidian"},
 )
 
 # CORS: origins берутся из конфига (CORS_ORIGINS в .env); по умолчанию "*" для dev.
@@ -137,12 +189,30 @@ instrumentator.instrument(app).expose(app, endpoint="/metrics", include_in_schem
 class DiagnoseRequest(BaseModel):
     """Тело POST /diagnose — входной инцидент (алерт)."""
 
-    namespace: str = Field(default="default", description="Namespace в Kubernetes")
-    pod_name: str | None = Field(default=None, description="Имя пода (опционально)")
-    deployment_name: str | None = Field(
-        default=None, description="Имя деплоймента (опционально)"
+    namespace: str = Field(
+        default="default",
+        description="Kubernetes namespace, в котором произошёл инцидент. "
+        "Должен входить в ALLOWED_NAMESPACES, иначе запрос отклоняется (403).",
+        examples=["default"],
     )
-    description: str = Field(default="", description="Текст алерта / описание проблемы")
+    pod_name: str | None = Field(
+        default=None,
+        description="Имя целевого пода (опционально). Если не указано, агент "
+        "попробует вывести под из deployment_name или списка подов namespace.",
+        examples=["payments-api-7d9f4b-x2kq"],
+    )
+    deployment_name: str | None = Field(
+        default=None,
+        description="Имя деплоймента (опционально): используется для поиска "
+        "целевого пода по префиксу имени, если pod_name не задан.",
+        examples=["payments-api"],
+    )
+    description: str = Field(
+        default="",
+        description="Текст алерта / свободное описание проблемы. Используется "
+        "как поисковый запрос RAG по runbook'ам и контекст для LLM.",
+        examples=["Pod payments-api restarts repeatedly, alert: ContainerOOMKilling"],
+    )
 
     def to_incident(self) -> Incident:
         """Конвертировать HTTP-модель в доменную модель оркестратора."""
@@ -152,15 +222,28 @@ class DiagnoseRequest(BaseModel):
 class DiagnosisResponse(BaseModel):
     """Ответ POST /diagnose: диагноз LLM + читаемый отчёт для мессенджеров."""
 
-    diagnosis: Diagnosis
-    report: str
+    diagnosis: Diagnosis = Field(
+        description="Структурированный RCA: root_cause, evidence, suggested_fix, "
+        "severity, warnings, requires_approval и сырые данные сбора.",
+    )
+    report: str = Field(
+        description="Готовый текст отчёта для Slack/Telegram (emoji-разметка).",
+        examples=["🟠 *Инцидент: диагностика* (severity: high)\n*Namespace:* `default`..."],
+    )
 
 
 class ReadyResponse(BaseModel):
     """Ответ GET /ready: статусы внешних зависимостей."""
 
-    status: str
-    checks: dict[str, str]
+    status: str = Field(
+        description="`ready`, если все зависимости доступны, иначе `degraded`.",
+        examples=["ready"],
+    )
+    checks: dict[str, str] = Field(
+        description="Статусы проверок по имени зависимости: `ok` или "
+        "`unavailable: <причина>` (kubernetes, prometheus).",
+        examples=[{"kubernetes": "ok", "prometheus": "ok"}],
+    )
 
 
 # ----------------------------------------------------------------------
@@ -231,7 +314,12 @@ async def unhandled_exception_handler(request: Request, exc: Exception) -> JSONR
 # ----------------------------------------------------------------------
 # Эндпоинты
 # ----------------------------------------------------------------------
-@app.get("/health")
+@app.get(
+    "/health",
+    tags=["Health & Status"],
+    summary="Liveness probe",
+    description="Liveness probe. Returns 200 if the application is running.",
+)
 def health() -> dict[str, str]:
     """Проверка работоспособности сервиса (не зависит от внешних систем)."""
     return run_health_check()
@@ -274,7 +362,13 @@ def _check_prometheus(s: Settings) -> str:
         return f"unavailable: {exc}"
 
 
-@app.get("/ready", response_model=ReadyResponse)
+@app.get(
+    "/ready",
+    tags=["Health & Status"],
+    summary="Readiness probe",
+    description="Readiness probe. Checks K8s API and Prometheus connectivity.",
+    response_model=ReadyResponse,
+)
 def ready() -> JSONResponse:
     """Проверка готовности: доступность K8s API и Prometheus.
 
@@ -293,7 +387,14 @@ def ready() -> JSONResponse:
     )
 
 
-@app.post("/diagnose", response_model=DiagnosisResponse)
+@app.post(
+    "/diagnose",
+    tags=["Diagnostics"],
+    summary="Diagnose Incident",
+    description="Accepts incident details and returns an AI-generated Root "
+    "Cause Analysis (RCA) in JSON format.",
+    response_model=DiagnosisResponse,
+)
 def diagnose(
     payload: DiagnoseRequest,
     orchestrator: IncidentOrchestrator = Depends(get_orchestrator),
@@ -334,7 +435,14 @@ def diagnose(
     )
 
 
-@app.post("/webhook/alertmanager", response_model=AlertmanagerWebhookResponse)
+@app.post(
+    "/webhook/alertmanager",
+    tags=["Webhooks"],
+    summary="Alertmanager webhook",
+    description="Webhook receiver for Prometheus Alertmanager. Parses alerts "
+    "and triggers diagnosis automatically.",
+    response_model=AlertmanagerWebhookResponse,
+)
 def webhook_alertmanager(
     payload: AlertmanagerPayload,
     orchestrator: IncidentOrchestrator = Depends(get_orchestrator),
