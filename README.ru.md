@@ -15,7 +15,7 @@ AI-агент для диагностики инцидентов в Kubernetes. 
 [![Python 3.12](https://img.shields.io/badge/python-3.12-blue?logo=python&logoColor=white)](https://www.python.org/downloads/)
 [![Docker](https://img.shields.io/badge/docker-multistage%20image-2496ED?logo=docker&logoColor=white)](./Dockerfile)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](./LICENSE)
-[![Tests](https://img.shields.io/badge/tests-233%20passed-brightgreen?logo=pytest&logoColor=white)](#тесты)
+[![Tests](https://img.shields.io/badge/tests-258%20passed-brightgreen?logo=pytest&logoColor=white)](#тесты)
 [![Ruff](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/astral-sh/ruff/main/assets/badge/v2.json)](https://github.com/astral-sh/ruff)
 
 AI-агент для диагностики инцидентов в Kubernetes.
@@ -102,7 +102,7 @@ Alertmanager → /diagnose → IncidentOrchestrator → [K8sTools, PrometheusToo
   (таблица инцидентов Timestamp/Namespace/Severity/Root Cause, метрики по severity,
   карточки аппрува с `suggested_fix` и кнопкой "Approve & Apply" для инцидентов с
   `requires_approval=true`); запускается отдельно от FastAPI, кластер не трогает.
-- **Тестирование** — 233 unit/интеграционных тестов (pytest + unittest.mock), покрытие ~92%
+- **Тестирование** — 258 unit/интеграционных тестов (pytest + unittest.mock), покрытие ~93%
   (гейт в CI `--cov-fail-under=85`): инструменты, оркестратор, LLM-клиент (мок HTTP),
   FastAPI-эндпоинты (TestClient), конфигурация и логирование, chaos-скрипт.
 - **DevOps-практики** — многоступенчатый Docker-образ, docker-compose, идемпотентный
@@ -618,7 +618,7 @@ ruff check src tests scripts
 python -m pytest --cov=src --cov-report=xml tests/
 ```
 
-Текущий набор: **233 passed**, покрытие **~92%** (инструменты K8s/Prometheus/логов,
+Текущий набор: **258 passed**, покрытие **~93%** (инструменты K8s/Prometheus/логов,
 оркестратор, LLM-клиент с моками HTTP, FastAPI-эндпоинты через TestClient (включая
 webhook Alertmanager и журнал аудита), валидация конфигурации, JSON-логирование,
 трейсинг OpenTelemetry, chaos-скрипт).
