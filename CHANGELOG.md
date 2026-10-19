@@ -9,7 +9,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- <!-- Новые фичи собираются здесь до следующего релиза (Keep a Changelog). -->
+- Docs metrics drift guard: `scripts/check_docs_metrics.py` (`make docs-check`,
+  шаг CI в test-job) — сверяет задекларированные в README.md/README.ru.md числа
+  тестов и покрытия с реальностью (`pytest --collect-only` + `coverage.xml`)
+  и падает с перечислением расхождений; юнит-тесты парсеров и EN/RU-консистентности.
 
 ## [1.0.0] - 2026-10-19
 
