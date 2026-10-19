@@ -27,12 +27,43 @@ class AlertmanagerAlert(BaseModel):
 
     model_config = ConfigDict(extra="ignore", populate_by_name=True)
 
-    status: str = "firing"
-    labels: dict[str, str] = Field(default_factory=dict)
-    annotations: dict[str, str] = Field(default_factory=dict)
-    starts_at: str = Field(default="", alias="startsAt")
-    ends_at: str = Field(default="", alias="endsAt")
-    fingerprint: str = ""
+    status: str = Field(
+        default="firing",
+        description="Состояние алерта: `firing` (диагностируется) или "
+        "`resolved` (агент пропускает).",
+        examples=["firing"],
+    )
+    labels: dict[str, str] = Field(
+        default_factory=dict,
+        description="Метки алерта: alertname, namespace, pod, severity и т.д. "
+        "Из них извлекаются namespace и целевой под инцидента.",
+        examples=[{"alertname": "PodOOMKilling", "namespace": "default",
+                   "pod": "payments-api-7d9f4b-x2kq", "severity": "critical"}],
+    )
+    annotations: dict[str, str] = Field(
+        default_factory=dict,
+        description="Человекочитаемые тексты алерта: summary и description "
+        "становятся описанием инцидента для RAG и LLM.",
+        examples=[{"summary": "Pod payments-api restarts repeatedly",
+                   "description": "Container OOMKilled"}],
+    )
+    starts_at: str = Field(
+        default="",
+        alias="startsAt",
+        description="ISO-8601 время возникновения алерта.",
+        examples=["2026-10-19T10:00:00.000Z"],
+    )
+    ends_at: str = Field(
+        default="",
+        alias="endsAt",
+        description="ISO-8601 время окончания (для firing — нулевое значение).",
+        examples=["0001-01-01T00:00:00Z"],
+    )
+    fingerprint: str = Field(
+        default="",
+        description="Уникальный отпечаток алерта (для трейсинга в логах).",
+        examples=["abc123def456"],
+    )
 
     # ------------------------------------------------------------------
     # Маппинг алерта -> доменный Incident оркестратора
@@ -77,9 +108,20 @@ class AlertmanagerPayload(BaseModel):
 
     model_config = ConfigDict(extra="ignore")
 
-    version: str = "4"
-    status: str = "firing"
-    alerts: list[AlertmanagerAlert] = Field(default_factory=list)
+    version: str = Field(
+        default="4",
+        description="Версия формата вебхука Alertmanager.",
+        examples=["4"],
+    )
+    status: str = Field(
+        default="firing",
+        description="Статус группы алертов (`firing` / `resolved`).",
+        examples=["firing"],
+    )
+    alerts: list[AlertmanagerAlert] = Field(
+        default_factory=list,
+        description="Список алертов; диагностируются только `firing`.",
+    )
 
     @property
     def firing_alerts(self) -> list[AlertmanagerAlert]:
@@ -90,6 +132,15 @@ class AlertmanagerPayload(BaseModel):
 class AlertmanagerWebhookResponse(BaseModel):
     """Ответ webhook'а: сколько алертов обработано/пропущено и сами диагнозы."""
 
-    processed: int = 0
-    skipped: int = 0
-    diagnoses: list[dict] = Field(default_factory=list)
+    processed: int = Field(
+        default=0, description="Сколько firing-алертов успешно диагностировано."
+    )
+    skipped: int = Field(
+        default=0,
+        description="Сколько алертов пропущено (resolved или guardrail-отклонение).",
+    )
+    diagnoses: list[dict] = Field(
+        default_factory=list,
+        description="Диагнозы по каждому обработанному алерту: "
+        "{diagnosis: RCA, report: текст для мессенджеров}.",
+    )
