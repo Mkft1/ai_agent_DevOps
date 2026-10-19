@@ -763,6 +763,8 @@ make dashboard           # или: streamlit run ui/dashboard.py
 | [`docs/OPERATIONS.md`](./docs/OPERATIONS.md) | **Дежурные инженеры** | Порядок действий при `severity: critical` и проверка безопасности фикса, реакция на `warnings` (деградация источников данных), добавление runbook'ов, обновление golden-датасета, troubleshooting (429 от LLM, загрузка embedding-модели) |
 | [`docs/runbooks/`](./docs/runbooks/) | База знаний SRE | 8 peer-reviewed runbook'ов, которые агент подтягивает гибридным RAG |
 | [`CONTRIBUTING.md`](./CONTRIBUTING.md) | Разработчики | Окружение разработки, правила тестов/линта, процесс PR |
+| [`CHANGELOG.md`](./CHANGELOG.md) | Всем | Keep a Changelog: что вошло в каждый релиз |
+| [`.github/pull_request_template.md`](./.github/pull_request_template.md) | Контрибьюторам | Чек-лист PR: тесты, линтер, docs, тесты на новую логику |
 
 ## Лицензия
 
