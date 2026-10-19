@@ -534,14 +534,19 @@ make dashboard           # or: streamlit run ui/dashboard.py
 
 What you see there:
 
+* **Headline metrics** — three big tiles: Total Incidents, Critical Incidents
+  (`severity=critical`) and Pending Approvals (`requires_approval=true`);
 * **Incidents table** — every diagnosis from the audit journal (`AUDIT_LOG_PATH`,
-  default `audit.jsonl`): Timestamp, Namespace, Severity, Root Cause (newest first),
-  plus per-severity metric tiles;
-* **Approval cards** — for each incident with `requires_approval: true`: namespace/pod,
-  root cause, the dangerous `suggested_fix` in a code block, data-collection warnings
-  and an **"Approve & Apply"** button (demo confirmation: the dashboard never touches
-  the cluster — the human applies the change via kubectl/GitOps after a dry-run);
-* **Raw audit events** expander and a sidebar Refresh button.
+  default `audit.jsonl`, parsed line-by-line with `json`): Time (human-readable,
+  `19 Oct, 10:00`), Namespace, Pod, Severity with colour coding
+  (🔴 critical / 🟠 high / 🟡 medium / 🟢 low) and Root Cause — newest first;
+* **Approval cards** — for each incident with `requires_approval: true`: root cause,
+  the dangerous `suggested_fix` in a code block, data-collection warnings and a
+  **"✅ Approve & Apply"** button (demo confirmation with 🎈: the dashboard never
+  touches the cluster — the human applies the change via kubectl/GitOps after a
+  dry-run);
+* **🔍 View Raw Audit Log** expander with the parsed JSON events and a sidebar
+  Refresh button.
 
 If the audit journal does not exist yet, the dashboard shows a warning with hints
 (run the agent and send a few `/diagnose` or Alertmanager requests) instead of crashing.
