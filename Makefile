@@ -10,7 +10,7 @@ lint:
 	ruff check src tests scripts eval ui
 
 test:
-	pytest --cov=src --cov-report=term-missing tests/
+	pytest -n auto --cov=src --cov-report=term-missing tests/
 
 run:
 	uvicorn src.main:app --host 0.0.0.0 --port 8000 --reload
