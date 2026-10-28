@@ -53,6 +53,16 @@ SAMPLE_DIAGNOSIS = {
 }
 
 
+@pytest.fixture(autouse=True)
+def _reset_rate_limiter():
+    """Сброс окон slowapi: модуль шлёт много webhook-запросов подряд."""
+    from src.main import limiter
+
+    limiter.reset()
+    yield
+    limiter.reset()
+
+
 @pytest.fixture()
 def client() -> TestClient:
     return TestClient(app, raise_server_exceptions=False)

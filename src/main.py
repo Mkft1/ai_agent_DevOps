@@ -14,6 +14,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import time
 import uuid
 
 import httpx
@@ -29,6 +30,10 @@ from opentelemetry.sdk.trace import TracerProvider
 from opentelemetry.sdk.trace.export import BatchSpanProcessor
 from prometheus_fastapi_instrumentator import Instrumentator
 from pydantic import BaseModel, Field, ValidationError
+from slowapi import Limiter
+from slowapi.errors import RateLimitExceeded
+from slowapi.middleware import SlowAPIMiddleware
+from slowapi.util import get_remote_address
 from starlette.middleware.base import BaseHTTPMiddleware
 
 from src.agent.llm_client import LLMClient, LLMError
@@ -172,6 +177,40 @@ def setup_tracing(settings: Settings) -> TracerProvider:
 setup_tracing(settings)
 # Авто-спаны на каждый HTTP-запрос (method, path, status, latency).
 FastAPIInstrumentor.instrument_app(app)
+
+# ----------------------------------------------------------------------
+# Rate limiting (slowapi): защита LLM-квот и API от alert-штормов/DoS.
+# Хранилище: MemoryStorage по умолчанию; Redis — через RATE_LIMIT_REDIS_URL
+# (общий счётчик между инстансами API).
+# ----------------------------------------------------------------------
+limiter = Limiter(
+    key_func=get_remote_address,
+    storage_uri=settings.rate_limit_redis_url or "memory://",
+)
+app.state.limiter = limiter
+
+
+@app.exception_handler(RateLimitExceeded)
+async def rate_limit_exceeded_handler(request: Request, exc: RateLimitExceeded) -> JSONResponse:
+    """429 с понятным JSON и заголовком Retry-After (секунд до сброса окна)."""
+    retry_after = "60"
+    view_limit = getattr(request.state, "view_rate_limit", None)
+    if view_limit is not None:
+        retry_after = str(max(1, int(getattr(view_limit, "reset", 0)) - int(time.time())))
+    logger.warning(
+        "Rate limit exceeded on %s %s (Retry-After: %s)",
+        request.method,
+        request.url.path,
+        retry_after,
+    )
+    return JSONResponse(
+        status_code=429,
+        content={"detail": "Rate limit exceeded. Please retry later."},
+        headers={"Retry-After": retry_after},
+    )
+
+
+app.add_middleware(SlowAPIMiddleware)
 
 # Prometheus: стандартные HTTP-метрики (информационные) + эндпоинт /metrics.
 # Кастомные метрики агента объявлены в src/utils/metrics.py и попадают в
@@ -401,7 +440,9 @@ async def ready() -> JSONResponse:
     "Cause Analysis (RCA) in JSON format.",
     response_model=DiagnosisResponse,
 )
+@limiter.limit("5/minute")
 async def diagnose(
+    request: Request,
     payload: DiagnoseRequest,
     orchestrator: IncidentOrchestrator = Depends(get_orchestrator),
 ) -> DiagnosisResponse:
@@ -449,7 +490,9 @@ async def diagnose(
     "and triggers diagnosis automatically.",
     response_model=AlertmanagerWebhookResponse,
 )
+@limiter.limit("30/minute")
 async def webhook_alertmanager(
+    request: Request,
     payload: AlertmanagerPayload,
     orchestrator: IncidentOrchestrator = Depends(get_orchestrator),
 ) -> AlertmanagerWebhookResponse:

@@ -36,7 +36,7 @@ The agent is strictly **read-only by default**: it never mutates the cluster (`E
 | 🔁 **Chaos self-test** | `scripts/chaos_test.py` creates an ImagePullBackOff pod, asks the agent to diagnose it, asserts the RCA mentions "image"/"pull", and cleans up. Idempotent. |
 | ☸️ **Helm chart** | Production-ready `charts/ai-agent` (v0.1.0): Deployment with probes & non-root securityContext, ClusterIP Service, least-privilege RBAC, ConfigMap/Secret from `values.yaml`, `make helm-lint` / `make helm-install`. |
 | 🖥️ **Operator dashboard** | `make dashboard` — Streamlit UI over the audit journal: incident table (Timestamp/Namespace/Severity/Root Cause), severity metrics, and approval cards with `suggested_fix` + "Approve & Apply" for every `requires_approval` incident. |
-| 🧪 **Testing & CI/CD** | 267 unit/integration tests with mocked clients (93% coverage, CI gate `--cov-fail-under=85`, SentenceTransformer mocked so tests never download models), plus an offline **evaluation framework** (`make eval`) with a golden dataset and LLM-as-a-judge scoring; | GitHub Actions pipeline: lint → test+coverage → Docker build+smoke → kind-based e2e on `main` (auto-skipped when no LLM secret is configured). |
+| 🧪 **Testing & CI/CD** | 270 unit/integration tests with mocked clients (93% coverage, CI gate `--cov-fail-under=85`, SentenceTransformer mocked so tests never download models), plus an offline **evaluation framework** (`make eval`) with a golden dataset and LLM-as-a-judge scoring; | GitHub Actions pipeline: lint → test+coverage → Docker build+smoke → kind-based e2e on `main` (auto-skipped when no LLM secret is configured). |
 | 🐳 **Containerized** | Multi-stage `python:3.12-slim` image, non-root user, healthcheck, no secrets baked into the image. |
 
 ---
@@ -322,6 +322,15 @@ SLACK_WEBHOOK_URL=https://hooks.slack.com/services/T000/B000/XXXX
 
 Safe recommendations (raise limits, fix image tags, add probes...) skip the gate:
 `requires_approval: false`, no Slack message.
+
+### Rate limiting (alert-storm / financial DoS protection)
+
+`POST /diagnose` is limited to **5 requests/minute** per client IP and
+`POST /webhook/alertmanager` to **30/minute** (slowapi, in-memory storage by
+default; set `RATE_LIMIT_REDIS_URL` to share counters across API replicas).
+Exceeding the limit returns **429** with `{"detail": "Rate limit exceeded. Please retry later."}`
+and a `Retry-After` header. Liveness/readiness probes (`/health`, `/ready`) are
+never limited — Kubernetes must always be able to check the pod.
 
 ## Security & Policy-as-Code
 
@@ -640,7 +649,7 @@ ai_agent_DevOps/
 │       └── text_utils.py        # truncate_context (bounded, JSON-safe)
 ├── charts/ai-agent/             # production Helm chart (v0.1.0): deployment,
 │                                # service, SA/RBAC, configmap, secret, helpers
-└── tests/                       # 267 tests, fully mocked externals
+└── tests/                       # 270 tests, fully mocked externals
 ```
 
 ---
