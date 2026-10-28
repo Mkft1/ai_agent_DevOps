@@ -61,7 +61,7 @@ def client() -> TestClient:
 @pytest.fixture()
 def mock_orchestrator() -> MagicMock:
     orch = MagicMock(spec=IncidentOrchestrator)
-    orch.diagnose.return_value = dict(SAMPLE_DIAGNOSIS)
+    orch.adiagnose.return_value = dict(SAMPLE_DIAGNOSIS)
     orch.format_report.return_value = "[report] severity=high"
     app.dependency_overrides[get_orchestrator] = lambda: orch
     yield orch
@@ -95,7 +95,7 @@ class TestWebhookAlertmanager:
         assert body["diagnoses"][0]["report"] == "[report] severity=high"
 
         # Маппинг алерта -> Incident: namespace/pod из labels, description из summary.
-        incident = mock_orchestrator.diagnose.call_args.args[0]
+        incident = mock_orchestrator.adiagnose.call_args.args[0]
         assert incident.namespace == "default"
         assert incident.pod_name == "payments-api-7d9f4b-x2kq"
         assert incident.description == ALERTMANAGER_PAYLOAD["alerts"][0]["annotations"]["summary"]
@@ -105,7 +105,7 @@ class TestWebhookAlertmanager:
         del payload["alerts"][0]["annotations"]["summary"]
         resp = client.post("/webhook/alertmanager", json=payload)
         assert resp.status_code == 200
-        incident = mock_orchestrator.diagnose.call_args.args[0]
+        incident = mock_orchestrator.adiagnose.call_args.args[0]
         assert incident.description == "Container OOMKilled in pod payments-api-7d9f4b-x2kq"
 
     def test_no_namespace_label_defaults_and_no_pod_is_none(self, client, mock_orchestrator) -> None:
@@ -115,7 +115,7 @@ class TestWebhookAlertmanager:
         ]}
         resp = client.post("/webhook/alertmanager", json=payload)
         assert resp.status_code == 200
-        incident = mock_orchestrator.diagnose.call_args.args[0]
+        incident = mock_orchestrator.adiagnose.call_args.args[0]
         assert incident.namespace == "default"
         assert incident.pod_name is None
         # Без аннотаций описание строится из alertname (не пустое).
@@ -130,7 +130,7 @@ class TestWebhookAlertmanager:
         body = resp.json()
         assert body["processed"] == 0
         assert body["skipped"] == 1
-        mock_orchestrator.diagnose.assert_not_called()
+        mock_orchestrator.adiagnose.assert_not_called()
 
     def test_invalid_json_returns_400(self, client, mock_orchestrator) -> None:
         resp = client.post(
@@ -151,7 +151,7 @@ class TestWebhookAlertmanager:
         assert resp.status_code == 422
 
     def test_guardrail_rejected_alert_is_skipped_not_fatal(self, client, mock_orchestrator) -> None:
-        mock_orchestrator.diagnose.side_effect = NamespaceNotAllowedError("ns 'prod' not allowed")
+        mock_orchestrator.adiagnose.side_effect = NamespaceNotAllowedError("ns 'prod' not allowed")
         resp = client.post("/webhook/alertmanager", json=ALERTMANAGER_PAYLOAD)
         assert resp.status_code == 200
         body = resp.json()
@@ -181,7 +181,7 @@ class TestAuditJournal:
         assert records[0]["incident"]["pod_name"] == "payments-api-7d9f4b-x2kq"
 
     def test_guardrail_and_no_firing_events_are_audited(self, client, mock_orchestrator, audit_file) -> None:
-        mock_orchestrator.diagnose.side_effect = NamespaceNotAllowedError("nope")
+        mock_orchestrator.adiagnose.side_effect = NamespaceNotAllowedError("nope")
         client.post("/webhook/alertmanager", json=ALERTMANAGER_PAYLOAD)
         resolved = json.loads(json.dumps(ALERTMANAGER_PAYLOAD))
         resolved["alerts"][0]["status"] = "resolved"

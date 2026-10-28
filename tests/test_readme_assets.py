@@ -31,6 +31,5 @@ def test_visual_table_present_in_both_readmes():
     en = (ROOT / "README.md").read_text(encoding="utf-8")
     ru = (ROOT / "README.ru.md").read_text(encoding="utf-8")
     for readme in (en, ru):
-        # assert "docs/assets/dashboard.png" in readme
-        # assert "docs/assets/swagger.png" in readme
-        pass
+        assert "docs/assets/dashboard.png" in readme
+        assert "docs/assets/swagger.png" in readme

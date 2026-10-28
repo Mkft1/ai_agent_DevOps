@@ -74,44 +74,61 @@ def _orchestrator_with_fix(suggested_fix: str, slack_url: str | None) -> Inciden
     )
 
 
-class TestOrchestratorApprovalFlow:
-    def test_dangerous_fix_sets_flag_and_notifies_slack(self, monkeypatch) -> None:
-        import src.agent.orchestrator as orch_module
+class FakeSlackClient:
+    """Мини-замена httpx.AsyncClient для тестов Slack-аппрува."""
 
-        post = MagicMock(return_value=MagicMock(status_code=200, raise_for_status=lambda: None))
-        monkeypatch.setattr(orch_module.requests, "post", post)
+    calls: list[tuple[str, dict]] = []
+    fail_with: Exception | None = None
+
+    def __init__(self, timeout=None):
+        self.timeout = timeout
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc_info):
+        return False
+
+    async def post(self, url, json=None):
+        if FakeSlackClient.fail_with is not None:
+            raise FakeSlackClient.fail_with
+        FakeSlackClient.calls.append((url, json))
+        return MagicMock(status_code=200, raise_for_status=lambda: None)
+
+
+@pytest.fixture()
+def fake_slack(monkeypatch):
+    import src.agent.orchestrator as orch_module
+
+    FakeSlackClient.calls = []
+    FakeSlackClient.fail_with = None
+    monkeypatch.setattr(orch_module.httpx, "AsyncClient", FakeSlackClient)
+    return FakeSlackClient
+
+
+class TestOrchestratorApprovalFlow:
+    def test_dangerous_fix_sets_flag_and_notifies_slack(self, fake_slack) -> None:
         orch = _orchestrator_with_fix(
             "kubectl delete pod bad-pod -n default", "https://hooks.slack.com/services/T/B/X"
         )
         result = orch.diagnose({"namespace": "default", "pod_name": "web-1"})
         assert result["requires_approval"] is True
-        post.assert_called_once()
-        args, kwargs = post.call_args
-        assert args[0] == "https://hooks.slack.com/services/T/B/X"
-        assert "⚠️ Action Required: Agent suggests dangerous fix:" in kwargs["json"]["text"]
-        assert "Approve or Reject?" in kwargs["json"]["text"]
+        assert len(fake_slack.calls) == 1
+        url, payload = fake_slack.calls[0]
+        assert url == "https://hooks.slack.com/services/T/B/X"
+        assert "⚠️ Action Required: Agent suggests dangerous fix:" in payload["text"]
+        assert "Approve or Reject?" in payload["text"]
 
-    def test_no_webhook_logs_warning_without_crash(self, caplog, monkeypatch) -> None:
-        import src.agent.orchestrator as orch_module
-
-        post = MagicMock()
-        monkeypatch.setattr(orch_module.requests, "post", post)
+    def test_no_webhook_logs_warning_without_crash(self, caplog, fake_slack) -> None:
         orch = _orchestrator_with_fix("kubectl delete pod bad-pod", None)
         with caplog.at_level("WARNING"):
             result = orch.diagnose({"namespace": "default", "pod_name": "web-1"})
         assert result["requires_approval"] is True
-        post.assert_not_called()  # нет webhook — не падаем, только WARNING
+        assert fake_slack.calls == []  # нет webhook — не падаем, только WARNING
         assert any("SLACK_WEBHOOK_URL" in rec.message for rec in caplog.records)
 
-    def test_slack_failure_does_not_break_diagnosis(self, monkeypatch) -> None:
-        import requests as requests_lib
-
-        import src.agent.orchestrator as orch_module
-
-        def boom(*args, **kwargs):
-            raise requests_lib.ConnectionError("slack down")
-
-        monkeypatch.setattr(orch_module.requests, "post", boom)
+    def test_slack_failure_does_not_break_diagnosis(self, fake_slack) -> None:
+        fake_slack.fail_with = ConnectionError("slack down")
         orch = _orchestrator_with_fix(
             "rm -rf /tmp/x", "https://hooks.slack.com/services/T/B/X"
         )
@@ -119,17 +136,13 @@ class TestOrchestratorApprovalFlow:
         assert result["requires_approval"] is True
         assert result["root_cause"] == "test cause"
 
-    def test_safe_fix_no_approval_no_slack(self, monkeypatch) -> None:
-        import src.agent.orchestrator as orch_module
-
-        post = MagicMock()
-        monkeypatch.setattr(orch_module.requests, "post", post)
+    def test_safe_fix_no_approval_no_slack(self, fake_slack) -> None:
         orch = _orchestrator_with_fix(
             "Increase the memory limit to 1Gi", "https://hooks.slack.com/services/T/B/X"
         )
         result = orch.diagnose({"namespace": "default", "pod_name": "web-1"})
         assert result["requires_approval"] is False
-        post.assert_not_called()
+        assert fake_slack.calls == []
 
     def test_report_mentions_approval(self) -> None:
         orch = IncidentOrchestrator(
