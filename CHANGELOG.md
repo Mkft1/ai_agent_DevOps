@@ -95,6 +95,10 @@ Kubernetes с наблюдаемостью, guardrails, evaluation-фреймв�
 
 ### Changed
 
+- Dockerfile: build-инструменты базового образа (setuptools/wheel/jaraco.context)
+  подняты до версий с закрытыми CVE (Trivy HIGH: CVE-2025-47273, CVE-2026-24049,
+  CVE-2026-23949); hadolint-ignore для намеренных практик (pip cache-mount,
+  apt без пина в builder).
 - CI optimization (цель 5-6 минут вместо ~11): lint и helm идут параллельно;
   test зависит только от lint и крутится c `pytest -n auto` (pytest-xdist);
   build (Docker + smoke) ждёт [test, helm] и не запускается на PR;
