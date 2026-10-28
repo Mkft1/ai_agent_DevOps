@@ -18,3 +18,4 @@ sentence-transformers
 streamlit
 pandas
 httpx
+filelock
