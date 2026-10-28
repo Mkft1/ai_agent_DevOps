@@ -5,6 +5,7 @@
 
 # Tests (pytest и httpx уже приходят из requirements.txt с пинами)
 pytest-cov==7.1.0
+pytest-xdist==3.8.0
 
 # Lint (CI job: lint)
 ruff==0.17.3

@@ -637,15 +637,18 @@ webhook Alertmanager и журнал аудита), валидация конф�
 ## CI/CD
 
 Workflow [`.github/workflows/ci.yml`](.github/workflows/ci.yml) запускается на
-`push` и `pull_request` в `main` (плюс ручной `workflow_dispatch`) и состоит из
-четырёх последовательных jobs:
+`push` и `pull_request` в `main` (плюс ручной `workflow_dispatch`). Топология
+параллельная (цель 5-6 минут): `lint` и `helm` стартуют одновременно, `test`
+(pytest **-n auto**, xdist) ждёт только `lint`; на push в `main`/dispatch
+`build` (нужны [test, helm]; на PR не запускается) и `integration-test`
+(нужен только test, идёт параллельно с build) завершают пайплайн:
 
 | Job | Что делает |
 |-----|------------|
 | `lint` | `ruff check src tests scripts` (конфиг — `pyproject.toml`) |
 | `test` | `pytest --cov=src --cov-report=xml --cov-fail-under=85 tests/`, артефакт `coverage.xml` |
 | `build` | Сборка Docker-образа (`docker/build-push-action`, **без push**) + smoke-тест `/health` |
-| `integration-test` | kind-кластер + ImagePullBackOff + проверка `/diagnose` (только push в main / ручной запуск; автоматически пропускается, если в репозитории не задан secret `QWEN_API_KEY`/`OPENAI_API_KEY`) |
+| `integration-test` | kind-кластер + ImagePullBackOff + проверка `/diagnose` (только push в main / ручной запуск, параллельно с `build`; автоматически пропускается, если не задан secret `QWEN_API_KEY`/`OPENAI_API_KEY`) |
 
 `build` зависит от `test`, `test` — от `lint`: образ не собирается, если код
 не прошёл линтер или тесты красные.

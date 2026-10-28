@@ -491,7 +491,7 @@ tests/
 - **Docs drift guard**: `make docs-check` (и шаг CI после pytest) сверяет числа
   тестов/покрытия в этом README с реальным прогоном — расхождение роняет CI.
 - **Integration (end-to-end)**: `scripts/run_integration_test.sh` spins up a real [kind](https://kind.sigs.k8s.io/) cluster, creates a pod with a bad image tag, runs the agent under uvicorn, sends a real `POST /diagnose`, and asserts the RCA mentions *"image"*/*"pull"* (via `jq`). Idempotent: leftover clusters/pods are removed before each run; cleanup happens even on failure.
-- **CI jobs** (GitHub Actions): `lint` (`ruff check src tests scripts`) → `test` (pytest + coverage, gate ≥85%) → `build` (Docker, load + smoke-test) → `integration-test` (kind e2e, push to `main` / manual dispatch only, so PRs stay fast; gracefully skipped when the repository has no `QWEN_API_KEY`/`OPENAI_API_KEY` secret).
+- **CI jobs** (GitHub Actions, target 5-6 min): `lint` and `helm` run **in parallel**; `test` (pytest **-n auto** via pytest-xdist, coverage gate ≥85%, docs drift-guard) needs only `lint`; on push to `main`/dispatch, `build` (Docker + smoke, needs [test, helm], BuildKit gha-cache `mode=max` + pip cache-mounts; NOT run on PRs) and `integration-test` (kind e2e, needs only test, runs **parallel to build**, gracefully skipped without `QWEN_API_KEY`/`OPENAI_API_KEY` secret) finish the pipeline. PRs run only lint+helm+test for fast feedback; `[skip ci]` in a commit title skips the run.
 
 ---
 

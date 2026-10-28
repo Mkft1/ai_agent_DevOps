@@ -48,16 +48,27 @@ COV_PATTERNS = (
 )
 
 
-def collect_test_count() -> int:
-    """Фактическое число тестов: pytest --collect-only (без запуска)."""
-    proc = subprocess.run(
-        [sys.executable, "-m", "pytest", "--collect-only", "-q", "tests/"],
-        cwd=ROOT, capture_output=True, text=True, check=True,
-    )
-    match = re.search(r"(\d+) tests? collected", proc.stdout)
-    if not match:
-        raise RuntimeError(f"cannot parse collect-only output: {proc.stdout[-300:]}")
-    return int(match.group(1))
+def collect_test_count(retries: int = 2) -> int:
+    """Фактическое число тестов: pytest --collect-only (без запуска).
+
+    Устойчиво к конкурентному запуску внутри xdist-воркеров: nested pytest
+    идёт с ``-p no:cacheprovider`` (не конкурирует за .pytest_cache) и одним
+    ретраем на случай ситуативных ошибок окружения.
+    """
+    last_error = ""
+    for _ in range(retries + 1):
+        proc = subprocess.run(
+            [
+                sys.executable, "-m", "pytest",
+                "--collect-only", "-q", "-p", "no:cacheprovider", "tests/",
+            ],
+            cwd=ROOT, capture_output=True, text=True, timeout=300,
+        )
+        match = re.search(r"(\d+) tests? collected", proc.stdout)
+        if proc.returncode == 0 and match:
+            return int(match.group(1))
+        last_error = proc.stdout[-300:] + proc.stderr[-300:]
+    raise RuntimeError(f"cannot parse collect-only output: {last_error}")
 
 
 def read_coverage_percent(path: Path | None = None) -> int:
