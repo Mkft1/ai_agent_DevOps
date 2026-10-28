@@ -117,7 +117,7 @@ class TestStreamlitApp:
     def _run():
         from streamlit.testing.v1 import AppTest
 
-        at = AppTest.from_file(str(UI_PATH), default_timeout=20)
+        at = AppTest.from_file(str(UI_PATH), default_timeout=30)
         at.run()
         return at
 

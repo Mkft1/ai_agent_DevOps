@@ -81,7 +81,18 @@ class TestWiring:
         assert "docs-check" in makefile
 
     def test_collect_count_matches_suite(self) -> None:
-        """collect-only парсится и совпадает с числом, задекларированным в README."""
+        """collect-only парсится и совпадает с числом, задекларированным в README.
+
+        Под xdist-воркером nested pytest пропускается: конкурентный collect
+        внутри параллельного прогона даёт флейки на слабых машинах, а эту же
+        проверку последовательно выполняет CI-шаг drift guard.
+        """
+        import os
+
+        if os.environ.get("PYTEST_XDIST_WORKER"):
+            import pytest as _pytest
+
+            _pytest.skip("nested collect under xdist: covered by CI drift-guard step")
         actual = chk.collect_test_count()
         en = (ROOT / "README.md").read_text(encoding="utf-8")
         assert actual in {v for _, v in chk.extract_stated(en, chk.TEST_PATTERNS)}

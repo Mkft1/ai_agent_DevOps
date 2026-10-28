@@ -15,8 +15,10 @@
 # ---------------------------------------------------------------
 FROM python:3.12-slim AS base
 
-ENV PIP_NO_CACHE_DIR=1 \
-    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+# PIP_NO_CACHE_DIR намеренно НЕ ставим: pip-кэш живёт в BuildKit cache-mount
+# (--mount=type=cache,target=/root/.cache/pip) и экспортируется в GHA-кэш
+# (cache-to: type=gha,mode=max) — wheels не скачиваются заново между раннами.
+ENV PIP_DISABLE_PIP_VERSION_CHECK=1 \
     PYTHONDONTWRITEBYTECODE=1
 
 RUN apt-get update \
@@ -38,10 +40,12 @@ WORKDIR /build
 # с torch==X в requirements.txt, чтобы requirements-слой видел зависимость
 # закрытой (wheel 2.14.1+cpu удовлетворяет specifier ==2.14.1 по PEP 440)
 # и не тянул CUDA-сборку из PyPI. Индекс ниже ПЕРЕОПРЕДЕЛЯЕТ дефолтный PyPI.
-RUN pip install --no-cache-dir torch==2.14.1 --index-url https://download.pytorch.org/whl/cpu
+RUN --mount=type=cache,target=/root/.cache/pip \
+    pip install torch==2.14.1 --index-url https://download.pytorch.org/whl/cpu
 
 COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+RUN --mount=type=cache,target=/root/.cache/pip \
+    pip install -r requirements.txt
 
 # ---------------------------------------------------------------
 # Stage 3: runtime — чистый python:3.12-slim без компиляторов и кэшей pip.

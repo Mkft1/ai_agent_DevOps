@@ -1,5 +1,14 @@
 name: CI
 
+# Пропуск прогона: добавьте [skip ci] или [ci skip] в заголовок коммита
+# (нативная поддержка GitHub Actions) — полезно для docs-only правок.
+#
+# Топология пайплайна (цель 5-6 минут):
+#   PR:  lint ─┐
+#        helm ─┼─> test (pytest-xdist)                     -> финиш
+#   main: lint ─┤
+#         helm ─┴─> test ──> build (Docker, gha-кэш max)  -> финиш
+#                         └─> integration-test (kind e2e, только main/dispatch)
 on:
   push:
     branches: [main]
@@ -33,6 +42,7 @@ jobs:
   helm:
     name: Helm lint & template
     runs-on: ubuntu-latest
+    # Параллельно с lint (без needs): быстрый независимый гейт чарта.
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -46,8 +56,9 @@ jobs:
             | python3 -c 'import sys, yaml; docs=[d for d in yaml.safe_load_all(sys.stdin) if d]; kinds=sorted({d["kind"] for d in docs}); print(kinds); assert "Deployment" in kinds and "Secret" in kinds'
 
   test:
-    name: Tests (pytest + coverage)
+    name: Tests (pytest + coverage, xdist)
     runs-on: ubuntu-latest
+    # Зависит только от lint (fast-gate: не греем раннер тестами при битом линтере).
     needs: lint
     steps:
       - name: Checkout code
@@ -61,8 +72,10 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements-dev.txt
-      - name: Run pytest with coverage
-        run: pytest --cov=src --cov-report=xml --cov-fail-under=85 tests/
+      - name: Run pytest with coverage (parallel, xdist)
+        # -n auto: тесты раскладываются по всем ядрам раннера (ускорение 2-4x);
+        # pytest-cov корректно суммирует покрытиеAcross workers в coverage.xml.
+        run: pytest -n auto --cov=src --cov-report=xml --cov-fail-under=85 tests/
       - name: Docs metrics drift guard (README vs pytest)
         run: python scripts/check_docs_metrics.py
       - name: Upload coverage report
@@ -75,7 +88,10 @@ jobs:
   build:
     name: Build Docker image (no push)
     runs-on: ubuntu-latest
-    needs: test
+    needs: [test, helm]
+    # На PR образ не собираем (lint+test+helm дают быстрый фидбек); полная
+    # сборка со smoke-тестом — на push в main и workflow_dispatch.
+    if: github.event_name != 'pull_request'
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -89,9 +105,11 @@ jobs:
           load: true
           tags: k8s-incident-agent:ci-${{ github.sha }}
           cache-from: type=gha
-          # mode=min: экспорт только финальных слоёв — mode=max с torch/sklearn
-          # отдавал в GHA-кэш гигабайты и растягивал job на десятки минут.
-          cache-to: type=gha,mode=min
+          # mode=max экспортирует ВСЕ слои builder-стадии, включая cache-mounts
+          # pip из Dockerfile (--mount=type=cache,target=/root/.cache/pip):
+          # при изменении requirements.txt wheels не скачиваются заново, а
+          # берутся из кэша — это и даёт целевые 5-6 минут на тёплом раннере.
+          cache-to: type=gha,mode=max
       - name: Smoke test container
         run: |
           docker run --rm -d --name agent-smoke \
@@ -115,7 +133,9 @@ jobs:
   integration-test:
     name: E2E (kind cluster, ImagePullBackOff)
     runs-on: ubuntu-latest
-    needs: build
+    # e2e валидирует ИСХОДНИКИ агента (uvicorn из репозитория), а не образ —
+    # поэтому ждём только test и идём ПАРАЛЛЕЛЬНО с build (экономия ~3 минуты).
+    needs: [test]
     # Тяжёлый e2e-сценарий: только push в main и ручные запуски, PR не замедляет.
     if: (github.event_name == 'push' && github.ref == 'refs/heads/main') || github.event_name == 'workflow_dispatch'
     env:

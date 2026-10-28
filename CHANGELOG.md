@@ -89,6 +89,13 @@ Kubernetes с наблюдаемостью, guardrails, evaluation-фреймв�
 
 ### Changed
 
+- CI optimization (цель 5-6 минут вместо ~11): lint и helm идут параллельно;
+  test зависит только от lint и крутится c `pytest -n auto` (pytest-xdist);
+  build (Docker + smoke) ждёт [test, helm] и не запускается на PR;
+  integration-test ждёт только test и идёт параллельно с build (только main/
+  workflow_dispatch); Docker BuildKit-кэш `cache-to: type=gha,mode=max` +
+  pip cache-mount в Dockerfile (`--mount=type=cache,target=/root/.cache/pip`) —
+  wheels не скачиваются заново при изменении requirements.
 - Strict dependency pinning: все прямые зависимости в `requirements.txt` и
   `requirements-dev.txt` зафиксированы через `==` (набор версий = clean-resolve
   CPython 3.12, верифицирован CI); `torch==2.14.1` согласован с CPU-индексом в

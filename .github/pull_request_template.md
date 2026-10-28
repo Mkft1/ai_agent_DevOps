@@ -25,6 +25,12 @@
 make lint && make test
 ```
 
+## CI
+
+- Пайплайн на PR: быстрые гейты (lint + helm параллельно → test c pytest-xdist);
+  build/e2e едут только на `main`/workflow_dispatch.
+- Для docs-only правок добавьте `[skip ci]` или `[ci skip]` в заголовок коммита.
+
 ## Notes for reviewers
 
 <!-- Риски, rollback-план, связанные PR (stacked), миграции конфигов -->
