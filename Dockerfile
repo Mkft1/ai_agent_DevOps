@@ -34,7 +34,11 @@ FROM base AS builder
 
 WORKDIR /build
 
-RUN pip install --no-cache-dir torch --index-url https://download.pytorch.org/whl/cpu
+# CPU-only PyTorch ставится ПЕРВЫМ и с явным пином: версия обязана совпадать
+# с torch==X в requirements.txt, чтобы requirements-слой видел зависимость
+# закрытой (wheel 2.14.1+cpu удовлетворяет specifier ==2.14.1 по PEP 440)
+# и не тянул CUDA-сборку из PyPI. Индекс ниже ПЕРЕОПРЕДЕЛЯЕТ дефолтный PyPI.
+RUN pip install --no-cache-dir torch==2.14.1 --index-url https://download.pytorch.org/whl/cpu
 
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt

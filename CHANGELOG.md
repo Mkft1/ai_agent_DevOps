@@ -89,6 +89,11 @@ Kubernetes с наблюдаемостью, guardrails, evaluation-фреймв�
 
 ### Changed
 
+- Strict dependency pinning: все прямые зависимости в `requirements.txt` и
+  `requirements-dev.txt` зафиксированы через `==` (набор версий = clean-resolve
+  CPython 3.12, верифицирован CI); `torch==2.14.1` согласован с CPU-индексом в
+  Dockerfile (wheel `2.14.1+cpu` удовлетворяет пин по PEP 440) — воспроизводимые
+  сборки без сюрпризов от минорных обновлений транзитивных зависимостей.
 - **Docker multi-stage optimization**: base → builder → runtime, CPU-only PyTorch
   (`--index-url .../whl/cpu`) до requirements, `cache-to: type=gha,mode=min` —
   сборка образа в CI ускорена с ~21 до ~4 минут, образ минус ~2 ГБ.
