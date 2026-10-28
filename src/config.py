@@ -37,6 +37,11 @@ class Settings(BaseSettings):
     # Журнал аудита диагностик (append-only JSON Lines); см. src/utils/audit.py.
     audit_log_path: str = "audit.jsonl"
 
+    # Rate limiting (slowapi): хранилище лимитов. По умолчанию in-memory
+    # (MemoryStorage); задайте redis:// URL для общего хранилища между
+    # несколькими инстансами API.
+    rate_limit_redis_url: str | None = None
+
     # OpenTelemetry: endpoint OTLP-экспортера трейсов (gRPC, напр. http://localhost:4317
     # для локального Jaeger). None (по умолчанию) — экспорт отключён: спаны
     # собираются in-process, но никуда не отправляются (нуль внешних эффектов).

@@ -19,3 +19,4 @@ streamlit
 pandas
 httpx
 filelock
+slowapi

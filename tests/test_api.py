@@ -47,6 +47,16 @@ def client() -> TestClient:
     return TestClient(app, raise_server_exceptions=False)
 
 
+@pytest.fixture(autouse=True)
+def _reset_rate_limiter():
+    """Сброс in-memory лимитов slowapi между тестами (иначе окна пересекаются)."""
+    from src.main import limiter
+
+    limiter.reset()
+    yield
+    limiter.reset()
+
+
 class TestHealth:
     def test_health_ok(self, client: TestClient) -> None:
         resp = client.get("/health")
@@ -366,3 +376,47 @@ class TestOrchestratorBootstrap:
         assert "[stub]" in body["diagnosis"]["root_cause"]
         # Graceful degradation: внешние системы недоступны — честные warnings.
         assert body["diagnosis"]["warnings"]
+
+
+class TestRateLimiting:
+    """slowapi: /diagnose 5/min, /webhook/alertmanager 30/min, probes без лимитов."""
+
+    def test_sixth_rapid_diagnose_returns_429(
+        self, client: TestClient, mock_orchestrator: MagicMock
+    ) -> None:
+        codes = [
+            client.post("/diagnose", json={"namespace": "default", "pod_name": "web-1"}).status_code
+            for _ in range(6)
+        ]
+        assert codes[:5] == [200] * 5
+        assert codes[5] == 429
+        resp = client.post("/diagnose", json={"namespace": "default", "pod_name": "web-1"})
+        assert resp.status_code == 429
+        assert resp.json() == {"detail": "Rate limit exceeded. Please retry later."}
+        assert resp.headers.get("Retry-After", "").isdigit()
+        assert int(resp.headers["Retry-After"]) >= 1
+
+    def test_health_and_ready_are_not_limited(self, client: TestClient) -> None:
+        for _ in range(40):  # сильно выше любого лимита — пробы обязаны жить
+            assert client.get("/health").status_code == 200
+        for _ in range(40):
+            assert client.get("/ready").status_code in (200, 503)  # но не 429
+
+    def test_webhook_limit_is_30_per_minute(
+        self, client: TestClient, mock_orchestrator: MagicMock
+    ) -> None:
+        payload = {
+            "version": "4",
+            "status": "firing",
+            "alerts": [
+                {
+                    "status": "firing",
+                    "labels": {"alertname": "X", "namespace": "default", "pod": "web-1"},
+                    "annotations": {"summary": "s"},
+                    "startsAt": "2026-10-19T00:00:00Z",
+                }
+            ],
+        }
+        codes = [client.post("/webhook/alertmanager", json=payload).status_code for _ in range(31)]
+        assert codes[:30] == [200] * 30
+        assert codes[30] == 429

@@ -9,6 +9,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- API rate limiting (slowapi): `POST /diagnose` — 5/minute, `POST /webhook/alertmanager` —
+  30/minute; 429 с JSON `{"detail": "Rate limit exceeded. Please retry later."}` и
+  заголовком `Retry-After`; MemoryStorage по умолчанию, `RATE_LIMIT_REDIS_URL` —
+  Redis для общих счётчиков между репликами; `/health` и `/ready` без лимитов.
 - Docs metrics drift guard: `scripts/check_docs_metrics.py` (`make docs-check`,
   шаг CI в test-job) — сверяет задекларированные в README.md/README.ru.md числа
   тестов и покрытия с реальностью (`pytest --collect-only` + `coverage.xml`)
