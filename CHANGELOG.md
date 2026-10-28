@@ -30,6 +30,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   тестов и покрытия с реальностью (`pytest --collect-only` + `coverage.xml`)
   и падает с перечислением расхождений; юнит-тесты парсеров и EN/RU-консистентности.
 
+### Fixed
+
+- `fix(docker)`: builder-стадия переведена на изолированный `/opt/venv` — оверлей
+  системного site-packages оставлял в runtime старые `*.dist-info` базового образа
+  (`wheel 0.45.1`, CVE-2026-24049; `jaraco.context 5.3.0`, CVE-2026-23949), которые
+  апгрейд пинов в builder не удалял; теперь в runtime копируется только venv
+  (`setuptools==84.2.1` — явный пин ≥ фикса CVE-2025-47273, wheel/jaraco.context
+  в venv не попадают), цель Trivy image-scan — Total: 0 CRITICAL/HIGH.
+- `fix(docker)`: промежуточный апгрейд build-инструментов в builder
+  (`setuptools`/`wheel`/`jaraco.context`) + hadolint-ignore для pip cache-mount.
+
 ## [1.0.0] - 2026-10-19
 
 Первый полноценный релиз: production-готовый AI-агент диагностики инцидентов

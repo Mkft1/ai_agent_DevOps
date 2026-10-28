@@ -27,15 +27,19 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/*
 
 # ---------------------------------------------------------------
-# Stage 2: builder — зависимости в системный site-packages.
+# Stage 2: builder — зависимости в ИЗОЛИРОВАННЫЙ /opt/venv.
+# venv вместо оверлея системного site-packages: при COPY готового venv в
+# runtime НЕ наследуются setuptools/wheel/jaraco.context базового образа —
+# оверлей оставлял старые dist-info с HIGH CVE (Trivy run 94/96).
 # КЭШИРОВАНИЕ: requirements.txt копируется ОТДЕЛЬНО и ДО кода — правки кода
 # не сбрасывают тяжёлый pip-слой (torch + sklearn + streamlit).
-# CPU-only PyTorch ставится ПЕРВЫМ через index-url cpu: иначе sentence-
-# transformers затянет CUDA-вариант torch (~2 ГБ+ CUDA-библиотеки).
 # ---------------------------------------------------------------
 FROM base AS builder
 
 WORKDIR /build
+
+RUN python -m venv /opt/venv
+ENV PATH="/opt/venv/bin:$PATH"
 
 # CPU-only PyTorch ставится ПЕРВЫМ и с явным пином: версия обязана совпадать
 # с torch==X в requirements.txt, чтобы requirements-слой видел зависимость
@@ -48,14 +52,10 @@ RUN --mount=type=cache,target=/root/.cache/pip \
 COPY requirements.txt .
 # hadolint ignore=DL3042
 RUN --mount=type=cache,target=/root/.cache/pip \
-    pip install -r requirements.txt
-
-# Build-инструменты базового образа (setuptools/wheel/jaraco.context) попадают
-# в runtime site-packages при COPY --from=builder. Trivy (run 94) нашёл в них
-# HIGH CVE с фиксами — поднимаем до закрытых версий; в runtime они не нужны
-# функционально, но удалять их из site-packages рискованнее, чем обновить.
-RUN --mount=type=cache,target=/root/.cache/pip \
-    pip install setuptools==78.1.1 wheel==0.46.2 jaraco.context==6.1.0
+    pip install -r requirements.txt \
+    && pip install setuptools==84.2.1
+# ^ setuptools — зависимость torch; пин >= фикса CVE-2025-47273 (78.1.1).
+#   wheel/jaraco.context в venv не попадают вовсе (не runtime-зависимости).
 
 # ---------------------------------------------------------------
 # Stage 3: runtime — чистый python:3.12-slim без компиляторов и кэшей pip.
@@ -66,7 +66,8 @@ LABEL org.opencontainers.image.title="ai-agent-devops" \
       org.opencontainers.image.description="AI-агент для диагностики инцидентов в Kubernetes"
 
 ENV PYTHONUNBUFFERED=1 \
-    PYTHONDONTWRITEBYTECODE=1
+    PYTHONDONTWRITEBYTECODE=1 \
+    PATH="/opt/venv/bin:$PATH"
 
 # Non-root пользователь; домашний каталог для монтируемого kubeconfig
 RUN useradd --create-home --uid 10001 appuser \
@@ -75,9 +76,9 @@ RUN useradd --create-home --uid 10001 appuser \
 
 WORKDIR /app
 
-# Только установленные пакеты и консольные скрипты из builder
-COPY --from=builder /usr/local/lib/python3.12/site-packages/ /usr/local/lib/python3.12/site-packages/
-COPY --from=builder /usr/local/bin/ /usr/local/bin/
+# Только изолированный venv: собственный site-packages базового образа в
+# runtime остаётся нетронутым (никаких унаследованных dist-info со старыми CVE)
+COPY --from=builder /opt/venv /opt/venv
 
 # Код приложения и нужные конфиги (ничего лишнего из build-контекста)
 COPY src/ ./src/
