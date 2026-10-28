@@ -5,6 +5,9 @@
 
 # Tests (pytest и httpx уже приходят из requirements.txt с пинами)
 pytest-cov==7.1.0
+# pytest-xdist: 3.8.0, а не 3.5.0 из исходной спеки — 3.5.0 несовместим с
+# pytest 9.2/execnet 2.x (RuntimeError: can't start new thread на полном suite;
+# проверено эмпирически). 3.8.0 верифицирован в CI.
 pytest-xdist==3.8.0
 
 # Lint (CI job: lint)
