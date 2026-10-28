@@ -26,6 +26,10 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 READMES = (ROOT / "README.md", ROOT / "README.ru.md")
 
+# Число тестов сверяем строго; покрытие — с допуском: line-rate слегка плавает
+# между окружениями (версия Python/pytest), а в README оно округлённое («~93%»).
+COVERAGE_TOLERANCE_POINTS = 1
+
 # Паттерны задекларированного числа тестов (badge, features, структура, RU-строки)
 TEST_PATTERNS = (
     r"tests-(\d+)%20passed",          # RU badge
@@ -74,6 +78,26 @@ def extract_stated(text: str, patterns: tuple[str, ...]) -> list[tuple[str, int]
     return found
 
 
+def find_drift(
+    stated_tests: list[tuple[str, int]],
+    stated_cov: list[tuple[str, int]],
+    actual_tests: int,
+    actual_cov: int,
+) -> list[str]:
+    """Сравнить заявленные в README числа с фактом; вернуть список расхождений."""
+    drift: list[str] = []
+    for source, value in stated_tests:
+        if value != actual_tests:
+            drift.append(f"{source}: tests stated {value}, actual {actual_tests}")
+    for source, value in stated_cov:
+        if abs(value - actual_cov) > COVERAGE_TOLERANCE_POINTS:
+            drift.append(
+                f"{source}: coverage stated {value}%, actual {actual_cov}% "
+                f"(tolerance ±{COVERAGE_TOLERANCE_POINTS})"
+            )
+    return drift
+
+
 def main() -> int:
     try:
         actual_tests = collect_test_count()
@@ -90,7 +114,6 @@ def main() -> int:
         )
         return 2
 
-    drift: list[str] = []
     stated_tests: list[tuple[str, int]] = []
     stated_cov: list[tuple[str, int]] = []
     for readme in READMES:
@@ -98,12 +121,7 @@ def main() -> int:
         stated_tests += [(readme.name, v) for _, v in extract_stated(text, TEST_PATTERNS)]
         stated_cov += [(readme.name, v) for _, v in extract_stated(text, COV_PATTERNS)]
 
-    for source, value in stated_tests:
-        if value != actual_tests:
-            drift.append(f"{source}: tests stated {value}, actual {actual_tests}")
-    for source, value in stated_cov:
-        if value != actual_cov:
-            drift.append(f"{source}: coverage stated {value}%, actual {actual_cov}%")
+    drift = find_drift(stated_tests, stated_cov, actual_tests, actual_cov)
 
     print(
         f"[docs-check] actual: {actual_tests} tests, {actual_cov}% coverage | "

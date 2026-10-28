@@ -46,6 +46,20 @@ class TestParsers:
             chk.read_coverage_percent(tmp_path / "nope.xml")
 
 
+class TestDriftTolerance:
+    def test_coverage_tolerance_one_point(self) -> None:
+        drift = chk.find_drift([("README.md", 270)], [("README.md", 93)], 270, 92)
+        assert drift == []  # ±1 пункт покрытия — не дрейф
+
+    def test_coverage_beyond_tolerance_is_drift(self) -> None:
+        drift = chk.find_drift([("README.md", 270)], [("README.md", 93)], 270, 90)
+        assert drift and "coverage" in drift[0]
+
+    def test_test_count_must_match_exactly(self) -> None:
+        drift = chk.find_drift([("README.md", 270)], [("README.md", 93)], 271, 93)
+        assert drift and "tests" in drift[0]
+
+
 class TestReadmeConsistency:
     def test_en_ru_numbers_match(self) -> None:
         en = (ROOT / "README.md").read_text(encoding="utf-8")
