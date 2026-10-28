@@ -430,7 +430,7 @@ class TestContextLimit:
         assert "[context truncated]" not in user_prompt
 
     def test_large_context_truncated(self) -> None:
-        settings = Settings(max_context_chars=1000, allowed_namespaces=["*"], _env_file=None)
+        settings = Settings(max_context_tokens=1000, allowed_namespaces=["*"], _env_file=None)
         orch, _, _, _, llm = make_orchestrator(settings=settings)
         # Добавляем большой pod_logs, чтобы контекст превысил лимит
         big_logs = "\n".join([f"log line {i}" for i in range(500)])
@@ -439,9 +439,14 @@ class TestContextLimit:
             {"namespace": "default", "pod_name": "api-7d9f-x2kq", "description": "x"}
         )
         user_prompt = llm.generate.call_args.kwargs["user_prompt"]
-        # Рекурсивная обрезка держит промт в лимите; маркеры усечения присутствуют.
-        assert "... [truncated]" in user_prompt or "[context truncated]" in user_prompt
-        assert len(user_prompt) <= 1500
+        # Token-обрезка держит промт в лимите; маркеры усечения присутствуют.
+        from src.utils.text_utils import TOKEN_TRUNCATION_MARKER
+
+        assert TOKEN_TRUNCATION_MARKER in user_prompt or "[context truncated]" in user_prompt
+        from src.utils.text_utils import estimate_tokens
+
+        # 1000 токенов лимита + служебный префикс «Данные диагностики:\n».
+        assert estimate_tokens(user_prompt) <= 1000 + 64
 
 
 class TestGracefulDegradation:
@@ -496,7 +501,7 @@ class TestGracefulDegradation:
 
     def test_context_truncated_before_llm_call(self) -> None:
         """truncate_context вызывается на контексте до отправки в LLM (маркер ... [truncated])."""
-        settings = Settings(max_context_chars=1000, allowed_namespaces=["*"], _env_file=None)
+        settings = Settings(max_context_tokens=1000, allowed_namespaces=["*"], _env_file=None)
         orch, _, _, _, llm = make_orchestrator(settings=settings)
         orch.logs.get_pod_logs.return_value = "\n".join(
             f"log line number {i} " + "spam " * 40 for i in range(500)
@@ -505,9 +510,11 @@ class TestGracefulDegradation:
 
         user_prompt = llm.generate.call_args.kwargs["user_prompt"]
         context_arg = llm.generate.call_args.kwargs["context"]
-        # Контекст, переданный LLM, уже обрезан рекурсивно (не просто срезан хвост JSON).
-        assert "... [truncated]" in json.dumps(context_arg, ensure_ascii=False)
-        assert len(user_prompt) <= 1500
+        # Контекст, переданный LLM, уже обрезан по токенам (не просто срезан хвост JSON).
+        from src.utils.text_utils import TOKEN_TRUNCATION_MARKER, estimate_tokens
+
+        assert TOKEN_TRUNCATION_MARKER in json.dumps(context_arg, ensure_ascii=False)
+        assert estimate_tokens(user_prompt) <= 1000 + 64  # лимит + служебный префикс
 
 
 class TestTokenEstimateLogging:
@@ -527,7 +534,7 @@ class TestTokenEstimateLogging:
     def test_warning_when_over_soft_limit_but_not_blocked(self, caplog):
         big_settings = Settings(
             allowed_namespaces=["default"],
-            max_context_chars=60000,  # >8000 токенов (1 токен ~ 4 символа)
+            max_context_tokens=60000,  # заведомо >8000 токенов_soft-лимита
             _env_file=None,
         )
         orch, k8s, prom, logs_tools, llm = make_orchestrator(settings=big_settings)

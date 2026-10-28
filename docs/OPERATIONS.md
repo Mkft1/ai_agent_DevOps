@@ -184,7 +184,7 @@ every postmortem is a free test case.
   1. Check the provider dashboard (Qwen/DashScope or your gateway) for QPM/TPM limits.
   2. Reduce load: group/deduplicate alerts in Alertmanager (`group_by`, `group_wait`)
      so one incident does not fire N diagnoses; the webhook skips `resolved` alerts.
-  3. Shrink token cost: lower `MAX_CONTEXT_CHARS` (default 16000) and `MAX_LOG_LINES`.
+  3. Shrink token cost: lower `MAX_CONTEXT_TOKENS` (default 4000, precise tiktoken count) and `MAX_LOG_LINES`.
   4. Switch model/provider via `LLM_MODEL` / `LLM_BASE_URL` if the limit is per-model.
 - While the LLM is unavailable the agent still answers with a fallback diagnosis
   (`warnings: ["LLM не ответил — RCA не сформирован"]`, severity from collected data)

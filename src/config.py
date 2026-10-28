@@ -74,8 +74,9 @@ class Settings(BaseSettings):
     # CORS (список разрешённых origins; по умолчанию "*" для dev)
     cors_origins: list[str] = ["*"]
 
-    # Ограничение размера контекста (в символах), передаваемого в LLM
-    max_context_chars: int = 16000
+    # Ограничение размера контекста, передаваемого в LLM, в ТОКЕНАХ
+    # (точный подсчёт tiktoken cl100k_base; см. src/utils/text_utils.py)
+    max_context_tokens: int = 4000
 
     # ------------------------------------------------------------------
     # Валидация конфигурации (fail-fast при старте приложения)
@@ -108,12 +109,12 @@ class Settings(BaseSettings):
             raise ValueError(f"max_log_lines must be >= 1, got {value}")
         return value
 
-    @field_validator("max_context_chars")
+    @field_validator("max_context_tokens")
     @classmethod
-    def _validate_max_context_chars(cls, value: int) -> int:
-        """MAX_CONTEXT_CHARS: не меньше 1000 символов (иначе контекст бесполезен)."""
-        if value < 1000:
-            raise ValueError(f"max_context_chars must be >= 1000, got {value}")
+    def _validate_max_context_tokens(cls, value: int) -> int:
+        """MAX_CONTEXT_TOKENS: не меньше 256 токенов (иначе контекст бесполезен)."""
+        if value < 256:
+            raise ValueError(f"max_context_tokens must be >= 256, got {value}")
         return value
 
     @property

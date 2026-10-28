@@ -29,7 +29,7 @@ The agent is strictly **read-only by default**: it never mutates the cluster (`E
 | 📚 **Hybrid RAG over runbooks** | Local Markdown runbooks (`docs/runbooks/*.md`) ranked by **hybrid search**: `0.5 × TF-IDF` (exact terms) + `0.5 × cosine similarity` of sentence-transformers embeddings (`all-MiniLM-L6-v2`, semantic match). No vector DB, no external service; if the model is unavailable the agent gracefully falls back to pure TF-IDF. Top playbooks are injected into the LLM context as `relevant_runbooks` and drive `suggested_fix`. |
 | ☸️ **Kubernetes integration** | Official Python client: pods, events, deployments, nodes, container logs (including pre-restart logs for OOMKilled/CrashLoopBackOff). |
 | 📈 **Prometheus integration** | instant & range queries, per-pod CPU/memory usage via `container_*` cAdvisor metrics. |
-| 🛡️ **Guardrails** | Namespace allow-list (`ALLOWED_NAMESPACES`), log-size cap (`MAX_LOG_LINES`), context-size cap (`MAX_CONTEXT_CHARS`), read-only mode (`ENABLE_WRITE_ACTIONS`), **dangerous-action policy** (fixes mentioning `delete`/`drop`/`rm -rf`/`scale 0` are flagged `requires_approval: true` and routed to a human via Slack), and cluster-level **Policy-as-Code**: least-privilege RBAC + Kyverno ClusterPolicies in `manifests/`. All configurable via `.env`, nothing hardcoded. |
+| 🛡️ **Guardrails** | Namespace allow-list (`ALLOWED_NAMESPACES`), log-size cap (`MAX_LOG_LINES`), context-size cap in tokens (`MAX_CONTEXT_TOKENS`, tiktoken), read-only mode (`ENABLE_WRITE_ACTIONS`), **dangerous-action policy** (fixes mentioning `delete`/`drop`/`rm -rf`/`scale 0` are flagged `requires_approval: true` and routed to a human via Slack), and cluster-level **Policy-as-Code**: least-privilege RBAC + Kyverno ClusterPolicies in `manifests/`. All configurable via `.env`, nothing hardcoded. |
 | 🩹 **Graceful degradation** | If any data source fails (K8s API down, Prometheus unreachable, empty logs), the agent records a warning in the report and continues diagnosing with whatever data it has — it never crashes the pipeline. |
 | 📊 **Observability** | `/metrics` endpoint (`prometheus-fastapi-instrumentator`) + custom counters/histograms: `diagnose_requests_total`, `diagnose_duration_seconds`, `k8s_api_errors_total`, `llm_fallback_total`. `X-Request-ID` correlation (echoed/generated per request), optional structured JSON logging (`LOG_FORMAT=json`) for Loki/CloudWatch, an append-only audit journal (`AUDIT_LOG_PATH`, JSON Lines) of every diagnosis, and **OpenTelemetry distributed tracing** (auto HTTP spans + manual spans per K8s/Prometheus/logs/RAG/LLM call, OTLP export to Jaeger/Tempo). |
 | 🚨 **Alertmanager webhook** | `POST /webhook/alertmanager` accepts the standard Alertmanager payload, diagnoses every `firing` alert (namespace/pod from labels, text from `annotations.summary`/`description`), skips `resolved`, and answers `400` on malformed payloads. |
@@ -63,7 +63,7 @@ flowchart LR
     LOGS --> CTX
 
     CTX --> RAG[RunbookRAG\nTF-IDF over\ndocs/runbooks/*.md]
-    RAG -->|"context +\nrelevant_runbooks"| TRUNC[truncate_context\nMAX_CONTEXT_CHARS]
+    RAG -->|"context +\nrelevant_runbooks"| TRUNC[truncate_context\nMAX_CONTEXT_TOKENS\ntiktoken]
     TRUNC --> LLM[LLM Client\nQwen / OpenAI-compatible\nretries + JSON validation]
     LLM -->|Diagnosis payload| DIAG[RCA JSON:\nroot_cause / evidence /\nsuggested_fix / severity]
     DIAG --> REPORT[format_report\nSlack / Telegram text]
@@ -122,7 +122,7 @@ cp .env.example .env
 | `CORS_ORIGINS` | `["*"]` | Allowed CORS origins (JSON list, e.g. `["http://localhost:3000"]`). |
 | `ALLOWED_NAMESPACES` | `["default"]` | Namespaces the agent may inspect; anything else → HTTP 403. |
 | `MAX_LOG_LINES` | `200` | Hard cap on `tail_lines` for log retrieval. |
-| `MAX_CONTEXT_CHARS` | `16000` | Max serialized size of the LLM context (long strings get truncated with `... [truncated]`). |
+| `MAX_CONTEXT_TOKENS` | `4000` | Max size of the serialized LLM context **in tokens** (precise tiktoken `cl100k_base` count); longest fields (logs) are truncated with `... [truncated to fit token limit]`. |
 | `ENABLE_WRITE_ACTIONS` | `false` | Read-only mode. No write path exists in the codebase today. |
 | `LOG_FORMAT` | `text` | `text` (human-readable) or `json` (one JSON object per line for log aggregators). |
 | `LLM_OFFLINE` | `false` | Demo/offline mode: without an LLM key `/diagnose` answers with the deterministic `LLMClientStub` instead of an honest `503`. Keep `false` in production. |
@@ -457,7 +457,7 @@ All limits are configuration-driven (see table above), enforced **before** any c
 
 1. **Namespace allow-list** — requests for namespaces outside `ALLOWED_NAMESPACES` fail fast with `"Namespace not allowed"` (HTTP 403); no API calls are made.
 2. **Read-only by design** — with `ENABLE_WRITE_ACTIONS=false` the agent only reads data and *suggests* fixes. There is no delete/exec/apply code path in the repository; the flag guards future action-proposing features.
-3. **Bounded context** — log tails capped by `MAX_LOG_LINES`; the whole LLM context is recursively trimmed to `MAX_CONTEXT_CHARS` (long values keep their tail — the freshest log lines — and are marked `... [truncated]`).
+3. **Bounded context** — log tails capped by `MAX_LOG_LINES`; the whole LLM context is iteratively trimmed to `MAX_CONTEXT_TOKENS` by precise tiktoken counting (longest values keep their tail — the freshest log lines — and are marked `... [truncated to fit token limit]`), guaranteeing no context-window overflow on any provider.
 4. **No secrets anywhere** — API keys come exclusively from `.env` (never committed, excluded from the Docker image via `.dockerignore`); prompt/response logging at DEBUG never includes auth headers.
 5. **Graceful degradation** — a failing tool produces a warning in the report ("K8s API unavailable, using only Prometheus metrics"), not a crash; even a missing kubeconfig at startup only degrades K8s/log tools to empty results, and an unconfigured LLM key yields an actionable `503` (or stub mode via `LLM_OFFLINE=true`), never a bare `500`.
 6. **Non-root container** — the runtime image runs as `appuser` (UID 10001) with a read-only kubeconfig mount.

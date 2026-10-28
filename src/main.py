@@ -76,7 +76,7 @@ OpenAI-compatible) → RCA → Report`. Ответ LLM валидируется 
 * **Namespace allow-list** (`ALLOWED_NAMESPACES`): запросы вне списка → `403` до любых обращений к кластеру;
 * **Policy-as-Code**: опасные рекомендации (`delete`, `drop`, `rm -rf`, `scale 0`)
   помечаются `requires_approval: true` и уходят на аппрув человеку в Slack;
-* **Bounded context**: лимиты `MAX_LOG_LINES` / `MAX_CONTEXT_CHARS`; секреты только из `.env`.
+* **Bounded context**: лимиты `MAX_LOG_LINES` / `MAX_CONTEXT_TOKENS` (tiktoken); секреты только из `.env`.
 
 ## Наблюдаемость
 `/metrics` (Prometheus), structured JSON-логи (`LOG_FORMAT=json`), `X-Request-ID`

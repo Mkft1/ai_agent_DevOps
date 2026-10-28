@@ -41,10 +41,10 @@ class TestGuardrailBounds:
         with pytest.raises(ValidationError):
             make_settings(max_log_lines=-5)
 
-    def test_max_context_chars_has_sane_minimum(self) -> None:
+    def test_max_context_tokens_has_sane_minimum(self) -> None:
         with pytest.raises(ValidationError):
-            make_settings(max_context_chars=10)
-        assert make_settings(max_context_chars=1000).max_context_chars == 1000
+            make_settings(max_context_tokens=10)
+        assert make_settings(max_context_tokens=4000).max_context_tokens == 4000
 
 
 class TestNewSettingsDefaults:
@@ -52,6 +52,7 @@ class TestNewSettingsDefaults:
         s = make_settings()
         assert s.log_format == "text"
         assert s.llm_offline is False
+        assert s.max_context_tokens == 4000
 
     def test_llm_offline_flag(self) -> None:
         assert make_settings(llm_offline="true").llm_offline is True
