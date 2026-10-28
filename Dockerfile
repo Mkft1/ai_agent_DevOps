@@ -21,6 +21,7 @@ FROM python:3.12-slim AS base
 ENV PIP_DISABLE_PIP_VERSION_CHECK=1 \
     PYTHONDONTWRITEBYTECODE=1
 
+# hadolint ignore=DL3008
 RUN apt-get update \
     && apt-get install -y --no-install-recommends build-essential \
     && rm -rf /var/lib/apt/lists/*
@@ -40,12 +41,21 @@ WORKDIR /build
 # с torch==X в requirements.txt, чтобы requirements-слой видел зависимость
 # закрытой (wheel 2.14.1+cpu удовлетворяет specifier ==2.14.1 по PEP 440)
 # и не тянул CUDA-сборку из PyPI. Индекс ниже ПЕРЕОПРЕДЕЛЯЕТ дефолтный PyPI.
+# hadolint ignore=DL3042
 RUN --mount=type=cache,target=/root/.cache/pip \
     pip install torch==2.14.1 --index-url https://download.pytorch.org/whl/cpu
 
 COPY requirements.txt .
+# hadolint ignore=DL3042
 RUN --mount=type=cache,target=/root/.cache/pip \
     pip install -r requirements.txt
+
+# Build-инструменты базового образа (setuptools/wheel/jaraco.context) попадают
+# в runtime site-packages при COPY --from=builder. Trivy (run 94) нашёл в них
+# HIGH CVE с фиксами — поднимаем до закрытых версий; в runtime они не нужны
+# функционально, но удалять их из site-packages рискованнее, чем обновить.
+RUN --mount=type=cache,target=/root/.cache/pip \
+    pip install setuptools==78.1.1 wheel==0.46.2 jaraco.context==6.1.0
 
 # ---------------------------------------------------------------
 # Stage 3: runtime — чистый python:3.12-slim без компиляторов и кэшей pip.
