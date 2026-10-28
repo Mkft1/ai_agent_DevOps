@@ -20,3 +20,4 @@ pandas
 httpx
 filelock
 slowapi
+tiktoken

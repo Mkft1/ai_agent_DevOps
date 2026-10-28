@@ -62,7 +62,7 @@ env:
   PROMETHEUS_URL: "http://prometheus.monitoring.svc.cluster.local:9090"
   ALLOWED_NAMESPACES: '["default"]'
   MAX_LOG_LINES: "200"
-  MAX_CONTEXT_CHARS: "16000"
+  MAX_CONTEXT_TOKENS: "4000"
   ENABLE_WRITE_ACTIONS: "false"
   LLM_OFFLINE: "false"
   LLM_BASE_URL: "https://dashscope.aliyuncs.com/compatible-mode"

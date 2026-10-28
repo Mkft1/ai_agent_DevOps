@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Precise token-based context control: `MAX_CONTEXT_CHARS` заменён на
+  `MAX_CONTEXT_TOKENS` (default 4000); `truncate_context` и `estimate_tokens`
+  используют tiktoken `cl100k_base` (fallback chars/4 offline), итеративно усекая
+  самые длинные поля до строгого соответствия лимиту токенов с маркером
+  `... [truncated to fit token limit]` — гарантия от переполнения контекстного
+  окна у любого LLM-провайдера.
 - API rate limiting (slowapi): `POST /diagnose` — 5/minute, `POST /webhook/alertmanager` —
   30/minute; 429 с JSON `{"detail": "Rate limit exceeded. Please retry later."}` и
   заголовком `Retry-After`; MemoryStorage по умолчанию, `RATE_LIMIT_REDIS_URL` —

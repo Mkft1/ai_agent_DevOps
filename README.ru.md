@@ -15,7 +15,7 @@ AI-агент для диагностики инцидентов в Kubernetes. 
 [![Python 3.12](https://img.shields.io/badge/python-3.12-blue?logo=python&logoColor=white)](https://www.python.org/downloads/)
 [![Docker](https://img.shields.io/badge/docker-multistage%20image-2496ED?logo=docker&logoColor=white)](./Dockerfile)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](./LICENSE)
-[![Tests](https://img.shields.io/badge/tests-270%20passed-brightgreen?logo=pytest&logoColor=white)](#тесты)
+[![Tests](https://img.shields.io/badge/tests-273%20passed-brightgreen?logo=pytest&logoColor=white)](#тесты)
 [![Ruff](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/astral-sh/ruff/main/assets/badge/v2.json)](https://github.com/astral-sh/ruff)
 
 AI-агент для диагностики инцидентов в Kubernetes.
@@ -102,7 +102,7 @@ Alertmanager → /diagnose → IncidentOrchestrator → [K8sTools, PrometheusToo
   (таблица инцидентов Timestamp/Namespace/Severity/Root Cause, метрики по severity,
   карточки аппрува с `suggested_fix` и кнопкой "Approve & Apply" для инцидентов с
   `requires_approval=true`); запускается отдельно от FastAPI, кластер не трогает.
-- **Тестирование** — 270 unit/интеграционных тестов (pytest + unittest.mock), покрытие ~93%
+- **Тестирование** — 273 unit/интеграционных тестов (pytest + unittest.mock), покрытие ~93%
   (гейт в CI `--cov-fail-under=85`): инструменты, оркестратор, LLM-клиент (мок HTTP),
   FastAPI-эндпоинты (TestClient), конфигурация и логирование, chaos-скрипт.
 - **DevOps-практики** — многоступенчатый Docker-образ, docker-compose, идемпотентный
@@ -269,7 +269,7 @@ curl http://localhost:8000/health
 | `MAX_LOG_LINES`   | `200`                                          | Guardrail: максимум строк лога, забираемых у пода               |
 | `ENABLE_WRITE_ACTIONS` | `false`                                   | Guardrail: разрешить агенту write-действия (по умолчанию только чтение) |
 | `CORS_ORIGINS`    | `[\"*\"]`                                      | Список разрешённых CORS origins (JSON-массив). Для прода задайте явно, напр. `[\"http://localhost:3000\"]` |
-| `MAX_CONTEXT_CHARS` | `16000`                                    | Максимальный размер контекста (в символах), передаваемого в LLM; при превышении обрезается с пометкой |
+| `MAX_CONTEXT_TOKENS` | `4000`                                     | Максимальный размер контекста, передаваемого в LLM, **в токенах** (точный подсчёт tiktoken `cl100k_base`); самые длинные поля обрезаются с пометкой `... [truncated to fit token limit]` |
 | `LOG_FORMAT`      | `text`                                         | Формат логов: `text` (человекочитаемый) или `json` (structured logging для Loki/CloudWatch) |
 | `LLM_OFFLINE`     | `false`                                        | Демо/оффлайн-режим: без LLM-ключа `/diagnose` отвечает stub-диагнозом вместо честного `503`; в проде держите `false` |
 | `AUDIT_LOG_PATH`  | `audit.jsonl`                                  | Append-only журнал аудита (JSON Lines): по одной JSON-строке на диагностику / guardrail-отклонение / webhook-батч |
@@ -301,13 +301,14 @@ curl http://localhost:8000/health
    конкретных origin'ов вашего UI, например `CORS_ORIGINS=["http://localhost:3000"]`
    или `["https://alerts.example.com"]` — это исключит произвольные сторонние сайты
    от вызова `/diagnose`.
-5. **MAX_CONTEXT_CHARS** — объём данных, отправляемых в LLM, ограничен (по умолчанию
-   16000 символов). Перед запросом к модели контекст проходит рекурсивное усечение
-   (`src/utils/text_utils.py::truncate_context`): длинные строки (логи, события)
-   обрезаются с маркером `... [truncated]` (для логов сохраняется хвост), при
-   необходимости усекаются и списки; если JSON всё ещё не влезает — применяется
-   финальное усечение с пометкой `[context truncated]`. Результат всегда
-   JSON-сериализуем — защита от раздувания токенов без падения сериализации.
+5. **MAX_CONTEXT_TOKENS** — объём данных, отправляемых в LLM, ограничен (по умолчанию
+   4000 **токенов**). Перед запросом к модели контекст проходит итеративное усечение
+   по токенам (`src/utils/text_utils.py::truncate_context`, точный подсчёт tiktoken
+   `cl100k_base`): самые длинные строки (логи, события) обрезаются с маркером
+   `... [truncated to fit token limit]` (для логов сохраняется хвост); если структура
+   сама по себе больше лимита — применяется preview-обёртка. Результат всегда
+   JSON-сериализуем и строго <= лимита — переполнение контекстного окна исключено
+   у любого провайдера.
 
 ### Graceful Degradation (устойчивость к сбоям инструментов)
 
@@ -628,7 +629,7 @@ ruff check src tests scripts
 python -m pytest --cov=src --cov-report=xml tests/
 ```
 
-Текущий набор: **270 passed**, покрытие **~93%** (инструменты K8s/Prometheus/логов,
+Текущий набор: **273 passed**, покрытие **~93%** (инструменты K8s/Prometheus/логов,
 оркестратор, LLM-клиент с моками HTTP, FastAPI-эндпоинты через TestClient (включая
 webhook Alertmanager и журнал аудита), валидация конфигурации, JSON-логирование,
 трейсинг OpenTelemetry, chaos-скрипт).

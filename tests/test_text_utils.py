@@ -1,106 +1,106 @@
-"""Unit-тесты truncate_context: рекурсивное усечение контекста для LLM."""
+"""Unit-тесты token-based усечения контекста (tiktoken, src/utils/text_utils.py)."""
+
+from __future__ import annotations
 
 import json
 
+import pytest
+
 from src.utils.text_utils import (
-    TRUNCATION_MARKER,
+    TOKEN_TRUNCATION_MARKER,
     estimate_json_size,
     estimate_tokens,
     truncate_context,
+    truncate_text_to_tokens,
 )
 
 
-class TestTruncateContext:
-    """Проверки поведения truncate_context по ТЗ Шага «Graceful Degradation»."""
+def _dump(ctx) -> str:
+    return json.dumps(ctx, ensure_ascii=False, default=str)
 
-    def test_long_string_truncated_with_marker(self) -> None:
-        """Длинные строки обрезаются с маркером '... [truncated]'."""
-        context = {"pod_logs_tail": "x" * 5000, "incident": {"namespace": "default"}}
-        result = truncate_context(context, max_chars=1000)
 
-        assert TRUNCATION_MARKER in result["pod_logs_tail"]
-        assert len(result["pod_logs_tail"]) <= 1000
-        # Короткие значения не трогаются.
-        assert result["incident"]["namespace"] == "default"
-
-    def test_small_context_unchanged(self) -> None:
-        """Если JSON уже в лимите — контекст возвращается без изменений."""
-        context = {"a": "short", "b": {"c": 42}}
-        result = truncate_context(context, max_chars=16000)
-        assert result == context
-        assert TRUNCATION_MARKER not in json.dumps(result)
-
-    def test_result_is_json_serializable_and_within_limit(self) -> None:
-        """После обрезки JSON сериализуем и не превышает max_chars."""
-        context = {
-            "pods": [{"name": f"pod-{i}", "labels": {"k": "v" * 300}} for i in range(50)],
-            "pod_logs_tail": "\n".join(f"line {i}: " + "log" * 100 for i in range(500)),
-            "metrics": {"cpu_cores": 0.5, "memory_bytes": 123},
-        }
-        limit = 4000
-        result = truncate_context(context, max_chars=limit)
-
-        dumped = json.dumps(result, ensure_ascii=False, default=str)  # не падает
-        assert len(dumped) <= limit
-        assert TRUNCATION_MARKER in dumped
-
-    def test_recursion_into_nested_lists_and_dicts(self) -> None:
-        """Обрезка применяется рекурсивно во вложенных структурах."""
-        context = {
-            "events": [
-                {"message": "boom " * 400, "count": 3},
-                {"message": "ok"},
-            ],
-            "target_pod": {"status": "Running " * 300},
-        }
-        result = truncate_context(context, max_chars=800)
-
-        assert TRUNCATION_MARKER in result["events"][0]["message"]
-        assert result["events"][1]["message"] == "ok"
-        assert TRUNCATION_MARKER in result["target_pod"]["status"]
-        # Не-строковые примитивы сохраняются как есть.
-        assert result["events"][0]["count"] == 3
-
-    def test_multiline_logs_keep_tail(self) -> None:
-        """Для многострочных логов сохраняется ХВОСТ (последние строки)."""
-        lines = [f"line-{i:04d} " + "m" * 60 for i in range(200)]
-        context = {"pod_logs_tail": "\n".join(lines)}
-        result = truncate_context(context, max_chars=600)
-
-        truncated = result["pod_logs_tail"]
-        assert truncated.startswith(TRUNCATION_MARKER)
-        assert "line-0199" in truncated  # последняя строка сохранена
-        assert "line-0000" not in truncated  # начало отброшено
-
-    def test_source_context_not_mutated(self) -> None:
-        """Исходный словарь не мутируется — создаётся копия со строками-заменами."""
-        original_value = "y" * 3000
-        context = {"logs": original_value}
-        truncate_context(context, max_chars=500)
-        assert context["logs"] == original_value
-
-    def test_estimate_json_size_fallback_never_raises(self) -> None:
-        """Оценка размера не падает даже на не-сериализуемых объектах."""
-
-        class Weird:
-            pass
-
-        assert estimate_json_size({"obj": Weird()}) > 0
+def _tokens_of(ctx) -> int:
+    return estimate_tokens(_dump(ctx))
 
 
 class TestEstimateTokens:
-    """Грубая оценка токенов (1 токен ~ 4 символа)."""
+    def test_exact_via_tiktoken(self) -> None:
+        tiktoken = pytest.importorskip("tiktoken")  # offline-деплои не блокируем
 
-    def test_empty_string_is_zero(self):
+        enc = tiktoken.get_encoding("cl100k_base")
+        text = "The quick brown fox jumps over the lazy dog"
+        assert estimate_tokens(text) == len(enc.encode(text))
+
+    def test_empty(self) -> None:
         assert estimate_tokens("") == 0
 
-    def test_rough_four_chars_per_token(self):
-        assert estimate_tokens("a" * 400) == 100
+    def test_fallback_when_encoder_unavailable(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        import src.utils.text_utils as tu
 
-    def test_short_text_at_least_one_token(self):
-        assert estimate_tokens("ab") == 1
+        monkeypatch.setattr(tu, "get_encoder", lambda: None)
+        assert estimate_tokens("x" * 400) == 100  # len // 4
 
-    def test_estimate_scales_with_prompt_size(self):
-        small = estimate_tokens("error: oom killed")
-        big = estimate_tokens("oom killed container " * 500)
-        assert big > small
+
+class TestTruncateTextToTokens:
+    def test_keeps_tail_and_marker(self) -> None:
+        text = "line head " + "word " * 500 + "LINE TAIL"
+        out = truncate_text_to_tokens(text, 50, keep="tail")
+        assert out.startswith(TOKEN_TRUNCATION_MARKER)
+        assert "LINE TAIL" in out
+        assert estimate_tokens(out) <= 50 + estimate_tokens(TOKEN_TRUNCATION_MARKER) + 1
+
+    def test_short_text_unchanged(self) -> None:
+        assert truncate_text_to_tokens("short", 100) == "short"
+
+
+class TestTruncateContext:
+    def test_small_context_unchanged(self) -> None:
+        context = {"a": "short", "b": {"c": 42}}
+        assert truncate_context(context, 4000) == context
+        assert TOKEN_TRUNCATION_MARKER not in _dump(truncate_context(context, 4000))
+
+    def test_ten_thousand_token_log_fits_limit_with_marker(self) -> None:
+        """По спеке: лог на 10 000 токенов -> результат <= max_context_tokens + маркер."""
+        pytest.importorskip("tiktoken")  # точная токенизация нужна для калибровки лога
+        log = "word " * 10_000  # ~10 000 токенов cl100k_base
+        assert 9_500 <= estimate_tokens(log) <= 10_500
+        context = {
+            "incident": {"namespace": "default", "pod_name": "web-1"},
+            "pod_logs_tail": log,
+            "metrics": {"cpu_cores": 0.5},
+        }
+        limit = 4000
+        result = truncate_context(context, limit)
+
+        assert _tokens_of(result) <= limit  # строго в лимите токенов
+        assert TOKEN_TRUNCATION_MARKER in _dump(result)
+        json.loads(_dump(result))  # JSON остаётся валидным
+        # Структура и короткие поля сохранены.
+        assert result["incident"]["namespace"] == "default"
+        assert result["metrics"]["cpu_cores"] == 0.5
+
+    def test_nested_structures_truncated_and_valid(self) -> None:
+        context = {
+            "events": [{"message": "boom " * 400, "count": 3}, {"message": "ok"}],
+            "target_pod": {"status": "Running " * 300},
+        }
+        result = truncate_context(context, 300)
+        assert _tokens_of(result) <= 300
+        assert TOKEN_TRUNCATION_MARKER in result["events"][0]["message"]
+        assert result["events"][1]["message"] == "ok"
+        json.loads(_dump(result))
+
+    def test_extreme_tiny_limit_still_fits(self) -> None:
+        context = {"pod_logs_tail": "word " * 5000, "pods": [{"name": "p" * 200}]}
+        result = truncate_context(context, 128)
+        assert _tokens_of(result) <= 128
+        json.loads(_dump(result))
+
+    def test_original_context_not_mutated(self) -> None:
+        context = {"pod_logs_tail": "word " * 5000}
+        truncate_context(context, 200)
+        assert context["pod_logs_tail"].startswith("word word")
+        assert TOKEN_TRUNCATION_MARKER not in context["pod_logs_tail"]
+
+    def test_estimate_json_size_still_char_based(self) -> None:
+        assert estimate_json_size({"a": "bbb"}) == len('{"a": "bbb"}')

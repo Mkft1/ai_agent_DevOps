@@ -35,7 +35,12 @@ from src.utils.metrics import (
     inc_llm_fallback,
     observe_diagnose_duration,
 )
-from src.utils.text_utils import TOKEN_SOFT_LIMIT, estimate_tokens, truncate_context
+from src.utils.text_utils import (
+    TOKEN_SOFT_LIMIT,
+    estimate_tokens,
+    truncate_context,
+    truncate_text_to_tokens,
+)
 
 logger = get_logger(__name__)
 
@@ -279,21 +284,23 @@ class IncidentOrchestrator:
         return clamped
 
     def _limit_context(self, context_json: str) -> str:
-        """Ограничить размер контекста для LLM значением MAX_CONTEXT_CHARS.
+        """Финальная гарантия: JSON контекста не длиннее MAX_CONTEXT_TOKENS.
 
-        Если сериализованный контекст длиннее лимита — обрезаем с хвоста и
-        добавляем пометку, чтобы модель понимала неполноту данных.
+        Основной контроль выполняет :func:`truncate_context` (по полям);
+        здесь — страховка на случай, если сериализованный JSON всё ещё
+        превышает лимит: усечение по токенам (tiktoken) с пометкой.
         """
-        limit = max(int(self.settings.max_context_chars), 1000)
-        if len(context_json) <= limit:
+        limit = max(int(self.settings.max_context_tokens), 256)
+        total = estimate_tokens(context_json)
+        if total <= limit:
             return context_json
         logger.warning(
-            "Context truncated to MAX_CONTEXT_CHARS=%d (was %d chars)",
+            "Context truncated to MAX_CONTEXT_TOKENS=%d (was %d tokens)",
             limit,
-            len(context_json),
+            total,
         )
         marker = "\n...[context truncated]"
-        return context_json[: limit - len(marker)] + marker
+        return truncate_text_to_tokens(context_json, limit, marker=marker, keep="head")
 
     @staticmethod
     def _build_rag_query(context: dict[str, Any], log_text: str) -> str:
@@ -552,9 +559,10 @@ class IncidentOrchestrator:
             warnings.append("pod_name не указан и не выводится из incident — skip per-pod steps")
 
         # e/f. Контекст -> LLM: системный промт отдельно, данные — в user-сообщении.
-        # truncate_context рекурсивно обрезает длинные строки (логи), чтобы JSON
-        # не превышал MAX_CONTEXT_CHARS; _limit_context — финальная гарантия лимита.
-        context = truncate_context(context, self.settings.max_context_chars)
+        # truncate_context итеративно обрезает самые длинные строки (логи) по
+        # ТОКЕНАМ (tiktoken), чтобы JSON не превышал MAX_CONTEXT_TOKENS;
+        # _limit_context — финальная гарантия лимита.
+        context = truncate_context(context, self.settings.max_context_tokens)
         context_json = json.dumps(context, ensure_ascii=False, default=str)
         user_prompt = (
             f"Данные диагностики:\n{self._limit_context(context_json)}"
@@ -640,7 +648,7 @@ class IncidentOrchestrator:
         Если суммарная оценка превышает ``TOKEN_SOFT_LIMIT`` (8000 токенов —
         примерный лимит дешёвых моделей), добавляется WARNING о возможном
         превышении контекста. Запрос при этом НЕ блокируется: размер контекста
-        уже ограничен ``truncate_context``/MAX_CONTEXT_CHARS.
+        уже ограничен ``truncate_context``/MAX_CONTEXT_TOKENS.
         """
         system_tokens = estimate_tokens(SYSTEM_PROMPT)
         user_tokens = estimate_tokens(user_prompt)
