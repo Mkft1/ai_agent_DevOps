@@ -35,7 +35,15 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-          cache: pip
+          # Встроенный cache: pip НЕ используется: кэш ведёт явный шаг
+          # actions/cache ниже — единый ключ на все Python-джобы workflow.
+      - name: Cache pip dependencies
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ hashFiles('requirements.txt', 'requirements-dev.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-
       - name: Install dev dependencies
         run: |
           python -m pip install --upgrade pip
@@ -47,6 +55,11 @@ jobs:
     name: Helm lint & template
     runs-on: ubuntu-latest
     # Параллельно с lint (без needs): быстрый независимый гейт чарта.
+    # Шага "Cache pip dependencies" здесь НЕТ осознанно: job не устанавливает
+    # Python-зависимости (системный python3 используется только для YAML-валидации
+    # helm template). Пустой кэш-шаг под общим ключом был бы вреден: при cache miss
+    # самый быстрый job сохраняет кэш первым, и пустой ~/.cache/pip "отравил" бы
+    # общий ключ до изменения requirements*.
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -71,7 +84,15 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-          cache: pip
+          # Встроенный cache: pip НЕ используется: кэш ведёт явный шаг
+          # actions/cache ниже — единый ключ на все Python-джобы workflow.
+      - name: Cache pip dependencies
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ hashFiles('requirements.txt', 'requirements-dev.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-
       - name: Install dev dependencies
         run: |
           python -m pip install --upgrade pip
@@ -102,7 +123,15 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-          cache: pip
+          # Встроенный cache: pip НЕ используется: кэш ведёт явный шаг
+          # actions/cache ниже — единый ключ на все Python-джобы workflow.
+      - name: Cache pip dependencies
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ hashFiles('requirements.txt', 'requirements-dev.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-
       - name: Install pip-audit
         run: python -m pip install --upgrade pip pip-audit
       - name: pip-audit runtime requirements (BLOCKING)
@@ -165,6 +194,10 @@ jobs:
     runs-on: ubuntu-latest
     # После build: сканируем ГОТОВЫЙ runtime-образ (пересборка из тёплого
     # gha-кэша ~1-2 мин) параллельно с integration-test.
+    # Шага "Cache pip dependencies" здесь НЕТ осознанно: Python-зависимости не
+    # устанавливаются (Hadolint/Buildx/Trivy — внешние actions); pip внутри
+    # Docker-сборки кэшируется BuildKit cache-mounts через type=gha, а БД Trivy —
+    # отдельным шагом "Cache Trivy vulnerability DB" ниже.
     needs: build
     if: ${{ vars.SKIP_SECURITY_SCAN != 'true' }}
     steps:
@@ -223,7 +256,15 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-          cache: pip
+          # Встроенный cache: pip НЕ используется: кэш ведёт явный шаг
+          # actions/cache ниже — единый ключ на все Python-джобы workflow.
+      - name: Cache pip dependencies
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ hashFiles('requirements.txt', 'requirements-dev.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-
       - name: Install dependencies
         if: ${{ env.QWEN_API_KEY != '' || env.OPENAI_API_KEY != '' }}
         run: |
