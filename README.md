@@ -36,7 +36,7 @@ The agent is strictly **read-only by default**: it never mutates the cluster (`E
 | 🔁 **Chaos self-test** | `scripts/chaos_test.py` creates an ImagePullBackOff pod, asks the agent to diagnose it, asserts the RCA mentions "image"/"pull", and cleans up. Idempotent. |
 | ☸️ **Helm chart** | Production-ready `charts/ai-agent` (v0.1.0): Deployment with probes & non-root securityContext, ClusterIP Service, least-privilege RBAC, ConfigMap/Secret from `values.yaml`, `make helm-lint` / `make helm-install`. |
 | 🖥️ **Operator dashboard** | `make dashboard` — Streamlit UI over the audit journal: incident table (Timestamp/Namespace/Severity/Root Cause), severity metrics, and approval cards with `suggested_fix` + "Approve & Apply" for every `requires_approval` incident. |
-| 🧪 **Testing & CI/CD** | 265 unit/integration tests with mocked clients (93% coverage, CI gate `--cov-fail-under=85`, SentenceTransformer mocked so tests never download models), plus an offline **evaluation framework** (`make eval`) with a golden dataset and LLM-as-a-judge scoring; | GitHub Actions pipeline: lint → test+coverage → Docker build+smoke → kind-based e2e on `main` (auto-skipped when no LLM secret is configured). |
+| 🧪 **Testing & CI/CD** | 267 unit/integration tests with mocked clients (93% coverage, CI gate `--cov-fail-under=85`, SentenceTransformer mocked so tests never download models), plus an offline **evaluation framework** (`make eval`) with a golden dataset and LLM-as-a-judge scoring; | GitHub Actions pipeline: lint → test+coverage → Docker build+smoke → kind-based e2e on `main` (auto-skipped when no LLM secret is configured). |
 | 🐳 **Containerized** | Multi-stage `python:3.12-slim` image, non-root user, healthcheck, no secrets baked into the image. |
 
 ---
@@ -640,7 +640,7 @@ ai_agent_DevOps/
 │       └── text_utils.py        # truncate_context (bounded, JSON-safe)
 ├── charts/ai-agent/             # production Helm chart (v0.1.0): deployment,
 │                                # service, SA/RBAC, configmap, secret, helpers
-└── tests/                       # 265 tests, fully mocked externals
+└── tests/                       # 267 tests, fully mocked externals
 ```
 
 ---
