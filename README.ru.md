@@ -649,6 +649,10 @@ Workflow [`.github/workflows/ci.yml`](.github/workflows/ci.yml) запускае
 | `test` | `pytest --cov=src --cov-report=xml --cov-fail-under=85 tests/`, артефакт `coverage.xml` |
 | `build` | Сборка Docker-образа (`docker/build-push-action`, **без push**) + smoke-тест `/health` |
 | `integration-test` | kind-кластер + ImagePullBackOff + проверка `/diagnose` (только push в main / ручной запуск, параллельно с `build`; автоматически пропускается, если не задан secret `QWEN_API_KEY`/`OPENAI_API_KEY`) |
+| `dependency-audit` | pip-audit: блокирующий аудит runtime-зависимостей (`requirements.txt`); dev-зависимости — report-only (не входят в образ); параллельно с `test` |
+| `security-scan` | Hadolint (Dockerfile) + Trivy-скан готового образа (`CRITICAL,HIGH` → fail-fast, кэш БД уязвимостей); после `build`, параллельно с e2e |
+
+Security-сканирование отключается переменной репозитория `SKIP_SECURITY_SCAN=true` (dev-форки).
 
 `build` зависит от `test`, `test` — от `lint`: образ не собирается, если код
 не прошёл линтер или тесты красные.

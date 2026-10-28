@@ -1,5 +1,9 @@
 name: CI
 
+# Security-сканирование (dependency-audit, security-scan) отключается
+# репозиторной переменной SKIP_SECURITY_SCAN=true (Settings -> Secrets and
+# variables -> Actions -> Variables) для dev-форков; по умолчанию включено.
+#
 # Пропуск прогона: добавьте [skip ci] или [ci skip] в заголовок коммита
 # (нативная поддержка GitHub Actions) — полезно для docs-only правок.
 #
@@ -85,6 +89,32 @@ jobs:
           path: coverage.xml
           retention-days: 7
 
+  dependency-audit:
+    name: Dependency audit (pip-audit)
+    runs-on: ubuntu-latest
+    # Параллельно с test (both need lint): shift-left без удорожания critical path.
+    needs: lint
+    if: ${{ vars.SKIP_SECURITY_SCAN != 'true' }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Install pip-audit
+        run: python -m pip install --upgrade pip pip-audit
+      - name: pip-audit runtime requirements (BLOCKING)
+        # Блокирующий аудит ТОЛЬКО runtime-зависимостей (requirements.txt):
+        # dev-зависимости (ruff, pytest-cov, pytest-xdist) не попадают в
+        # runtime-образ (Dockerfile ставит только requirements.txt), поэтому
+        # их уязвимости не блокируют CI — см. следующий шаг (report-only).
+        run: pip-audit -r requirements.txt --progress-spinner off
+      - name: pip-audit dev requirements (report only, non-blocking)
+        continue-on-error: true
+        run: pip-audit -r requirements-dev.txt --progress-spinner off
+
   build:
     name: Build Docker image (no push)
     runs-on: ubuntu-latest
@@ -129,6 +159,51 @@ jobs:
             fi
           done
           docker stop agent-smoke
+
+  security-scan:
+    name: Security scan (Trivy image + Hadolint)
+    runs-on: ubuntu-latest
+    # После build: сканируем ГОТОВЫЙ runtime-образ (пересборка из тёплого
+    # gha-кэша ~1-2 мин) параллельно с integration-test.
+    needs: build
+    if: ${{ vars.SKIP_SECURITY_SCAN != 'true' }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      - name: Hadolint (Dockerfile best-practices lint)
+        uses: hadolint/hadolint-action@v3.1.0
+        with:
+          dockerfile: Dockerfile
+          failure-threshold: error
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+      - name: Rebuild image from warm GHA cache (scan target)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: false
+          load: true
+          tags: k8s-incident-agent:scan-${{ github.sha }}
+          cache-from: type=gha
+          # cache-to здесь НЕ нужен: кэш уже экспортировал job build.
+      - name: Cache Trivy vulnerability DB
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/trivy
+          key: trivy-db-${{ runner.os }}-${{ github.run_id }}
+          restore-keys: |
+            trivy-db-${{ runner.os }}-
+      - name: Trivy image scan (CRITICAL,HIGH -> fail-fast)
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: k8s-incident-agent:scan-${{ github.sha }}
+          format: table
+          exit-code: "1"
+          severity: CRITICAL,HIGH
+          # Не фиксируем уязвимости без доступного фикса (upstream-patched
+          # релиз закроет их сам); фиксящиеся CRITICAL/HIGH роняют CI.
+          ignore-unfixed: true
+          scanners: vuln,secret
 
   integration-test:
     name: E2E (kind cluster, ImagePullBackOff)

@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Security scanning in CI: job `dependency-audit` (pip-audit, блокирующий аудит
+  runtime-зависимостей; dev-зависимости report-only, т.к. не входят в образ)
+  параллельно с тестами; job `security-scan` после build (Hadolint Dockerfile +
+  Trivy-скан образа: severity CRITICAL,HIGH, exit-code 1, ignore-unfixed, кэш БД
+  Trivy через actions/cache; пересборка образа из тёплого gha-кэша) параллельно
+  с e2e; оба job отключаемы переменной `SKIP_SECURITY_SCAN=true`.
 - Precise token-based context control: `MAX_CONTEXT_CHARS` заменён на
   `MAX_CONTEXT_TOKENS` (default 4000); `truncate_context` и `estimate_tokens`
   используют tiktoken `cl100k_base` (fallback chars/4 offline), итеративно усекая
