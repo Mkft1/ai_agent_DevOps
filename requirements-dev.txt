@@ -1,11 +1,10 @@
 # Development/test dependencies (install on top of requirements.txt)
 #   pip install -r requirements-dev.txt
+# Строгий pinning: версии согласованы с CI (CPython 3.12).
 -r requirements.txt
 
-# Tests
-pytest
-pytest-cov
-httpx
+# Tests (pytest и httpx уже приходят из requirements.txt с пинами)
+pytest-cov==7.1.0
 
 # Lint (CI job: lint)
-ruff
+ruff==0.17.3

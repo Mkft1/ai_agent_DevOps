@@ -1,23 +1,32 @@
-fastapi
-uvicorn
-kubernetes
-prometheus-api-client
-python-dotenv
-pydantic
-pydantic-settings
-requests
-pytest
-tenacity
-prometheus-fastapi-instrumentator
-scikit-learn
-opentelemetry-api
-opentelemetry-sdk
-opentelemetry-instrumentation-fastapi
-opentelemetry-exporter-otlp
-sentence-transformers
-streamlit
-pandas
-httpx
-filelock
-slowapi
-tiktoken
+# Прямые зависимости приложения: строгий pinning (==) для воспроизводимости.
+# Набор версий = clean-resolve CPython 3.12 (target: CI ubuntu-latest и образ
+# python:3.12-slim), верифицирован зелёным CI-раном. Обновление: правим пин
+# намеренно (PR + прогон lint/test/e2e), а не «само подтянется».
+fastapi==0.162.0
+uvicorn==0.54.0
+kubernetes==37.0.1
+prometheus-api-client==0.7.2
+python-dotenv==1.2.4
+pydantic==2.14.1
+pydantic-settings==2.16.2
+requests==2.34.2
+pytest==9.2.0
+tenacity==9.2.1
+prometheus-fastapi-instrumentator==8.1.0
+scikit-learn==1.9.1
+opentelemetry-api==1.45.1
+opentelemetry-sdk==1.45.1
+opentelemetry-instrumentation-fastapi==0.66b1
+opentelemetry-exporter-otlp==1.45.1
+sentence-transformers==6.2.0
+streamlit==1.66.1
+pandas==3.1.0
+httpx==0.28.1
+filelock==4.2.4
+slowapi==0.1.10
+tiktoken==0.14.0
+# torch: в Dockerfile ставится ПЕРВЫМ из CPU-индекса
+# (--index-url https://download.pytorch.org/whl/cpu, wheel 2.14.1+cpu);
+# по PEP 440 локальная метка +cpu удовлетворяет_specifier'у ==2.14.1, поэтому
+# pip в requirements-слое видит зависимость закрытой и НЕ тянет CUDA-сборку.
+torch==2.14.1
