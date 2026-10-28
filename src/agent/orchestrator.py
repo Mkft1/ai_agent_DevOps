@@ -10,12 +10,13 @@ LLM: по умолчанию используется реальный клие�
 
 from __future__ import annotations
 
+import asyncio
 import json
 import time
 from pathlib import Path
 from typing import Any, Protocol, runtime_checkable
 
-import requests
+import httpx
 from opentelemetry import trace
 from opentelemetry.trace import StatusCode
 from pydantic import BaseModel, Field, ValidationError
@@ -318,7 +319,14 @@ class IncidentOrchestrator:
     # Основной цикл диагностики
     # ------------------------------------------------------------------
     def diagnose(self, incident: dict | Incident) -> dict:
-        """Публичный вход диагностики с Prometheus-метриками.
+        """Синхронный фасад для тестов/eval/скриптов: ``asyncio.run(adiagnose(...))``.
+
+        В async-окружении (FastAPI-эндпоинты) используйте :meth:`adiagnose`.
+        """
+        return asyncio.run(self.adiagnose(incident))
+
+    async def adiagnose(self, incident: dict | Incident) -> dict:
+        """Публичный вход диагностики с Prometheus-метриками (async).
 
         Оборачивает :meth:`_diagnose_impl` в таймер ``diagnose_duration_seconds``
         (label namespace), после получения
@@ -339,7 +347,7 @@ class IncidentOrchestrator:
         with tracer.start_as_current_span("incident.diagnose") as span:
             span.set_attribute("incident.namespace", str(ns or "unknown"))
             try:
-                result = self._diagnose_impl(incident)
+                result = await self._diagnose_impl(incident)
             finally:
                 observe_diagnose_duration(ns, time.perf_counter() - started)
             span.set_attribute("incident.severity", str(result.get("severity", "unknown")))
@@ -347,7 +355,7 @@ class IncidentOrchestrator:
         inc_diagnose_request(ns, result.get("severity"))
         return result
 
-    def _diagnose_impl(self, incident: dict | Incident) -> dict:
+    async def _diagnose_impl(self, incident: dict | Incident) -> dict:
         """Диагностировать инцидент и вернуть диагноз (dict для API-слоя).
 
         Шаги:
@@ -383,7 +391,9 @@ class IncidentOrchestrator:
         with tracer.start_as_current_span("k8s.get_pods") as span:
             span.set_attribute("k8s.namespace", incident.namespace)
             try:
-                pods = self.k8s.get_pods(namespace=incident.namespace)
+                pods = await asyncio.to_thread(
+                    self.k8s.get_pods, namespace=incident.namespace
+                )
                 span.set_attribute("k8s.pods_found", len(pods))
             except Exception as exc:  # защита от непредвиденных ошибок инструмента
                 span.record_exception(exc)
@@ -445,7 +455,9 @@ class IncidentOrchestrator:
                 with tracer.start_as_current_span("k8s.get_events") as span:
                     span.set_attribute("k8s.namespace", incident.namespace)
                     try:
-                        events = self.k8s.get_events(namespace=incident.namespace)
+                        events = await asyncio.to_thread(
+                            self.k8s.get_events, namespace=incident.namespace
+                        )
                         span.set_attribute("k8s.events_found", len(events))
                     except Exception as exc:
                         span.record_exception(exc)
@@ -467,8 +479,10 @@ class IncidentOrchestrator:
             with tracer.start_as_current_span("prometheus.pod_cpu") as span:
                 span.set_attribute("k8s.pod", target_pod)
                 try:
-                    cpu = self.prometheus.get_pod_cpu_usage(
-                        namespace=incident.namespace, pod_name=target_pod
+                    cpu = await asyncio.to_thread(
+                        self.prometheus.get_pod_cpu_usage,
+                        namespace=incident.namespace,
+                        pod_name=target_pod,
                     )
                 except Exception as exc:
                     span.record_exception(exc)
@@ -478,8 +492,10 @@ class IncidentOrchestrator:
             with tracer.start_as_current_span("prometheus.pod_memory") as span:
                 span.set_attribute("k8s.pod", target_pod)
                 try:
-                    mem = self.prometheus.get_pod_memory_usage(
-                        namespace=incident.namespace, pod_name=target_pod
+                    mem = await asyncio.to_thread(
+                        self.prometheus.get_pod_memory_usage,
+                        namespace=incident.namespace,
+                        pod_name=target_pod,
                     )
                 except Exception as exc:
                     span.record_exception(exc)
@@ -498,8 +514,11 @@ class IncidentOrchestrator:
                 span.set_attribute("k8s.pod", target_pod)
                 span.set_attribute("logs.tail_lines", tail_lines)
                 try:
-                    log_text = self.logs.get_pod_logs(
-                        namespace=incident.namespace, pod_name=target_pod, tail_lines=tail_lines
+                    log_text = await asyncio.to_thread(
+                        self.logs.get_pod_logs,
+                        namespace=incident.namespace,
+                        pod_name=target_pod,
+                        tail_lines=tail_lines,
                     )
                     span.set_attribute("logs.bytes", len(log_text or ""))
                 except Exception as exc:
@@ -517,8 +536,9 @@ class IncidentOrchestrator:
             with tracer.start_as_current_span("rag.search") as span:
                 span.set_attribute("rag.top_k", RAG_TOP_K)
                 try:
-                    runbooks = self.rag.find_relevant(
-                        self._build_rag_query(context, log_text), top_k=RAG_TOP_K
+                    rag_query = self._build_rag_query(context, log_text)
+                    runbooks = await asyncio.to_thread(
+                        self.rag.find_relevant, rag_query, top_k=RAG_TOP_K
                     )
                     span.set_attribute("rag.matches", len(runbooks))
                 except Exception as exc:
@@ -547,7 +567,9 @@ class IncidentOrchestrator:
         with tracer.start_as_current_span("llm.generate") as span:
             span.set_attribute("llm.model", self.settings.llm_model)
             try:
-                diagnosis_dict, llm_raw = self._query_llm(context, user_prompt)
+                diagnosis_dict, llm_raw = await asyncio.to_thread(
+                    self._query_llm, context, user_prompt
+                )
                 span.set_attribute("llm.ok", True)
                 span.set_attribute("llm.response_chars", len(llm_raw or ""))
             except Exception as exc:
@@ -572,7 +594,7 @@ class IncidentOrchestrator:
         result.requires_approval = check_policy(result.suggested_fix, self.settings)
         if result.requires_approval:
             inc_approval_request()
-            self._notify_slack_approval(result.suggested_fix)
+            await self._notify_slack_approval(result.suggested_fix)
 
         logger.info(
             "Diagnosis complete: severity=%s, warnings=%d, requires_approval=%s",
@@ -582,12 +604,13 @@ class IncidentOrchestrator:
         )
         return result.model_dump()
 
-    def _notify_slack_approval(self, suggested_fix: str) -> None:
+    async def _notify_slack_approval(self, suggested_fix: str) -> None:
         """Отправить запрос аппрува опасной рекомендации в Slack (incoming webhook).
 
-        Graceful degradation: без ``SLACK_WEBHOOK_URL`` — только WARNING в логах
-        (диагноз всё равно помечен ``requires_approval=true``); ошибка отправки
-        не роняет диагностику.
+        Асинхронно (``httpx.AsyncClient``, timeout 5 c): не блокирует event loop
+        FastAPI во время alert-штормов. Graceful degradation: без
+        ``SLACK_WEBHOOK_URL`` — только WARNING в логах (диагноз всё равно
+        помечен ``requires_approval=true``); ошибка отправки не роняет диагностику.
         """
         webhook = self.settings.slack_webhook_url
         message = (
@@ -602,10 +625,9 @@ class IncidentOrchestrator:
             )
             return
         try:
-            resp = requests.post(
-                webhook, json={"text": message}, timeout=SLACK_TIMEOUT_SECONDS
-            )
-            resp.raise_for_status()
+            async with httpx.AsyncClient(timeout=SLACK_TIMEOUT_SECONDS) as client:
+                resp = await client.post(webhook, json={"text": message})
+                resp.raise_for_status()
             logger.info("Slack approval request sent (HTTP %s)", resp.status_code)
         except Exception as exc:  # noqa: BLE001 - Slack недоступен не роняет диагноз
             logger.error("Failed to send Slack approval request: %s", exc)

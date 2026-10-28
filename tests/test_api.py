@@ -6,7 +6,7 @@ Kubernetes / Prometheus / LLM нет.
 
 from __future__ import annotations
 
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from fastapi.testclient import TestClient
@@ -33,7 +33,7 @@ SAMPLE_DIAGNOSIS = {
 def mock_orchestrator() -> MagicMock:
     """Заменить реальный оркестратор моком через dependency override."""
     orch = MagicMock(spec=IncidentOrchestrator)
-    orch.diagnose.return_value = dict(SAMPLE_DIAGNOSIS)
+    orch.adiagnose.return_value = dict(SAMPLE_DIAGNOSIS)
     orch.format_report.return_value = "[report] severity=high"
     app.dependency_overrides[get_orchestrator] = lambda: orch
     yield orch
@@ -74,8 +74,8 @@ class TestDiagnose:
         assert diag["evidence"] == SAMPLE_DIAGNOSIS["evidence"]
 
         # Эндпоинт не дублирует логику — просто делегирует оркестратору.
-        mock_orchestrator.diagnose.assert_called_once()
-        incident = mock_orchestrator.diagnose.call_args.args[0]
+        mock_orchestrator.adiagnose.assert_called_once()
+        incident = mock_orchestrator.adiagnose.call_args.args[0]
         assert incident.namespace == "prod"
         assert incident.pod_name == "web-1"
         assert incident.description == "Pod restarts alert"
@@ -87,7 +87,7 @@ class TestDiagnose:
         """Можно прислать только description — остальные поля по умолчанию."""
         resp = client.post("/diagnose", json={"description": "cpu high"})
         assert resp.status_code == 200
-        incident = mock_orchestrator.diagnose.call_args.args[0]
+        incident = mock_orchestrator.adiagnose.call_args.args[0]
         assert incident.namespace == "default"
         assert incident.pod_name is None
 
@@ -97,13 +97,13 @@ class TestDiagnose:
         """Несовместимый тип поля -> pydantic-валидация FastAPI (422), оркестратор не трогается."""
         resp = client.post("/diagnose", json={"namespace": {"bad": "dict"}})
         assert resp.status_code == 422
-        mock_orchestrator.diagnose.assert_not_called()
+        mock_orchestrator.adiagnose.assert_not_called()
 
     def test_diagnose_orchestrator_crash_returns_500(
         self, client: TestClient, mock_orchestrator: MagicMock
     ) -> None:
         """Исключение внутри diagnose() -> 500 с detail, приложение не падает."""
-        mock_orchestrator.diagnose.side_effect = RuntimeError("LLM unavailable")
+        mock_orchestrator.adiagnose.side_effect = RuntimeError("LLM unavailable")
         resp = client.post("/diagnose", json={"description": "x"})
         assert resp.status_code == 500
         assert "LLM unavailable" in resp.json()["detail"]
@@ -120,7 +120,7 @@ class TestDiagnose:
 class TestReady:
     def test_ready_all_ok_returns_200(self, client: TestClient) -> None:
         with patch("src.main._check_kubernetes", return_value="ok"), patch(
-            "src.main._check_prometheus", return_value="ok"
+            "src.main._check_prometheus", new=AsyncMock(return_value="ok")
         ):
             resp = client.get("/ready")
         assert resp.status_code == 200
@@ -130,7 +130,7 @@ class TestReady:
 
     def test_ready_prometheus_down_returns_503(self, client: TestClient) -> None:
         with patch("src.main._check_kubernetes", return_value="ok"), patch(
-            "src.main._check_prometheus", return_value="unavailable: timeout"
+            "src.main._check_prometheus", new=AsyncMock(return_value="unavailable: timeout")
         ):
             resp = client.get("/ready")
         assert resp.status_code == 503
@@ -138,21 +138,44 @@ class TestReady:
         assert resp.json()["checks"]["prometheus"].startswith("unavailable")
 
     def test_check_prometheus_http_layer(self) -> None:
-        """_check_prometheus реально делает GET /-/ready и трактует код статуса."""
+        """_check_prometheus асинхронно делает GET /-/ready и трактует код статуса."""
+        import asyncio
+
+        import httpx
+
         from src.config import get_settings
         from src.main import _check_prometheus
 
-        with patch("src.main.requests.get") as get:
-            get.return_value = MagicMock(status_code=200)
-            assert _check_prometheus(get_settings()) == "ok"
-            url = get.call_args.args[0]
-            assert url.endswith("/-/ready")
+        calls: list[str] = []
 
-            get.return_value = MagicMock(status_code=503)
-            assert "HTTP 503" in _check_prometheus(get_settings())
+        class FakeClient:
+            def __init__(self, timeout=None, status=200, exc=None):
+                self.timeout = timeout
+                self._status = status
+                self._exc = exc
 
-            get.side_effect = Exception("connection refused")
-            assert "unavailable" in _check_prometheus(get_settings())
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *exc_info):
+                return False
+
+            async def get(self, url):
+                calls.append(url)
+                if self._exc:
+                    raise self._exc
+                return MagicMock(status_code=self._status)
+
+        with patch("src.main.httpx.AsyncClient", FakeClient):
+            assert asyncio.run(_check_prometheus(get_settings())) == "ok"
+            assert calls[0].endswith("/-/ready")
+
+        with patch("src.main.httpx.AsyncClient", lambda **kw: FakeClient(status=503)):
+            assert "HTTP 503" in asyncio.run(_check_prometheus(get_settings()))
+
+        exc = httpx.ConnectError("connection refused")
+        with patch("src.main.httpx.AsyncClient", lambda **kw: FakeClient(exc=exc)):
+            assert "unavailable" in asyncio.run(_check_prometheus(get_settings()))
 
 
 class TestCORSAndHandlers:
@@ -173,7 +196,7 @@ class TestGuardrailsAPI:
 
     def test_diagnose_disallowed_namespace_returns_403(self, client):
         orch = MagicMock(spec=IncidentOrchestrator)
-        orch.diagnose.side_effect = NamespaceNotAllowedError(
+        orch.adiagnose.side_effect = NamespaceNotAllowedError(
             "Namespace 'kube-system' not allowed."
         )
         app.dependency_overrides[get_orchestrator] = lambda: orch

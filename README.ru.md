@@ -2,6 +2,9 @@
   <a href="./README.md"><b>🇬🇧 English </b></a> &nbsp;|&nbsp; <a href="./README.ru.md"><b>🇷 Русский</b></a>
 </p>
 
+| Интерактивный дашборд | Документация API (Swagger) |
+|---|---|
+| ![Dashboard](docs/assets/dashboard.png) | ![Swagger](docs/assets/swagger.png) |
 
 <h1 align="center">ИИ-агент для диагностики инцидентов в K8s</h1>
 

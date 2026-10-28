@@ -11,11 +11,12 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import uuid
 
-import requests
+import httpx
 from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
@@ -345,15 +346,18 @@ def _check_kubernetes(s: Settings) -> str:
         return f"unavailable: {exc}"
 
 
-def _check_prometheus(s: Settings) -> str:
+async def _check_prometheus(s: Settings) -> str:
     """Лёгкая проверка доступности Prometheus (GET /-/ready, таймаут 3 с).
+
+    Асинхронно (``httpx.AsyncClient``): не блокирует event loop FastAPI.
 
     Returns:
         "ok" | "unavailable: <причина>".
     """
     url = s.prometheus_url.rstrip("/") + "/-/ready"
     try:
-        resp = requests.get(url, timeout=3)
+        async with httpx.AsyncClient(timeout=3.0) as client:
+            resp = await client.get(url)
         if resp.status_code == 200:
             return "ok"
         return f"unavailable: HTTP {resp.status_code}"
@@ -369,15 +373,17 @@ def _check_prometheus(s: Settings) -> str:
     description="Readiness probe. Checks K8s API and Prometheus connectivity.",
     response_model=ReadyResponse,
 )
-def ready() -> JSONResponse:
+async def ready() -> JSONResponse:
     """Проверка готовности: доступность K8s API и Prometheus.
 
     Возвращает 200, если обе зависимости доступны, иначе 503. Тело ответа
-    содержит статус каждой проверки.
+    содержит статус каждой проверки. Prometheus опрашивается асинхронно
+    (httpx), K8s-проверка (sync-клиент) вынесена в worker-поток, чтобы не
+    блокировать event loop.
     """
     checks = {
-        "kubernetes": _check_kubernetes(settings),
-        "prometheus": _check_prometheus(settings),
+        "kubernetes": await asyncio.to_thread(_check_kubernetes, settings),
+        "prometheus": await _check_prometheus(settings),
     }
     all_ok = all(v == "ok" for v in checks.values())
     body = ReadyResponse(status="ready" if all_ok else "degraded", checks=checks)
@@ -395,7 +401,7 @@ def ready() -> JSONResponse:
     "Cause Analysis (RCA) in JSON format.",
     response_model=DiagnosisResponse,
 )
-def diagnose(
+async def diagnose(
     payload: DiagnoseRequest,
     orchestrator: IncidentOrchestrator = Depends(get_orchestrator),
 ) -> DiagnosisResponse:
@@ -406,7 +412,7 @@ def diagnose(
     """
     incident = payload.to_incident()
     try:
-        diagnosis_dict = orchestrator.diagnose(incident)
+        diagnosis_dict = await orchestrator.adiagnose(incident)
     except NamespaceNotAllowedError as exc:
         # Guardrail: запрещённый namespace — запрос не выполняется.
         logger.warning("Guardrail rejected incident: %s", exc)
@@ -443,7 +449,7 @@ def diagnose(
     "and triggers diagnosis automatically.",
     response_model=AlertmanagerWebhookResponse,
 )
-def webhook_alertmanager(
+async def webhook_alertmanager(
     payload: AlertmanagerPayload,
     orchestrator: IncidentOrchestrator = Depends(get_orchestrator),
 ) -> AlertmanagerWebhookResponse:
@@ -483,7 +489,7 @@ def webhook_alertmanager(
             alert.fingerprint,
         )
         try:
-            diagnosis_dict = orchestrator.diagnose(incident)
+            diagnosis_dict = await orchestrator.adiagnose(incident)
         except NamespaceNotAllowedError as exc:
             # Guardrail: запрещённый namespace — алерт пропускаем, не роняем батч.
             logger.warning("Guardrail rejected alert: %s", exc)
