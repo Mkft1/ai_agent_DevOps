@@ -7,6 +7,22 @@ name: CI
 # Пропуск прогона: добавьте [skip ci] или [ci skip] в заголовок коммита
 # (нативная поддержка GitHub Actions) — полезно для docs-only правок.
 #
+# Версии actions (проверено 2026-10-19 по runs.using в action.yml каждого тега):
+# все JS-actions переведены на мажоры с runtime node24 — GitHub депрецировал
+# Node.js 20 (changelog 2025-09-19) и выдавал warning в Annotations для
+# checkout@v4 / setup-python@v5 / cache@v4 / upload-artifact@v4 /
+# setup-buildx-action@v3 / build-push-action@v6. Нюанс: upload-artifact
+# по умолчанию на node24 только начиная с v6 (v5 всё ещё таргетит node20).
+# hadolint-action@v3.1.0 (актуальный тег задачи) и trivy-action@master
+# оставлены как есть: это docker/composite-actions без node-рантайма,
+# предупреждений они не дают.
+#
+# Раннер зафиксирован на ubuntu-24.04: метка ubuntu-latest мигрирует на
+# Ubuntu 26 начиная 2026-10-19 (actions/runner-images#14748), из-за чего в
+# Annotations висел notice. Пиннинг убирает notice и даёт воспроизводимость
+# (e2e c kind чувствителен к версиям docker/kind из образа раннера).
+# Пересмотреть пиннинг, когда Ubuntu 26 стабилизируется в ubuntu-latest.
+#
 # Топология пайплайна (цель 5-6 минут):
 #   PR:  lint ─┐
 #        helm ─┼─> test (pytest-xdist)                     -> финиш
@@ -27,18 +43,18 @@ concurrency:
 jobs:
   lint:
     name: Lint (ruff)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
       - name: Set up Python 3.12
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v7
         with:
           python-version: "3.12"
           # Встроенный cache: pip НЕ используется: кэш ведёт явный шаг
           # actions/cache ниже — единый ключ на все Python-джобы workflow.
       - name: Cache pip dependencies
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: ~/.cache/pip
           key: ${{ runner.os }}-pip-${{ hashFiles('requirements.txt', 'requirements-dev.txt') }}
@@ -53,7 +69,7 @@ jobs:
 
   helm:
     name: Helm lint & template
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     # Параллельно с lint (без needs): быстрый независимый гейт чарта.
     # Шага "Cache pip dependencies" здесь НЕТ осознанно: job не устанавливает
     # Python-зависимости (системный python3 используется только для YAML-валидации
@@ -62,7 +78,7 @@ jobs:
     # общий ключ до изменения requirements*.
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
       - name: Install Helm
         run: curl -fsSL https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
       - name: helm lint
@@ -74,20 +90,20 @@ jobs:
 
   test:
     name: Tests (pytest + coverage, xdist)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     # Зависит только от lint (fast-gate: не греем раннер тестами при битом линтере).
     needs: lint
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
       - name: Set up Python 3.12
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v7
         with:
           python-version: "3.12"
           # Встроенный cache: pip НЕ используется: кэш ведёт явный шаг
           # actions/cache ниже — единый ключ на все Python-джобы workflow.
       - name: Cache pip dependencies
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: ~/.cache/pip
           key: ${{ runner.os }}-pip-${{ hashFiles('requirements.txt', 'requirements-dev.txt') }}
@@ -104,7 +120,7 @@ jobs:
       - name: Docs metrics drift guard (README vs pytest)
         run: python scripts/check_docs_metrics.py
       - name: Upload coverage report
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: coverage-xml
           path: coverage.xml
@@ -112,21 +128,21 @@ jobs:
 
   dependency-audit:
     name: Dependency audit (pip-audit)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     # Параллельно с test (both need lint): shift-left без удорожания critical path.
     needs: lint
     if: ${{ vars.SKIP_SECURITY_SCAN != 'true' }}
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
       - name: Set up Python 3.12
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v7
         with:
           python-version: "3.12"
           # Встроенный cache: pip НЕ используется: кэш ведёт явный шаг
           # actions/cache ниже — единый ключ на все Python-джобы workflow.
       - name: Cache pip dependencies
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: ~/.cache/pip
           key: ${{ runner.os }}-pip-${{ hashFiles('requirements.txt', 'requirements-dev.txt') }}
@@ -146,18 +162,18 @@ jobs:
 
   build:
     name: Build Docker image (no push)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     needs: [test, helm]
     # На PR образ не собираем (lint+test+helm дают быстрый фидбек); полная
     # сборка со smoke-тестом — на push в main и workflow_dispatch.
     if: github.event_name != 'pull_request'
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@v4
       - name: Build image (validation only, no push)
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@v7
         with:
           context: .
           push: false
@@ -191,7 +207,7 @@ jobs:
 
   security-scan:
     name: Security scan (Trivy image + Hadolint)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     # После build: сканируем ГОТОВЫЙ runtime-образ (пересборка из тёплого
     # gha-кэша ~1-2 мин) параллельно с integration-test.
     # Шага "Cache pip dependencies" здесь НЕТ осознанно: Python-зависимости не
@@ -202,16 +218,16 @@ jobs:
     if: ${{ vars.SKIP_SECURITY_SCAN != 'true' }}
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
       - name: Hadolint (Dockerfile best-practices lint)
         uses: hadolint/hadolint-action@v3.1.0
         with:
           dockerfile: Dockerfile
           failure-threshold: error
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@v4
       - name: Rebuild image from warm GHA cache (scan target)
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@v7
         with:
           context: .
           push: false
@@ -220,7 +236,7 @@ jobs:
           cache-from: type=gha
           # cache-to здесь НЕ нужен: кэш уже экспортировал job build.
       - name: Cache Trivy vulnerability DB
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: ~/.cache/trivy
           key: trivy-db-${{ runner.os }}-${{ github.run_id }}
@@ -240,7 +256,7 @@ jobs:
 
   integration-test:
     name: E2E (kind cluster, ImagePullBackOff)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     # e2e валидирует ИСХОДНИКИ агента (uvicorn из репозитория), а не образ —
     # поэтому ждём только test и идём ПАРАЛЛЕЛЬНО с build (экономия ~3 минуты).
     needs: [test]
@@ -251,15 +267,15 @@ jobs:
       OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
       - name: Set up Python 3.12
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v7
         with:
           python-version: "3.12"
           # Встроенный cache: pip НЕ используется: кэш ведёт явный шаг
           # actions/cache ниже — единый ключ на все Python-джобы workflow.
       - name: Cache pip dependencies
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: ~/.cache/pip
           key: ${{ runner.os }}-pip-${{ hashFiles('requirements.txt', 'requirements-dev.txt') }}
