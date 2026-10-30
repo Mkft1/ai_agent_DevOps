@@ -1,0 +1,170 @@
+name: Cache Cleanup
+
+# Еженедельная чистка кэшей GitHub Actions (лимит 10 GB на репозиторий).
+# Источники роста кэшей (по инвентаризации 2026-10-29, 23 кэша / 4.6 GB):
+# - каждый PR, меняющий requirements.txt, сохраняет дубль pip-кэша (~3 GB)
+#   в скоупе refs/pull/N/merge — после мержа ветка удаляется, кэш остаётся
+#   сиротой до автоэвикции GitHub (7 дней без обращений + LRU);
+# - buildkit cache-to mode=max создаёт новые поколения блобов на каждый push;
+# - trivy-action кэширует БД уязвимостей ключом cache-trivy-YYYY-MM-DD
+#   (~97 MB/день, ключ меняется ежедневно).
+#
+# Что удаляет workflow:
+# 1. кэши закрытых/смерженных PR (refs/pull/N/merge);
+# 2. кэши удалённых веток (refs/heads/*, кроме main);
+# 3. устаревшие кэши БД Trivy (cache-trivy-*): 2 самых свежих сохраняются.
+#
+# Что НЕ удаляет:
+# - кэши ветки main (Linux-pip-*, buildkit-*) — они нужны основному CI,
+#   даже если давно не использовались;
+# - кэши, созданные ИЛИ использованные менее 48 часов назад (защита от
+#   удаления активных записей, например во время CI на открытом PR);
+#   для Trivy возраст проверяется по created_at: fallback restore-keys
+#   обновляет last_accessed_at дневных ключей при каждом прогоне, и защита
+#   по last_accessed_at заблокировала бы ротацию БД навсегда;
+# - ничего при ошибках API (fail-safe: HTTP 404 трактуем как «сущность
+#   удалена», сетевые ошибки/rate limit — как повод ПРОПУСТИТЬ удаление).
+#
+# Удаление выполняется по cache id (DELETE /actions/caches/{cache_id}):
+# ключи кэшей не уникальны между скоупами refs, удаление по ключу задело бы
+# чужие записи.
+#
+# Триггер schedule срабатывает только из default-ветки (main) — до мержа
+# workflow можно запускать вручную через workflow_dispatch (Actions -> Cache
+# Cleanup -> Run workflow, выбрав ветку).
+
+on:
+  schedule:
+    - cron: '0 3 * * 0'  # Воскресенье 03:00 UTC
+  workflow_dispatch:
+
+permissions:
+  actions: write       # DELETE /repos/{repo}/actions/caches/{id}
+  contents: read       # проверка существования веток
+  pull-requests: read  # проверка состояния PR
+
+jobs:
+  cleanup:
+    name: Delete orphaned and stale caches
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+
+      - name: Delete orphaned caches
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          # --- Защита «не старше 48 часов» -------------------------------
+          CUTOFF=$(( $(date +%s) - 48 * 3600 ))
+
+          # rc=0 — кэш свежий (оставить), rc=1 — старше 48h (можно удалять).
+          # Ошибка парсинга даты -> rc=0 (fail-safe: сомневаешься — оставь).
+          is_fresh() {  # $1=created_at $2=last_accessed_at
+            local c l
+            c=$(date -u -d "$1" +%s 2>/dev/null) || return 0
+            l=$(date -u -d "$2" +%s 2>/dev/null) || return 0
+            [ "$c" -ge "$CUTOFF" ] && return 0
+            [ "$l" -ge "$CUTOFF" ] && return 0
+            return 1
+          }
+          # Для Trivy-кэшей — только по created_at (см. пояснение в шапке).
+          is_fresh_created() {  # $1=created_at
+            local c
+            c=$(date -u -d "$1" +%s 2>/dev/null) || return 0
+            [ "$c" -ge "$CUTOFF" ] && return 0
+            return 1
+          }
+
+          # GET одного поля через gh api. Устанавливает RESULT в одно из:
+          # "<значение>" / "not_found" (HTTP 404) / "api_error" (прочее).
+          # При api_error вызывающий код обязан ПРОПУСТИТЬ удаление.
+          api_field() {  # $1=API-path $2=--jq-фильтр
+            local err rc out
+            err=$(mktemp)
+            out=$(gh api "$1" --jq "$2" 2>"$err") && rc=0 || rc=$?
+            if [ "$rc" -eq 0 ]; then
+              RESULT="$out"
+            elif grep -q "HTTP 404" "$err"; then
+              RESULT="not_found"
+            else
+              RESULT="api_error"
+            fi
+            rm -f "$err"
+          }
+
+          delete_cache() {  # $1=id $2=причина $3=size_in_bytes
+            echo "Deleting cache $1 ($2, size=$(( $3 / 1024 / 1024 ))MB)"
+            gh api "repos/$GITHUB_REPOSITORY/actions/caches/$1" \
+              --method DELETE || true
+          }
+
+          echo "=== Fetching all caches ==="
+          CACHES=$(gh api "repos/$GITHUB_REPOSITORY/actions/caches" --paginate \
+            --jq '.actions_caches[] | "\(.id)\t\(.ref)\t\(.created_at)\t\(.last_accessed_at)\t\(.size_in_bytes)"')
+
+          echo "=== Deleting orphaned PR caches (closed/merged PRs) ==="
+          echo "$CACHES" | while IFS=$'\t' read -r id ref created last size; do
+            if [[ "$ref" =~ ^refs/pull/([0-9]+)/merge$ ]]; then
+              pr_number="${BASH_REMATCH[1]}"
+              # Проверяем, закрыт ли PR
+              api_field "repos/$GITHUB_REPOSITORY/pulls/$pr_number" '.state'
+              case "$RESULT" in
+                closed|not_found)
+                  if is_fresh "$created" "$last"; then
+                    echo "Keeping fresh cache $id (PR #$pr_number, state=$RESULT, <48h)"
+                  else
+                    delete_cache "$id" "PR #$pr_number, state=$RESULT" "$size"
+                  fi
+                  ;;
+                api_error)
+                  echo "Skipping cache $id (PR #$pr_number): API error, keeping"
+                  ;;
+              esac
+            fi
+          done
+
+          echo "=== Deleting caches for deleted branches ==="
+          echo "$CACHES" | while IFS=$'\t' read -r id ref created last size; do
+            if [[ "$ref" =~ ^refs/heads/(.+)$ ]]; then
+              branch="${BASH_REMATCH[1]}"
+              # Кэши main не трогаем ни при каких условиях
+              if [ "$branch" = "main" ]; then
+                continue
+              fi
+              # Проверяем, существует ли ветка
+              api_field "repos/$GITHUB_REPOSITORY/branches/$branch" '.name'
+              case "$RESULT" in
+                not_found)
+                  if is_fresh "$created" "$last"; then
+                    echo "Keeping fresh cache $id (branch=$branch deleted, <48h)"
+                  else
+                    delete_cache "$id" "branch=$branch deleted" "$size"
+                  fi
+                  ;;
+                api_error)
+                  echo "Skipping cache $id (branch=$branch): API error, keeping"
+                  ;;
+              esac
+            fi
+          done
+
+          echo "=== Deleting old Trivy caches (keep 2 most recent) ==="
+          gh api "repos/$GITHUB_REPOSITORY/actions/caches" --paginate \
+            --jq '.actions_caches[] | select(.key | test("^cache-trivy-")) | "\(.id)\t\(.key)\t\(.created_at)\t\(.size_in_bytes)"' \
+            | sort -t$'\t' -k3 -r \
+            | tail -n +3 \
+            | while IFS=$'\t' read -r id key created size; do
+                if is_fresh_created "$created"; then
+                  echo "Keeping fresh Trivy cache $id ($key, <48h)"
+                else
+                  delete_cache "$id" "old Trivy DB $key" "$size"
+                fi
+              done
+
+          echo "=== Cleanup complete ==="
+          gh api "repos/$GITHUB_REPOSITORY/actions/caches" --paginate \
+            --jq '[.actions_caches[].size_in_bytes] | (add // 0) / 1024 / 1024 / 1024' \
+            | xargs -I {} echo "Total cache usage: {} GB"
