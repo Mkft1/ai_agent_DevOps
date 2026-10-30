@@ -35,6 +35,17 @@ on:
   pull_request:
     branches: [main]
   workflow_dispatch:
+    # reason виден в UI рана (секция "Workflow inputs") и в payload события.
+    # Важно: GitHub ОТВЕРГАЕТ dispatch с ключами, не объявленными в workflow
+    # (422 "Unexpected inputs provided: [reason]" — проверено эмпирически
+    # 2026-10-30), поэтому секция inputs обязательна для работы
+    # scripts/verify_ci_cache.sh, который шлёт `-f reason="cache-verification"`.
+    inputs:
+      reason:
+        description: "Причина ручного запуска (cache-verification — от scripts/verify_ci_cache.sh)"
+        type: string
+        required: false
+        default: "manual"
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
