@@ -332,6 +332,8 @@ default; set `RATE_LIMIT_REDIS_URL` to share counters across API replicas).
 Exceeding the limit returns **429** with `{"detail": "Rate limit exceeded. Please retry later."}`
 and a `Retry-After` header. Liveness/readiness probes (`/health`, `/ready`) are
 never limited — Kubernetes must always be able to check the pod.
+Automated proof that the limits work: `make load-test` — a Locust scenario verifying
+429 on `/diagnose` overload (see [Testing → Load Testing](#load-testing-rate-limit-verification)).
 
 ## Security & Policy-as-Code
 
@@ -493,6 +495,39 @@ tests/
   тестов/покрытия в этом README с реальным прогоном — расхождение роняет CI.
 - **Integration (end-to-end)**: `scripts/run_integration_test.sh` spins up a real [kind](https://kind.sigs.k8s.io/) cluster, creates a pod with a bad image tag, runs the agent under uvicorn, sends a real `POST /diagnose`, and asserts the RCA mentions *"image"*/*"pull"* (via `jq`). Idempotent: leftover clusters/pods are removed before each run; cleanup happens even on failure.
 - **CI jobs** (GitHub Actions, target 5-6 min): `lint` and `helm` run **in parallel**; `test` (pytest **-n auto** via pytest-xdist, coverage gate ≥85%, docs drift-guard) needs only `lint`; on push to `main`/dispatch, `build` (Docker + smoke, needs [test, helm], BuildKit gha-cache `mode=max` + pip cache-mounts; NOT run on PRs) and `integration-test` (kind e2e, needs only test, runs **parallel to build**, gracefully skipped without `QWEN_API_KEY`/`OPENAI_API_KEY` secret) finish the pipeline. PRs run lint+helm+test+dependency-audit for fast feedback; `[skip ci]` in a commit title skips the run. Security layer: `dependency-audit` (pip-audit, blocking on runtime `requirements.txt`, dev-deps report-only) runs parallel to tests, and `security-scan` (Hadolint + Trivy image scan, `CRITICAL,HIGH` fail-fast, cached Trivy DB) runs after build parallel to e2e; both are skippable via repo variable `SKIP_SECURITY_SCAN=true`.
+
+### Load Testing (rate-limit verification)
+
+[`scripts/load_test.py`](scripts/load_test.py) (Locust) is the automated proof that the
+slowapi limits actually work: under overload `POST /diagnose` returns **429**, the app
+does not crash (no 5xx), and `GET /health` stays unrestricted.
+
+```bash
+make install     # once: installs locust (requirements-dev.txt)
+make run         # terminal 1 — the agent on http://localhost:8000
+make load-test   # terminal 2 — locust headless: 10 users, 10 seconds
+```
+
+**Expected result:** ~50% of `/diagnose` requests get **429** — of the burst of 10, the
+first 5 pass with 200 and the next 5 are strictly 429 (the `POST /diagnose [429 expected]`
+row in the stats table); `/health` — **100% 200** (thousands of requests while the limit
+is being hit). Scenario verdicts are the `SCENARIO test_diagnose_rate_limit` and
+`SCENARIO test_health_unlimited` rows with **0 failures**; any unexpected behaviour (500,
+429 within the first five, non-429 beyond the limit, non-200 on `/health`) is recorded as
+a real locust failure and a non-zero exit code.
+
+Notes:
+
+- The slowapi counter is keyed by client IP, so all Locust users on localhost share one
+  60-second window — the `/diagnose` burst runs exactly once per run, while the other
+  9 users keep hammering `/health` in parallel (proving health checks are not blocked
+  under overload).
+- `/diagnose` needs an LLM: `QWEN_API_KEY`/`OPENAI_API_KEY`, or `LLM_OFFLINE=true` in
+  `.env` (stub mode — fast responses, recommended for this test). Without either, the
+  endpoint honestly returns 503 before the limiter fires and the scenario fails with a
+  hint. With a real (slow) LLM key, raise the run duration:
+  `locust -f scripts/load_test.py --headless -u 10 -t 120s --host=http://localhost:8000`.
+- Rerun at most once per minute (the limit window is 60 s), or restart the agent.
 
 ---
 
