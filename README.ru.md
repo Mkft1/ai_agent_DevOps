@@ -15,7 +15,7 @@ AI-агент для диагностики инцидентов в Kubernetes. 
 [![Python 3.12](https://img.shields.io/badge/python-3.12-blue?logo=python&logoColor=white)](https://www.python.org/downloads/)
 [![Docker](https://img.shields.io/badge/docker-multistage%20image-2496ED?logo=docker&logoColor=white)](./Dockerfile)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](./LICENSE)
-[![Tests](https://img.shields.io/badge/tests-273%20passed-brightgreen?logo=pytest&logoColor=white)](#тесты)
+[![Tests](https://img.shields.io/badge/tests-310%20passed-brightgreen?logo=pytest&logoColor=white)](#тесты)
 [![Ruff](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/astral-sh/ruff/main/assets/badge/v2.json)](https://github.com/astral-sh/ruff)
 
 AI-агент для диагностики инцидентов в Kubernetes.
@@ -94,7 +94,10 @@ Alertmanager → /diagnose → IncidentOrchestrator → [K8sTools, PrometheusToo
 - **Безопасность (guardrails)** — read-only по умолчанию, белый список namespace'ов,
   лимит строк логов, секреты только через `.env`, non-root контейнер, `.dockerignore`,
   политика опасных действий: рекомендации с `delete`/`drop`/`rm -rf`/`scale 0`
-  помечаются `requires_approval: true` и уходят на аппрув человеку в Slack.
+  помечаются `requires_approval: true` и уходят на аппрув человеку в Slack,
+  маскирование PII/секретов перед отправкой в LLM (`ENABLE_SCRUBBING`: JWT,
+  API-ключи, пароли в URL, Bearer-токены, email в логах и событиях заменяются
+  на `[REDACTED:<type>]` до выхода контекста за периметр).
 - **Helm-чарт** — production-ready `charts/ai-agent` (v0.1.0): Deployment с probes
   и non-root securityContext, ClusterIP Service, least-privilege RBAC,
   ConfigMap/Secret из `values.yaml`, `make helm-lint` / `make helm-install`.
@@ -102,7 +105,7 @@ Alertmanager → /diagnose → IncidentOrchestrator → [K8sTools, PrometheusToo
   (таблица инцидентов Timestamp/Namespace/Severity/Root Cause, метрики по severity,
   карточки аппрува с `suggested_fix` и кнопкой "Approve & Apply" для инцидентов с
   `requires_approval=true`); запускается отдельно от FastAPI, кластер не трогает.
-- **Тестирование** — 273 unit/интеграционных тестов (pytest + unittest.mock), покрытие ~93%
+- **Тестирование** — 310 unit/интеграционных тестов (pytest + unittest.mock), покрытие ~93%
   (гейт в CI `--cov-fail-under=85`): инструменты, оркестратор, LLM-клиент (мок HTTP),
   FastAPI-эндпоинты (TestClient), конфигурация и логирование, chaos-скрипт.
 - **DevOps-практики** — многоступенчатый Docker-образ, docker-compose, идемпотентный
@@ -158,6 +161,7 @@ ai_agent_DevOps/
 │       ├── audit.py       # Журнал аудита диагностик (append-only JSON Lines)
 │       ├── logger.py      # Базовое логирование
 │       ├── metrics.py     # Кастомные Prometheus-метрики агента
+│       ├── scrubber.py    # маскирование PII/секретов перед отправкой в LLM
 │       └── text_utils.py  # truncate_context: рекурсивная обрезка контекста для LLM
 ├── eval/
 │   ├── golden_dataset.json  # золотые инциденты: ожидаемый root cause + runbook
@@ -309,6 +313,37 @@ curl http://localhost:8000/health
    сама по себе больше лимита — применяется preview-обёртка. Результат всегда
    JSON-сериализуем и строго <= лимита — переполнение контекстного окна исключено
    у любого провайдера.
+6. **ENABLE_SCRUBBING / REDACT_IPS** — маскирование PII и секретов перед отправкой
+   данных в LLM: пароли, JWT, API-ключи, Bearer-токены и email в логах подов и
+   K8s-событиях заменяются на `[REDACTED:<type>]` **до** сериализации контекста
+   для внешнего провайдера. Подробности — в подразделе ниже.
+
+### Приватность данных и маскирование PII (Data Privacy & PII Scrubbing)
+
+Логи контейнеров и события Kubernetes регулярно содержат секреты, а контекст диагностики
+уходит **внешнему LLM-провайдеру** (Qwen/OpenAI-совместимый API) — поэтому перед
+сериализацией в JSON каждый payload проходит через скраббер (`src/utils/scrubber.py`,
+вызывается в оркестраторе непосредственно перед запросом к LLM):
+
+| Паттерн | Пример | Маскируется как |
+|---|---|---|
+| JWT-токены | `eyJhbGciOi...` | `[REDACTED:jwt]` |
+| API-ключи | `sk-...` (OpenAI), `ghp_...` (GitHub), `AKIA...` (AWS), `key-...` | `[REDACTED:api_key]` |
+| Пароли в URL | `postgres://app:hunter2@db:5432/orders` | `postgres://app:[REDACTED:password]@db:5432/orders` |
+| Bearer-токены | `Authorization: Bearer abc...` | `[REDACTED:bearer]` |
+| Email | `admin@example.com` | `[REDACTED:email]` |
+
+- **Что скрабится**: `pod_logs_tail` и каждое событие Kubernetes из контекста LLM.
+  **Что не скрабится**: ответ самой модели (`root_cause`, `evidence`, `suggested_fix`)
+  возвращается как есть — это сгенерированный текст, а не сырые данные кластера.
+- **IP-адреса по умолчанию НЕ маскируются** — они критичны для сетевой диагностики;
+  `REDACT_IPS=true` включает маскирование IPv4 (`[REDACTED:ip]`).
+- **Отключение**: `ENABLE_SCRUBBING=false` превращает маскирование в полный passthrough —
+  допустимо только для доверенных локальных моделей (например, Ollama внутри кластера).
+  По умолчанию — `true`; это обязательное требование Enterprise compliance review.
+- **Наблюдаемость**: каждый замаскированный элемент инкрементирует Prometheus-счётчик
+  `scrubbed_items_total{type="jwt|api_key|password|bearer|email|ip"}` — всплеск метрики
+  показывает, какие секреты циркулируют в рабочих нагрузках.
 
 ### Graceful Degradation (устойчивость к сбоям инструментов)
 
@@ -544,6 +579,7 @@ curl -s -X POST localhost:8000/diagnose -H 'Content-Type: application/json' \
 | `diagnose_duration_seconds`  | Histogram | namespace             | длительность `IncidentOrchestrator.diagnose`  |
 | `k8s_api_errors_total`       | Counter   | method                | ошибки Kubernetes API в инструментах          |
 | `llm_fallback_total`         | Counter   | —                     | срабатывания fallback-диагноза (битый JSON)   |
+| `scrubbed_items_total`       | Counter   | type                  | замаскированные секреты/PII перед отправкой в LLM |
 
 Пример запроса:
 
@@ -648,7 +684,7 @@ ruff check src tests scripts
 python -m pytest --cov=src --cov-report=xml tests/
 ```
 
-Текущий набор: **273 passed**, покрытие **~93%** (инструменты K8s/Prometheus/логов,
+Текущий набор: **310 passed**, покрытие **~93%** (инструменты K8s/Prometheus/логов,
 оркестратор, LLM-клиент с моками HTTP, FastAPI-эндпоинты через TestClient (включая
 webhook Alertmanager и журнал аудита), валидация конфигурации, JSON-логирование,
 трейсинг OpenTelemetry, chaos-скрипт).

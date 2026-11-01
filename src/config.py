@@ -71,6 +71,15 @@ class Settings(BaseSettings):
     max_log_lines: int = 200
     enable_write_actions: bool = False
 
+    # Маскирование PII/секретов перед отправкой данных в LLM
+    # (src/utils/scrubber.py): JWT, API-ключи, пароли в URL, Bearer-токены,
+    # email в логах подов и K8s-событиях заменяются на [REDACTED:<type>].
+    # Отключение (false) — только для доверенных локальных моделей.
+    enable_scrubbing: bool = True
+    # Дополнительно маскировать IPv4-адреса. По умолчанию false: IP нужны
+    # для сетевой диагностики инцидентов (флаг на будущее/усиление режима).
+    redact_ips: bool = False
+
     # CORS (список разрешённых origins; по умолчанию "*" для dev)
     cors_origins: list[str] = ["*"]
 
