@@ -9,6 +9,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Extended policy guardrail (`src/agent/policies.py`): двухуровневая защита от
+  опасных рекомендаций LLM. Уровень 1 — 18 регистронезависимых regex вместо
+  4 substring'ов: к `delete`/`drop`/`rm -rf`/`scale 0` добавлены синонимы и
+  перефразировки (`remove the pod`, `terminate all instances/pods`,
+  `kill the pod`, `set replicas to 0/zero`, `scale down to 0/zero`,
+  `replicas: 0`/`--replicas=0`, `kubectl apply|create -f`, `drop table`,
+  `truncate table`, `chmod 777`, `chown root`, `export ...=...secret`,
+  `echo ... > /etc/passwd`) —
+  каждый паттерн задокументирован пояснением опасности. Уровень 2 — ЛЮБОЕ
+  упоминание `kubectl`/`helm`/`oc`, не являющееся read-only-командой
+  (`get`/`describe`/`logs`), автоматически требует аппрува и логирует WARNING
+  «Policy guardrail: kubectl/helm command detected, requiring approval».
+  Новый Prometheus-счётчик `policy_approval_required_total` инкрементируется
+  на каждый вердикт `requires_approval=true`. Таблицы паттернов — в
+  README.md/README.ru.md («Security Policies & Approvals»).
 - PII/secret scrubbing before LLM calls (`src/utils/scrubber.py`): JWT, API-ключи
   (`sk-`/`ghp_`/`AKIA`/`key-`), пароли в URL, Bearer-токены и email в логах подов и
   K8s-событиях маскируются на `[REDACTED:<type>]` **до** сериализации контекста для

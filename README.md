@@ -29,14 +29,14 @@ The agent is strictly **read-only by default**: it never mutates the cluster (`E
 | 📚 **Hybrid RAG over runbooks** | Local Markdown runbooks (`docs/runbooks/*.md`) ranked by **hybrid search**: `0.5 × TF-IDF` (exact terms) + `0.5 × cosine similarity` of sentence-transformers embeddings (`all-MiniLM-L6-v2`, semantic match). No vector DB, no external service; if the model is unavailable the agent gracefully falls back to pure TF-IDF. Top playbooks are injected into the LLM context as `relevant_runbooks` and drive `suggested_fix`. |
 | ☸️ **Kubernetes integration** | Official Python client: pods, events, deployments, nodes, container logs (including pre-restart logs for OOMKilled/CrashLoopBackOff). |
 | 📈 **Prometheus integration** | instant & range queries, per-pod CPU/memory usage via `container_*` cAdvisor metrics. |
-| 🛡️ **Guardrails** | Namespace allow-list (`ALLOWED_NAMESPACES`), log-size cap (`MAX_LOG_LINES`), context-size cap in tokens (`MAX_CONTEXT_TOKENS`, tiktoken), read-only mode (`ENABLE_WRITE_ACTIONS`), **dangerous-action policy** (fixes mentioning `delete`/`drop`/`rm -rf`/`scale 0` are flagged `requires_approval: true` and routed to a human via Slack), cluster-level **Policy-as-Code**: least-privilege RBAC + Kyverno ClusterPolicies in `manifests/`, and **PII/secret scrubbing before LLM calls** (`ENABLE_SCRUBBING`: JWTs, API keys, passwords in URLs, Bearer tokens and emails in logs/events are masked as `[REDACTED:<type>]` before the context leaves the perimeter). All configurable via `.env`, nothing hardcoded. |
+| 🛡️ **Guardrails** | Namespace allow-list (`ALLOWED_NAMESPACES`), log-size cap (`MAX_LOG_LINES`), context-size cap in tokens (`MAX_CONTEXT_TOKENS`, tiktoken), read-only mode (`ENABLE_WRITE_ACTIONS`), **two-level dangerous-action policy** (destructive patterns — `delete`/`drop`/`rm -rf`/`scale 0` and paraphrases like `remove the pod`, `terminate all instances`, `set replicas to 0`, `kubectl apply -f`, `chmod 777` — plus ANY non-read-only `kubectl`/`helm`/`oc` command are flagged `requires_approval: true` and routed to a human via Slack), cluster-level **Policy-as-Code**: least-privilege RBAC + Kyverno ClusterPolicies in `manifests/`, and **PII/secret scrubbing before LLM calls** (`ENABLE_SCRUBBING`: JWTs, API keys, passwords in URLs, Bearer tokens and emails in logs/events are masked as `[REDACTED:<type>]` before the context leaves the perimeter). All configurable via `.env`, nothing hardcoded. |
 | 🩹 **Graceful degradation** | If any data source fails (K8s API down, Prometheus unreachable, empty logs), the agent records a warning in the report and continues diagnosing with whatever data it has — it never crashes the pipeline. |
-| 📊 **Observability** | `/metrics` endpoint (`prometheus-fastapi-instrumentator`) + custom counters/histograms: `diagnose_requests_total`, `diagnose_duration_seconds`, `k8s_api_errors_total`, `llm_fallback_total`, `scrubbed_items_total`. `X-Request-ID` correlation (echoed/generated per request), optional structured JSON logging (`LOG_FORMAT=json`) for Loki/CloudWatch, an append-only audit journal (`AUDIT_LOG_PATH`, JSON Lines) of every diagnosis, and **OpenTelemetry distributed tracing** (auto HTTP spans + manual spans per K8s/Prometheus/logs/RAG/LLM call, OTLP export to Jaeger/Tempo). |
+| 📊 **Observability** | `/metrics` endpoint (`prometheus-fastapi-instrumentator`) + custom counters/histograms: `diagnose_requests_total`, `diagnose_duration_seconds`, `k8s_api_errors_total`, `llm_fallback_total`, `scrubbed_items_total`, `policy_approval_required_total`. `X-Request-ID` correlation (echoed/generated per request), optional structured JSON logging (`LOG_FORMAT=json`) for Loki/CloudWatch, an append-only audit journal (`AUDIT_LOG_PATH`, JSON Lines) of every diagnosis, and **OpenTelemetry distributed tracing** (auto HTTP spans + manual spans per K8s/Prometheus/logs/RAG/LLM call, OTLP export to Jaeger/Tempo). |
 | 🚨 **Alertmanager webhook** | `POST /webhook/alertmanager` accepts the standard Alertmanager payload, diagnoses every `firing` alert (namespace/pod from labels, text from `annotations.summary`/`description`), skips `resolved`, and answers `400` on malformed payloads. |
 | 🔁 **Chaos self-test** | `scripts/chaos_test.py` creates an ImagePullBackOff pod, asks the agent to diagnose it, asserts the RCA mentions "image"/"pull", and cleans up. Idempotent. |
 | ☸️ **Helm chart** | Production-ready `charts/ai-agent` (v0.1.0): Deployment with probes & non-root securityContext, ClusterIP Service, least-privilege RBAC, ConfigMap/Secret from `values.yaml`, `make helm-lint` / `make helm-install`. |
 | 🖥️ **Operator dashboard** | `make dashboard` — Streamlit UI over the audit journal: incident table (Timestamp/Namespace/Severity/Root Cause), severity metrics, and approval cards with `suggested_fix` + "Approve & Apply" for every `requires_approval` incident. |
-| 🧪 **Testing & CI/CD** | 310 unit/integration tests with mocked clients (93% coverage, CI gate `--cov-fail-under=85`, SentenceTransformer mocked so tests never download models), plus an offline **evaluation framework** (`make eval`) with a golden dataset and LLM-as-a-judge scoring; | GitHub Actions pipeline: lint → test+coverage → Docker build+smoke → kind-based e2e on `main` (auto-skipped when no LLM secret is configured). |
+| 🧪 **Testing & CI/CD** | 368 unit/integration tests with mocked clients (93% coverage, CI gate `--cov-fail-under=85`, SentenceTransformer mocked so tests never download models), plus an offline **evaluation framework** (`make eval`) with a golden dataset and LLM-as-a-judge scoring; | GitHub Actions pipeline: lint → test+coverage → Docker build+smoke → kind-based e2e on `main` (auto-skipped when no LLM secret is configured). |
 | 🐳 **Containerized** | Multi-stage `python:3.12-slim` image, non-root user, healthcheck, no secrets baked into the image. |
 
 ---
@@ -295,16 +295,39 @@ Behaviour: `labels.namespace` → incident namespace (default `default`), `label
 ## Security Policies & Approvals
 
 The agent never mutates the cluster — but its *suggestions* can be dangerous.
-Before an operator acts on them, a role-based policy gate runs:
+Before an operator acts on them, a role-based policy gate runs
+(`src/agent/policies.py::check_policy(suggested_fix)`) with **two defense levels**:
 
-1. `src/agent/policies.py::check_policy(suggested_fix)` scans the LLM's recommendation
-   for dangerous commands: `delete`, `drop`, `rm -rf`, `scale 0` (case-insensitive).
-2. If a dangerous pattern is found while the agent is read-only
-   (`ENABLE_WRITE_ACTIONS=false`), the diagnosis is flagged
+1. **Dangerous patterns (level 1).** The recommendation is scanned with
+   case-insensitive regexes for destructive actions *and their synonyms /
+   paraphrases* — the model cannot slip through by rewording the command
+   ("remove the pod", "terminate all instances", "set replicas to zero"):
+
+   | Dangerous action | Detected patterns (regex, case-insensitive) | Why it is dangerous |
+   |---|---|---|
+   | Resource deletion | `delete`, `remove\s+(the\s+)?pod`, `terminate\s+(all\s+)?(instance\|pod)`, `kill\s+(the\s+)?pod` | Irreversible loss of pods/PVCs/namespaces and in-memory state |
+   | Replica zeroing | `scale\s+0`, `set\s+replicas\s+to\s+(0\|zero)`, `scale\s+down\s+to\s+(0\|zero)`, `replicas\s*[:=]\s*0` | Full service outage — covers YAML manifests (`replicas: 0`), CLI flags (`--replicas=0`) and word form ("to zero") |
+   | Arbitrary manifests | `kubectl\s+apply\s+-f`, `kubectl\s+create\s+-f` | Privileged pods, hostPath mounts, RBAC backdoors — a classic prompt-injection foothold |
+   | Filesystem destruction | `rm\s+-rf` | Unrecoverable data loss on the node |
+   | Database destruction | `drop`/`drop\s+table`, `truncate\s+table` | Irreversible loss of tables and their data |
+   | Permission escalation | `chmod\s+777`, `chown\s+root` | World-writable data; breaks non-root security contexts (`runAsNonRoot`) |
+   | Secret / system-file injection | `export\s+.*=\s*.*secret`, `echo\s+.*>\s*/etc/passwd` | Secret leakage via env/child processes; node compromise and root accounts |
+
+2. **CLI mention (level 2, defense in depth).** ANY mention of `kubectl`, `helm`
+   or `oc` (OpenShift) that is not a read-only command (`get` / `describe` /
+   `logs`) sets `requires_approval: true` automatically — even when no level-1
+   pattern matched — and logs a `WARNING`:
+   `Policy guardrail: kubectl/helm command detected, requiring approval`.
+   Rationale: to actually mutate a cluster the model inevitably needs a CLI
+   tool, so tool mentions are guarded even for subcommands the regexes do not
+   know yet. Read-only diagnostics (`kubectl get pods`, `kubectl describe pod`,
+   `kubectl logs`) remain approval-free — they mutate nothing.
+3. In read-only mode (`ENABLE_WRITE_ACTIONS=false`) every hit flags the diagnosis
    **`requires_approval: true`** (visible in `POST /diagnose` and
    `POST /webhook/alertmanager` responses, in the audit journal and as a 🔔 line
-   in the Slack/Telegram report).
-3. If `SLACK_WEBHOOK_URL` is configured, the agent posts an approval request to an
+   in the Slack/Telegram report) and increments the `policy_approval_required_total`
+   Prometheus counter.
+4. If `SLACK_WEBHOOK_URL` is configured, the agent posts an approval request to an
    incoming webhook:
 
    ```
@@ -314,15 +337,16 @@ Before an operator acts on them, a role-based policy gate runs:
    Without the webhook the agent logs a `WARNING` (approval still required in the
    diagnosis) — it never crashes. A Slack outage also cannot break diagnosis:
    send failures are logged and the response is returned as usual.
-4. Every approval request increments the `approval_requests_total` Prometheus metric.
+5. Every approval request increments the `approval_requests_total` Prometheus metric.
 
 ```bash
 # .env
 SLACK_WEBHOOK_URL=https://hooks.slack.com/services/T000/B000/XXXX
 ```
 
-Safe recommendations (raise limits, fix image tags, add probes...) skip the gate:
-`requires_approval: false`, no Slack message.
+Safe recommendations (raise limits, fix image tags, add probes...) and read-only
+CLI commands (`kubectl get pods`, `kubectl describe pod`, `kubectl logs`) skip the
+gate: `requires_approval: false`, no Slack message.
 
 ### Rate limiting (alert-storm / financial DoS protection)
 
@@ -693,7 +717,7 @@ ai_agent_DevOps/
 │   ├── prompts/sre_system.txt   # system prompt for the LLM (loaded at init, fallback in code)
 │   ├── agent/
 │   │   ├── orchestrator.py      # IncidentOrchestrator: pipeline, guardrails, degradation, reporting
-│   │   ├── policies.py          # dangerous-fix policy (delete/drop/rm -rf/scale 0) -> approval
+│   │   ├── policies.py          # 2-level dangerous-fix policy (synonym regexes + kubectl/helm/oc) -> approval
 │   │   ├── llm_client.py        # OpenAI-compatible client: tenacity retries, 30s timeout
 │   │   ├── rag.py               # RunbookRAG: hybrid retrieval (TF-IDF + embeddings) over docs/runbooks
 │   │   └── tools/               # k8s_tools.py, prometheus_tools.py, logs_tools.py
@@ -705,7 +729,7 @@ ai_agent_DevOps/
 │       └── text_utils.py        # truncate_context (bounded, JSON-safe)
 ├── charts/ai-agent/             # production Helm chart (v0.1.0): deployment,
 │                                # service, SA/RBAC, configmap, secret, helpers
-└── tests/                       # 310 tests, fully mocked externals
+└── tests/                       # 368 tests, fully mocked externals
 ```
 
 ---
