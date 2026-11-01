@@ -1,7 +1,7 @@
 PYTHON=python3
 PIP=pip
 
-.PHONY: install lint test run docker-build chaos e2e jaeger eval dashboard helm-lint helm-install docs-check
+.PHONY: install lint test run docker-build chaos e2e load-test jaeger eval dashboard helm-lint helm-install docs-check
 
 install:
 	$(PIP) install -r requirements.txt -r requirements-dev.txt
@@ -23,6 +23,10 @@ chaos:
 
 e2e:
 	bash scripts/run_integration_test.sh
+
+load-test:
+	@echo "Starting Locust headless load test (10 users, 10s duration)..."
+	locust -f scripts/load_test.py --headless -u 10 -t 10s --host=http://localhost:8000
 
 jaeger:
 	docker rm -f jaeger 2>/dev/null || true

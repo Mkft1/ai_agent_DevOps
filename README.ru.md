@@ -429,6 +429,9 @@ SLACK_WEBHOOK_URL=https://hooks.slack.com/services/T000/B000/XXXX
 **429** с `{"detail": "Rate limit exceeded. Please retry later."}` и заголовком
 `Retry-After`. Пробы `/health` и `/ready` не ограничены никогда — Kubernetes
 обязан всегда мог проверять под.
+Автоматизированное доказательство работы лимитов: `make load-test` — Locust-сценарий,
+проверяющий 429 при перегрузке `/diagnose` (см. «Тесты и линтеры → Нагрузочное
+тестирование»).
 
 ## Безопасность и Policy-as-Code
 
@@ -649,6 +652,39 @@ python -m pytest --cov=src --cov-report=xml tests/
 оркестратор, LLM-клиент с моками HTTP, FastAPI-эндпоинты через TestClient (включая
 webhook Alertmanager и журнал аудита), валидация конфигурации, JSON-логирование,
 трейсинг OpenTelemetry, chaos-скрипт).
+
+### Нагрузочное тестирование (проверка rate limiting)
+
+[`scripts/load_test.py`](scripts/load_test.py) (Locust) — автоматизированное доказательство
+того, что лимиты slowapi действительно работают: при перегрузке `POST /diagnose` возвращает
+**429**, приложение не падает (без 5xx), а `GET /health` остаётся неограниченным.
+
+```bash
+make install     # один раз: ставит locust (requirements-dev.txt)
+make run         # терминал 1 — агент на http://localhost:8000
+make load-test   # терминал 2 — locust headless: 10 пользователей, 10 секунд
+```
+
+**Ожидаемый результат:** ~50% запросов `/diagnose` получают **429** — из burst'а в 10
+запросов первые 5 проходят с 200, следующие 5 строго 429 (строка
+`POST /diagnose [429 expected]` в таблице статистики); `/health` — **100% 200** (тысячи
+запросов на фоне срабатывающего лимита). Вердикты сценариев — строки
+`SCENARIO test_diagnose_rate_limit` и `SCENARIO test_health_unlimited` с **0 failures**;
+любое неожиданное поведение (500, 429 в первой пятёрке, не-429 сверх лимита, не-200 на
+`/health`) фиксируется как настоящий failure locust с ненулевым exit code.
+
+Нюансы:
+
+- Счётчик slowapi keyed по IP клиента, поэтому все пользователи Locust на localhost делят
+  одно 60-секундное окно — burst на `/diagnose` выполняется ровно один раз за прогон, а
+  остальные 9 пользователей всё это время параллельно грузят `/health` (доказательство,
+  что health check не блокируется под перегрузкой).
+- Для `/diagnose` нужен LLM: `QWEN_API_KEY`/`OPENAI_API_KEY` либо `LLM_OFFLINE=true` в
+  `.env` (stub-режим — быстрые ответы, рекомендуется для этого теста). Без них эндпоинт
+  честно возвращает 503 ещё до срабатывания limiter'а, и сценарий упадёт с подсказкой.
+  С реальным (медленным) LLM-ключом увеличьте длительность прогона:
+  `locust -f scripts/load_test.py --headless -u 10 -t 120s --host=http://localhost:8000`.
+- Повторный запуск — не чаще раза в минуту (окно лимита 60 с), либо перезапустите агент.
 
 ## CI/CD
 

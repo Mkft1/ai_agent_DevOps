@@ -12,3 +12,8 @@ pytest-xdist==3.8.0
 
 # Lint (CI job: lint)
 ruff==0.17.3
+
+# Load testing (make load-test): Locust-сценарий проверки rate limiting —
+# scripts/load_test.py. Dev-only: в runtime-образ не входит, блокирующий
+# pip-audit в CI проверяет только requirements.txt.
+locust==2.47.0
