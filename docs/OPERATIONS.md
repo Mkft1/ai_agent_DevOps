@@ -33,7 +33,10 @@ When `POST /diagnose` (or the Alertmanager webhook) returns **`severity: critica
 
 2. **Check `requires_approval`.**
    - `requires_approval: true` means the suggested fix matched the dangerous-action
-     policy (`delete`, `drop`, `rm -rf`, `scale 0`). If `SLACK_WEBHOOK_URL` is
+     policy (destructive patterns like `delete`, `drop`, `rm -rf`, `scale 0` and
+     their synonyms — `remove the pod`, `set replicas to 0`, `kubectl apply -f`,
+     `chmod 777`, ... — or ANY `kubectl`/`helm`/`oc` command that is not
+     read-only `get`/`describe`/`logs`). If `SLACK_WEBHOOK_URL` is
      configured, an approval request was already posted to Slack
      (`⚠️ Action Required: ... Approve or Reject?`); the report also carries a 🔔 line.
    - **Never apply a `requires_approval: true` fix under time pressure without a

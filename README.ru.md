@@ -15,7 +15,7 @@ AI-агент для диагностики инцидентов в Kubernetes. 
 [![Python 3.12](https://img.shields.io/badge/python-3.12-blue?logo=python&logoColor=white)](https://www.python.org/downloads/)
 [![Docker](https://img.shields.io/badge/docker-multistage%20image-2496ED?logo=docker&logoColor=white)](./Dockerfile)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](./LICENSE)
-[![Tests](https://img.shields.io/badge/tests-310%20passed-brightgreen?logo=pytest&logoColor=white)](#тесты)
+[![Tests](https://img.shields.io/badge/tests-368%20passed-brightgreen?logo=pytest&logoColor=white)](#тесты)
 [![Ruff](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/astral-sh/ruff/main/assets/badge/v2.json)](https://github.com/astral-sh/ruff)
 
 AI-агент для диагностики инцидентов в Kubernetes.
@@ -93,7 +93,10 @@ Alertmanager → /diagnose → IncidentOrchestrator → [K8sTools, PrometheusToo
   и возвращает `400` на битом JSON/схеме.
 - **Безопасность (guardrails)** — read-only по умолчанию, белый список namespace'ов,
   лимит строк логов, секреты только через `.env`, non-root контейнер, `.dockerignore`,
-  политика опасных действий: рекомендации с `delete`/`drop`/`rm -rf`/`scale 0`
+  двухуровневая политика опасных действий: деструктивные паттерны
+  (`delete`/`drop`/`rm -rf`/`scale 0`) и их синонимы/перефразировки (`remove the pod`,
+  `terminate all instances`, `set replicas to 0`, `kubectl apply -f`, `chmod 777`, ...)
+  плюс ЛЮБЫЕ команды `kubectl`/`helm`/`oc` кроме read-only (`get`/`describe`/`logs`)
   помечаются `requires_approval: true` и уходят на аппрув человеку в Slack,
   маскирование PII/секретов перед отправкой в LLM (`ENABLE_SCRUBBING`: JWT,
   API-ключи, пароли в URL, Bearer-токены, email в логах и событиях заменяются
@@ -105,7 +108,7 @@ Alertmanager → /diagnose → IncidentOrchestrator → [K8sTools, PrometheusToo
   (таблица инцидентов Timestamp/Namespace/Severity/Root Cause, метрики по severity,
   карточки аппрува с `suggested_fix` и кнопкой "Approve & Apply" для инцидентов с
   `requires_approval=true`); запускается отдельно от FastAPI, кластер не трогает.
-- **Тестирование** — 310 unit/интеграционных тестов (pytest + unittest.mock), покрытие ~93%
+- **Тестирование** — 368 unit/интеграционных тестов (pytest + unittest.mock), покрытие ~93%
   (гейт в CI `--cov-fail-under=85`): инструменты, оркестратор, LLM-клиент (мок HTTP),
   FastAPI-эндпоинты (TestClient), конфигурация и логирование, chaos-скрипт.
 - **DevOps-практики** — многоступенчатый Docker-образ, docker-compose, идемпотентный
@@ -148,7 +151,7 @@ ai_agent_DevOps/
 │   ├── config.py          # Загрузка конфигурации из .env
 │   ├── agent/
 │   │   ├── orchestrator.py  # Оркестрация шагов диагностики (K8s -> контекст -> LLM -> RCA)
-│   │   ├── policies.py      # политика опасных фиксов (delete/drop/rm -rf/scale 0) -> аппрув
+│   │   ├── policies.py      # 2 уровня политики опасных фиксов (regex-синонимы + kubectl/helm/oc) -> аппрув
 │   │   ├── llm_client.py    # Реальный LLM-клиент (Qwen / OpenAI-совместимый API, ретраи tenacity)
 │   │   ├── rag.py           # RunbookRAG: гибридный поиск (TF-IDF + эмбеддинги) по runbook'ам
 │   │   └── tools/
@@ -429,14 +432,38 @@ namespace пропускается (`skipped++`, событие `guardrail_rejec
 ### Политики безопасности и аппрувы
 
 Агент не выполняет изменения в кластере, но его *рекомендации* могут быть опасны.
-Перед применением человеком срабатывает policy-гейт:
+Перед применением человеком срабатывает policy-гейт
+(`src/agent/policies.py::check_policy(suggested_fix)`) с **двумя уровнями защиты**:
 
-1. `src/agent/policies.py::check_policy(suggested_fix)` ищет в рекомендации LLM
-   опасные команды: `delete`, `drop`, `rm -rf`, `scale 0` (регистронезависимо).
-2. Если паттерн найден в read-only режиме (`ENABLE_WRITE_ACTIONS=false`), диагноз
-   помечается **`requires_approval: true`** — поле видно в ответах `/diagnose` и
-   `/webhook/alertmanager`, в журнале аудита и строкой 🔔 в отчёте для мессенджеров.
-3. При настроенном `SLACK_WEBHOOK_URL` агент отправляет запрос аппрува
+1. **Опасные паттерны (уровень 1).** Рекомендация сканируется регистронезависимыми
+   regex на деструктивные действия *и их синонимы/перефразировки* — модель не может
+   обойти проверку, переформулировав команду («remove the pod», «terminate all
+   instances», «set replicas to zero»):
+
+   | Опасное действие | Детектируемые паттерны (regex, регистронезависимо) | Почему опасно |
+   |---|---|---|
+   | Удаление ресурсов | `delete`, `remove\s+(the\s+)?pod`, `terminate\s+(all\s+)?(instance\|pod)`, `kill\s+(the\s+)?pod` | Безвозвратная потеря подов/PVC/namespace'ов и in-memory состояния |
+   | Обнуление реплик | `scale\s+0`, `set\s+replicas\s+to\s+(0\|zero)`, `scale\s+down\s+to\s+(0\|zero)`, `replicas\s*[:=]\s*0` | Полный простой сервиса — покрывает YAML-манифесты (`replicas: 0`), CLI-флаги (`--replicas=0`) и словесную форму («to zero») |
+   | Произвольные манифесты | `kubectl\s+apply\s+-f`, `kubectl\s+create\s+-f` | Privileged-поды, hostPath-монтирования, RBAC-backdoor'ы — классический вектор prompt-injection |
+   | Разрушение файловой системы | `rm\s+-rf` | Невосстановимая потеря данных на узле |
+   | Разрушение БД | `drop`/`drop\s+table`, `truncate\s+table` | Безвозвратная потеря таблиц и данных |
+   | Эскалация прав | `chmod\s+777`, `chown\s+root` | Данные, доступные всем на запись; поломка non-root security context (`runAsNonRoot`) |
+   | Инъекции секретов и системных файлов | `export\s+.*=\s*.*secret`, `echo\s+.*>\s*/etc/passwd` | Утечка секретов через env/дочерние процессы; компрометация узла и root-аккаунты |
+
+2. **Упоминание CLI (уровень 2, защита в глубину).** ЛЮБОЕ упоминание `kubectl`,
+   `helm` или `oc` (OpenShift), не являющееся read-only-командой (`get` /
+   `describe` / `logs`), автоматически ставит `requires_approval: true` — даже
+   если ни один паттерн уровня 1 не сработал — и логирует `WARNING`:
+   `Policy guardrail: kubectl/helm command detected, requiring approval`.
+   Обоснование: чтобы реально изменить кластер, модели в любом случае понадобится
+   CLI-инструмент, поэтому охраняются даже неизвестные regex'ам субкоманды.
+   Read-only-диагностика (`kubectl get pods`, `kubectl describe pod`,
+   `kubectl logs`) аппрува не требует — она ничего не меняет.
+3. В read-only режиме (`ENABLE_WRITE_ACTIONS=false`) любое срабатывание помечает
+   диагноз **`requires_approval: true`** — поле видно в ответах `/diagnose` и
+   `/webhook/alertmanager`, в журнале аудита и строкой 🔔 в отчёте для мессенджеров —
+   и инкрементирует Prometheus-счётчик `policy_approval_required_total`.
+4. При настроенном `SLACK_WEBHOOK_URL` агент отправляет запрос аппрува
    во incoming webhook:
 
    ```
@@ -446,7 +473,7 @@ namespace пропускается (`skipped++`, событие `guardrail_rejec
    Без webhook'а агент пишет `WARNING` в логи (аппрув в диагнозе всё равно
    требуется) и не падает; недоступность Slack диагностику тоже не роняет —
    ошибка отправки только логируется.
-4. Каждый запрос аппрува инкрементирует Prometheus-метрику `approval_requests_total`.
+5. Каждый запрос аппрува инкрементирует Prometheus-метрику `approval_requests_total`.
 
 ```bash
 # .env
@@ -454,7 +481,9 @@ SLACK_WEBHOOK_URL=https://hooks.slack.com/services/T000/B000/XXXX
 ```
 
 Безопасные рекомендации (поднять лимиты, поправить тег образа, добавить probes)
-гейт не проходят: `requires_approval: false`, сообщение в Slack не отправляется.
+и read-only-команды CLI (`kubectl get pods`, `kubectl describe pod`,
+`kubectl logs`) гейт не проходят: `requires_approval: false`, сообщение в Slack
+не отправляется.
 
 ### Rate limiting (защита квот LLM и API от alert-штормов)
 
@@ -580,6 +609,8 @@ curl -s -X POST localhost:8000/diagnose -H 'Content-Type: application/json' \
 | `k8s_api_errors_total`       | Counter   | method                | ошибки Kubernetes API в инструментах          |
 | `llm_fallback_total`         | Counter   | —                     | срабатывания fallback-диагноза (битый JSON)   |
 | `scrubbed_items_total`       | Counter   | type                  | замаскированные секреты/PII перед отправкой в LLM |
+| `approval_requests_total`    | Counter   | —                     | запросы аппрува опасных фиксов, отправленные в Slack |
+| `policy_approval_required_total` | Counter | —                   | вердикты guardrail «требуется аппрув» (опасный паттерн или kubectl/helm/oc) |
 
 Пример запроса:
 
@@ -684,7 +715,7 @@ ruff check src tests scripts
 python -m pytest --cov=src --cov-report=xml tests/
 ```
 
-Текущий набор: **310 passed**, покрытие **~93%** (инструменты K8s/Prometheus/логов,
+Текущий набор: **368 passed**, покрытие **~93%** (инструменты K8s/Prometheus/логов,
 оркестратор, LLM-клиент с моками HTTP, FastAPI-эндпоинты через TestClient (включая
 webhook Alertmanager и журнал аудита), валидация конфигурации, JSON-логирование,
 трейсинг OpenTelemetry, chaos-скрипт).

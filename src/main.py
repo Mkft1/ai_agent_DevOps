@@ -74,7 +74,10 @@ OpenAI-compatible) → RCA → Report`. Ответ LLM валидируется 
 ## Guardrails (безопасность по умолчанию)
 * **Read-only**: агент не выполняет изменений в кластере (`ENABLE_WRITE_ACTIONS=false`);
 * **Namespace allow-list** (`ALLOWED_NAMESPACES`): запросы вне списка → `403` до любых обращений к кластеру;
-* **Policy-as-Code**: опасные рекомендации (`delete`, `drop`, `rm -rf`, `scale 0`)
+* **Policy-as-Code**: опасные рекомендации (`delete`, `drop`, `rm -rf`, `scale 0`
+  и синонимы/перефразировки: `remove the pod`, `terminate all instances`,
+  `set replicas to 0`, `kubectl apply -f`, `drop table`, `chmod 777`, ...)
+  и ЛЮБЫЕ команды `kubectl`/`helm`/`oc`, кроме read-only (`get`/`describe`/`logs`),
   помечаются `requires_approval: true` и уходят на аппрув человеку в Slack;
 * **Bounded context**: лимиты `MAX_LOG_LINES` / `MAX_CONTEXT_TOKENS` (tiktoken); секреты только из `.env`.
 

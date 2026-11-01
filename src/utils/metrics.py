@@ -13,6 +13,10 @@
                                  Kubernetes API в инструментах.
     llm_fallback_total           (Counter)                        — срабатывания
                                  fallback-диагноза (LLM вернул невалидный JSON).
+    policy_approval_required_total (Counter)                      — вердикты
+                                 policy-guardrail «требуется аппрув человека»
+                                 (check_policy -> True: опасный паттерн или
+                                 упоминание kubectl/helm/oc).
     scrubbed_items_total         (Counter,   type)                — число
                                  замаскированных чувствительных элементов
                                  (jwt/api_key/password/bearer/email/ip) перед
@@ -68,6 +72,12 @@ APPROVAL_REQUESTS_TOTAL = Counter(
     "Total number of dangerous-fix approvals requested from humans (Slack)",
 )
 
+POLICY_APPROVAL_REQUIRED_TOTAL = Counter(
+    "policy_approval_required_total",
+    "Total number of policy-guardrail verdicts that flagged a suggested fix "
+    "as requiring human approval (dangerous pattern or kubectl/helm/oc mention)",
+)
+
 SCRUBBED_ITEMS_TOTAL = Counter(
     "scrubbed_items_total",
     "Total number of sensitive items (secrets/PII) masked by the scrubber "
@@ -104,6 +114,16 @@ def inc_llm_fallback() -> None:
 def inc_approval_request() -> None:
     """Увеличить счётчик запрошенных человеческих аппрувов опасных фиксов."""
     APPROVAL_REQUESTS_TOTAL.inc()
+
+
+def inc_policy_approval_required() -> None:
+    """Увеличить счётчик вердиктов guardrail «требуется аппрув человека».
+
+    Вызывается из :func:`src.agent.policies.check_policy` каждый раз, когда
+    рекомендация помечается ``requires_approval=true`` (опасный паттерн
+    уровня 1 или упоминание kubectl/helm/oc уровня 2).
+    """
+    POLICY_APPROVAL_REQUIRED_TOTAL.inc()
 
 
 def inc_scrubbed_items(item_type: str | None, amount: int = 1) -> None:
