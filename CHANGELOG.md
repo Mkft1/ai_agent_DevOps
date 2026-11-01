@@ -9,6 +9,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- PII/secret scrubbing before LLM calls (`src/utils/scrubber.py`): JWT, API-ключи
+  (`sk-`/`ghp_`/`AKIA`/`key-`), пароли в URL, Bearer-токены и email в логах подов и
+  K8s-событиях маскируются на `[REDACTED:<type>]` **до** сериализации контекста для
+  внешнего LLM-провайдера (интеграция в `IncidentOrchestrator`); ответ модели
+  (root_cause/evidence/suggested_fix) не маскируется. Конфигурация:
+  `ENABLE_SCRUBBING` (default true; false — passthrough для доверенных локальных
+  моделей), `REDACT_IPS` (default false — IP сохраняются для сетевой диагностики);
+  Prometheus-счётчик `scrubbed_items_total{type}`. Обязательно для Enterprise
+  compliance review.
 - Security scanning in CI: job `dependency-audit` (pip-audit, блокирующий аудит
   runtime-зависимостей; dev-зависимости report-only, т.к. не входят в образ)
   параллельно с тестами; job `security-scan` после build (Hadolint Dockerfile +

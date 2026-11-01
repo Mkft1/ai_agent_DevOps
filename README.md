@@ -29,14 +29,14 @@ The agent is strictly **read-only by default**: it never mutates the cluster (`E
 | 📚 **Hybrid RAG over runbooks** | Local Markdown runbooks (`docs/runbooks/*.md`) ranked by **hybrid search**: `0.5 × TF-IDF` (exact terms) + `0.5 × cosine similarity` of sentence-transformers embeddings (`all-MiniLM-L6-v2`, semantic match). No vector DB, no external service; if the model is unavailable the agent gracefully falls back to pure TF-IDF. Top playbooks are injected into the LLM context as `relevant_runbooks` and drive `suggested_fix`. |
 | ☸️ **Kubernetes integration** | Official Python client: pods, events, deployments, nodes, container logs (including pre-restart logs for OOMKilled/CrashLoopBackOff). |
 | 📈 **Prometheus integration** | instant & range queries, per-pod CPU/memory usage via `container_*` cAdvisor metrics. |
-| 🛡️ **Guardrails** | Namespace allow-list (`ALLOWED_NAMESPACES`), log-size cap (`MAX_LOG_LINES`), context-size cap in tokens (`MAX_CONTEXT_TOKENS`, tiktoken), read-only mode (`ENABLE_WRITE_ACTIONS`), **dangerous-action policy** (fixes mentioning `delete`/`drop`/`rm -rf`/`scale 0` are flagged `requires_approval: true` and routed to a human via Slack), and cluster-level **Policy-as-Code**: least-privilege RBAC + Kyverno ClusterPolicies in `manifests/`. All configurable via `.env`, nothing hardcoded. |
+| 🛡️ **Guardrails** | Namespace allow-list (`ALLOWED_NAMESPACES`), log-size cap (`MAX_LOG_LINES`), context-size cap in tokens (`MAX_CONTEXT_TOKENS`, tiktoken), read-only mode (`ENABLE_WRITE_ACTIONS`), **dangerous-action policy** (fixes mentioning `delete`/`drop`/`rm -rf`/`scale 0` are flagged `requires_approval: true` and routed to a human via Slack), cluster-level **Policy-as-Code**: least-privilege RBAC + Kyverno ClusterPolicies in `manifests/`, and **PII/secret scrubbing before LLM calls** (`ENABLE_SCRUBBING`: JWTs, API keys, passwords in URLs, Bearer tokens and emails in logs/events are masked as `[REDACTED:<type>]` before the context leaves the perimeter). All configurable via `.env`, nothing hardcoded. |
 | 🩹 **Graceful degradation** | If any data source fails (K8s API down, Prometheus unreachable, empty logs), the agent records a warning in the report and continues diagnosing with whatever data it has — it never crashes the pipeline. |
-| 📊 **Observability** | `/metrics` endpoint (`prometheus-fastapi-instrumentator`) + custom counters/histograms: `diagnose_requests_total`, `diagnose_duration_seconds`, `k8s_api_errors_total`, `llm_fallback_total`. `X-Request-ID` correlation (echoed/generated per request), optional structured JSON logging (`LOG_FORMAT=json`) for Loki/CloudWatch, an append-only audit journal (`AUDIT_LOG_PATH`, JSON Lines) of every diagnosis, and **OpenTelemetry distributed tracing** (auto HTTP spans + manual spans per K8s/Prometheus/logs/RAG/LLM call, OTLP export to Jaeger/Tempo). |
+| 📊 **Observability** | `/metrics` endpoint (`prometheus-fastapi-instrumentator`) + custom counters/histograms: `diagnose_requests_total`, `diagnose_duration_seconds`, `k8s_api_errors_total`, `llm_fallback_total`, `scrubbed_items_total`. `X-Request-ID` correlation (echoed/generated per request), optional structured JSON logging (`LOG_FORMAT=json`) for Loki/CloudWatch, an append-only audit journal (`AUDIT_LOG_PATH`, JSON Lines) of every diagnosis, and **OpenTelemetry distributed tracing** (auto HTTP spans + manual spans per K8s/Prometheus/logs/RAG/LLM call, OTLP export to Jaeger/Tempo). |
 | 🚨 **Alertmanager webhook** | `POST /webhook/alertmanager` accepts the standard Alertmanager payload, diagnoses every `firing` alert (namespace/pod from labels, text from `annotations.summary`/`description`), skips `resolved`, and answers `400` on malformed payloads. |
 | 🔁 **Chaos self-test** | `scripts/chaos_test.py` creates an ImagePullBackOff pod, asks the agent to diagnose it, asserts the RCA mentions "image"/"pull", and cleans up. Idempotent. |
 | ☸️ **Helm chart** | Production-ready `charts/ai-agent` (v0.1.0): Deployment with probes & non-root securityContext, ClusterIP Service, least-privilege RBAC, ConfigMap/Secret from `values.yaml`, `make helm-lint` / `make helm-install`. |
 | 🖥️ **Operator dashboard** | `make dashboard` — Streamlit UI over the audit journal: incident table (Timestamp/Namespace/Severity/Root Cause), severity metrics, and approval cards with `suggested_fix` + "Approve & Apply" for every `requires_approval` incident. |
-| 🧪 **Testing & CI/CD** | 273 unit/integration tests with mocked clients (93% coverage, CI gate `--cov-fail-under=85`, SentenceTransformer mocked so tests never download models), plus an offline **evaluation framework** (`make eval`) with a golden dataset and LLM-as-a-judge scoring; | GitHub Actions pipeline: lint → test+coverage → Docker build+smoke → kind-based e2e on `main` (auto-skipped when no LLM secret is configured). |
+| 🧪 **Testing & CI/CD** | 310 unit/integration tests with mocked clients (93% coverage, CI gate `--cov-fail-under=85`, SentenceTransformer mocked so tests never download models), plus an offline **evaluation framework** (`make eval`) with a golden dataset and LLM-as-a-judge scoring; | GitHub Actions pipeline: lint → test+coverage → Docker build+smoke → kind-based e2e on `main` (auto-skipped when no LLM secret is configured). |
 | 🐳 **Containerized** | Multi-stage `python:3.12-slim` image, non-root user, healthcheck, no secrets baked into the image. |
 
 ---
@@ -464,6 +464,24 @@ All limits are configuration-driven (see table above), enforced **before** any c
 4. **No secrets anywhere** — API keys come exclusively from `.env` (never committed, excluded from the Docker image via `.dockerignore`); prompt/response logging at DEBUG never includes auth headers.
 5. **Graceful degradation** — a failing tool produces a warning in the report ("K8s API unavailable, using only Prometheus metrics"), not a crash; even a missing kubeconfig at startup only degrades K8s/log tools to empty results, and an unconfigured LLM key yields an actionable `503` (or stub mode via `LLM_OFFLINE=true`), never a bare `500`.
 6. **Non-root container** — the runtime image runs as `appuser` (UID 10001) with a read-only kubeconfig mount.
+7. **PII/secret scrubbing before LLM calls** — pod logs and Kubernetes events are masked (`[REDACTED:<type>]`) before the context is serialized for the external LLM provider; see [Data Privacy & PII Scrubbing](#data-privacy--pii-scrubbing) below.
+
+### Data Privacy & PII Scrubbing
+
+Container logs and Kubernetes events routinely carry secrets, and the diagnosis context is sent to a **third-party LLM provider** — so before serialization every payload passes through the scrubber (`src/utils/scrubber.py`, called by the orchestrator right before the LLM step):
+
+| Pattern | Example | Masked as |
+|---|---|---|
+| JWT tokens | `eyJhbGciOi...` | `[REDACTED:jwt]` |
+| API keys | `sk-...` (OpenAI), `ghp_...` (GitHub), `AKIA...` (AWS), `key-...` | `[REDACTED:api_key]` |
+| Passwords in URLs | `postgres://app:hunter2@db:5432/orders` | `postgres://app:[REDACTED:password]@db:5432/orders` |
+| Bearer tokens | `Authorization: Bearer abc...` | `[REDACTED:bearer]` |
+| Emails | `admin@example.com` | `[REDACTED:email]` |
+
+- **What is scrubbed**: `pod_logs_tail` and every Kubernetes event in the LLM context. **What is not**: the model's own answer (`root_cause`, `evidence`, `suggested_fix`) is returned as-is — it is generated text, not raw cluster data.
+- **IP addresses are NOT masked by default** — they are essential for network diagnosis; set `REDACT_IPS=true` to mask IPv4 addresses as well (`[REDACTED:ip]`).
+- **Disabling**: `ENABLE_SCRUBBING=false` turns masking into a pure passthrough — only do this for trusted local models (e.g. Ollama inside the cluster). Default is `true`; this is a hard requirement for enterprise compliance review.
+- **Observability**: every masked item increments the Prometheus counter `scrubbed_items_total{type="jwt|api_key|password|bearer|email|ip"}` — a sudden spike shows what kind of secrets are circulating in your workloads.
 
 ---
 
@@ -484,6 +502,7 @@ tests/
 ├── test_webhook_alertmanager.py  # Alertmanager payload parsing, 400s, resolved-skip, audit journal
 ├── test_tracing.py           # OTel provider, FastAPI auto-spans, manual tool/LLM spans
 ├── test_policies.py          # dangerous-fix policy, Slack approval flow, no-webhook fallback
+├── test_scrubber.py          # PII/secret masking: patterns, false positives, config, orchestrator wiring
 ├── test_evaluate.py          # eval harness: dataset schema, judge parsing, exit codes
 ├── test_dashboard.py         # audit journal parsing, table build, approval filter
 └── test_api.py               # FastAPI TestClient: /health /ready /diagnose /metrics, CORS, errors, X-Request-ID
@@ -682,10 +701,11 @@ ai_agent_DevOps/
 │       ├── audit.py             # append-only audit journal (JSON Lines)
 │       ├── logger.py            # stdlib logging setup
 │       ├── metrics.py           # custom Prometheus metrics
+│       ├── scrubber.py          # PII/secret masking before LLM calls ([REDACTED:<type>])
 │       └── text_utils.py        # truncate_context (bounded, JSON-safe)
 ├── charts/ai-agent/             # production Helm chart (v0.1.0): deployment,
 │                                # service, SA/RBAC, configmap, secret, helpers
-└── tests/                       # 273 tests, fully mocked externals
+└── tests/                       # 310 tests, fully mocked externals
 ```
 
 ---

@@ -13,6 +13,10 @@
                                  Kubernetes API в инструментах.
     llm_fallback_total           (Counter)                        — срабатывания
                                  fallback-диагноза (LLM вернул невалидный JSON).
+    scrubbed_items_total         (Counter,   type)                — число
+                                 замаскированных чувствительных элементов
+                                 (jwt/api_key/password/bearer/email/ip) перед
+                                 отправкой данных в LLM.
 """
 
 from __future__ import annotations
@@ -64,6 +68,13 @@ APPROVAL_REQUESTS_TOTAL = Counter(
     "Total number of dangerous-fix approvals requested from humans (Slack)",
 )
 
+SCRUBBED_ITEMS_TOTAL = Counter(
+    "scrubbed_items_total",
+    "Total number of sensitive items (secrets/PII) masked by the scrubber "
+    "before sending diagnosis data to the LLM",
+    ["type"],
+)
+
 
 # ----------------------------------------------------------------------
 # Хелперы инкрементирования (не падают при любых входных данных)
@@ -93,3 +104,16 @@ def inc_llm_fallback() -> None:
 def inc_approval_request() -> None:
     """Увеличить счётчик запрошенных человеческих аппрувов опасных фиксов."""
     APPROVAL_REQUESTS_TOTAL.inc()
+
+
+def inc_scrubbed_items(item_type: str | None, amount: int = 1) -> None:
+    """Увеличить счётчик замаскированных чувствительных элементов по типу.
+
+    Args:
+        item_type: тип секрета из scrubber'а (jwt/api_key/password/bearer/
+            email/ip); пустые значения нормализуются к ``unknown``.
+        amount: число замаскированных элементов (<= 0 игнорируется).
+    """
+    if amount <= 0:
+        return
+    SCRUBBED_ITEMS_TOTAL.labels(type=_label(item_type)).inc(amount)

@@ -33,8 +33,10 @@ from src.utils.metrics import (
     inc_approval_request,
     inc_diagnose_request,
     inc_llm_fallback,
+    inc_scrubbed_items,
     observe_diagnose_duration,
 )
+from src.utils.scrubber import scrub_sensitive_data, scrub_structure
 from src.utils.text_utils import (
     TOKEN_SOFT_LIMIT,
     estimate_tokens,
@@ -322,6 +324,51 @@ class IncidentOrchestrator:
             parts.extend(tail)
         return "\n".join(parts)
 
+    def _scrub_context(self, context: dict[str, Any]) -> dict[str, Any]:
+        """PII-guardrail: замаскировать секреты в логах и K8s-событиях до LLM.
+
+        Обрабатывает ``context["pod_logs_tail"]`` и каждый элемент
+        ``context["events"]`` (рекурсивно по строковым полям) ПЕРЕД
+        сериализацией контекста в JSON для LLM-провайдера: пароли, JWT,
+        API-ключи, Bearer-токены и email заменяются на ``[REDACTED:<type>]``
+        (см. :mod:`src.utils.scrubber`). Ответ LLM (root_cause / evidence /
+        suggested_fix) не маскируется — это сгенерированный моделью текст.
+
+        Конфигурация: ``ENABLE_SCRUBBING`` (default true; false — passthrough
+        для доверенных локальных моделей), ``REDACT_IPS`` (default false —
+        IP-адреса сохраняются, т.к. нужны для сетевой диагностики).
+
+        Счётчики замаскированных элементов по типам уходят в Prometheus-
+        метрику ``scrubbed_items_total{type}``.
+        """
+        if not self.settings.enable_scrubbing:
+            logger.debug("PII scrubbing disabled (ENABLE_SCRUBBING=false) — passthrough")
+            return context
+
+        totals: dict[str, int] = {}
+
+        def _merge(stats: dict[str, int]) -> None:
+            for item_type, count in stats.items():
+                totals[item_type] = totals.get(item_type, 0) + count
+
+        logs = context.get("pod_logs_tail")
+        if isinstance(logs, str) and logs:
+            context["pod_logs_tail"], stats = scrub_sensitive_data(
+                logs, enabled=True, redact_ips=self.settings.redact_ips
+            )
+            _merge(stats)
+        if "events" in context:
+            context["events"], stats = scrub_structure(
+                context["events"], enabled=True, redact_ips=self.settings.redact_ips
+            )
+            _merge(stats)
+
+        for item_type, count in totals.items():
+            inc_scrubbed_items(item_type, count)
+        if totals:
+            logger.info("PII scrubbed before LLM call: %s", totals)
+        return context
+
     # ------------------------------------------------------------------
     # Основной цикл диагностики
     # ------------------------------------------------------------------
@@ -557,6 +604,11 @@ class IncidentOrchestrator:
                 context["relevant_runbooks"] = runbooks
         else:
             warnings.append("pod_name не указан и не выводится из incident — skip per-pod steps")
+
+        # e0. PII/secret scrubbing: маскирование секретов ДО отправки в LLM.
+        # Логи и K8s-события уходят внешнему провайдеру — пароли/JWT/API-ключи/
+        # email не должны покидать периметр (Enterprise compliance).
+        context = self._scrub_context(context)
 
         # e/f. Контекст -> LLM: системный промт отдельно, данные — в user-сообщении.
         # truncate_context итеративно обрезает самые длинные строки (логи) по
