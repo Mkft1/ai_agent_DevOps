@@ -9,7 +9,7 @@
 <h1 align="center">K8s Incident Diagnosis AI Agent</h1>
 
 [![CI](https://github.com/Mkft1/ai_agent_DevOps/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/Mkft1/ai_agent_DevOps/actions/workflows/ci.yml)
-![Coverage](https://img.shields.io/badge/coverage-93%25-brightgreen)
+![Coverage](https://img.shields.io/badge/coverage-94%25-brightgreen)
 ![Python](https://img.shields.io/badge/python-3.12-blue?logo=python&logoColor=white)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](./LICENSE)
 [![Docker](https://img.shields.io/badge/docker-multistage-2496ED?logo=docker&logoColor=white)](./Dockerfile)
@@ -30,13 +30,14 @@ The agent is strictly **read-only by default**: it never mutates the cluster (`E
 | ☸️ **Kubernetes integration** | Official Python client: pods, events, deployments, nodes, container logs (including pre-restart logs for OOMKilled/CrashLoopBackOff). |
 | 📈 **Prometheus integration** | instant & range queries, per-pod CPU/memory usage via `container_*` cAdvisor metrics. |
 | 🛡️ **Guardrails** | Namespace allow-list (`ALLOWED_NAMESPACES`), log-size cap (`MAX_LOG_LINES`), context-size cap in tokens (`MAX_CONTEXT_TOKENS`, tiktoken), read-only mode (`ENABLE_WRITE_ACTIONS`), **two-level dangerous-action policy** (destructive patterns — `delete`/`drop`/`rm -rf`/`scale 0` and paraphrases like `remove the pod`, `terminate all instances`, `set replicas to 0`, `kubectl apply -f`, `chmod 777` — plus ANY non-read-only `kubectl`/`helm`/`oc` command are flagged `requires_approval: true` and routed to a human via Slack), cluster-level **Policy-as-Code**: least-privilege RBAC + Kyverno ClusterPolicies in `manifests/`, and **PII/secret scrubbing before LLM calls** (`ENABLE_SCRUBBING`: JWTs, API keys, passwords in URLs, Bearer tokens and emails in logs/events are masked as `[REDACTED:<type>]` before the context leaves the perimeter). All configurable via `.env`, nothing hardcoded. |
+| 🔐 **Authentication & RBAC (OIDC)** | Optional JWT auth (`OIDC_ENABLED`, default `false` = full backward compatibility): `POST /diagnose` and `POST /webhook/alertmanager` require a Bearer JWT from any OIDC provider (Keycloak/Auth0/Azure AD/Okta) — signature verified against the provider JWKS (RS/PS/ES/EdDSA only, `HS256` rejected), `iss`/`aud`/`exp` enforced, roles from the `roles`/`groups` claim (`401`/`403`, fail-closed); the webhook also accepts a constant-time-compared `X-Webhook-Secret` for Alertmanager. `/health`, `/ready`, `/metrics` stay open for probes/scraping. Dashboard login + admin-only approvals included. See [Authentication & Authorization](#authentication--authorization-oidc). |
 | 🩹 **Graceful degradation** | If any data source fails (K8s API down, Prometheus unreachable, empty logs), the agent records a warning in the report and continues diagnosing with whatever data it has — it never crashes the pipeline. |
 | 📊 **Observability** | `/metrics` endpoint (`prometheus-fastapi-instrumentator`) + custom counters/histograms: `diagnose_requests_total`, `diagnose_duration_seconds`, `k8s_api_errors_total`, `llm_fallback_total`, `scrubbed_items_total`, `policy_approval_required_total`. `X-Request-ID` correlation (echoed/generated per request), optional structured JSON logging (`LOG_FORMAT=json`) for Loki/CloudWatch, an append-only audit journal (`AUDIT_LOG_PATH`, JSON Lines) of every diagnosis, and **OpenTelemetry distributed tracing** (auto HTTP spans + manual spans per K8s/Prometheus/logs/RAG/LLM call, OTLP export to Jaeger/Tempo). |
 | 🚨 **Alertmanager webhook** | `POST /webhook/alertmanager` accepts the standard Alertmanager payload, diagnoses every `firing` alert (namespace/pod from labels, text from `annotations.summary`/`description`), skips `resolved`, and answers `400` on malformed payloads. |
 | 🔁 **Chaos self-test** | `scripts/chaos_test.py` creates an ImagePullBackOff pod, asks the agent to diagnose it, asserts the RCA mentions "image"/"pull", and cleans up. Idempotent. |
 | ☸️ **Helm chart** | Production-ready `charts/ai-agent` (v0.1.0): Deployment with probes & non-root securityContext, ClusterIP Service, least-privilege RBAC, ConfigMap/Secret from `values.yaml`, `make helm-lint` / `make helm-install`. |
-| 🖥️ **Operator dashboard** | `make dashboard` — Streamlit UI over the audit journal: incident table (Timestamp/Namespace/Severity/Root Cause), severity metrics, and approval cards with `suggested_fix` + "Approve & Apply" for every `requires_approval` incident. |
-| 🧪 **Testing & CI/CD** | 368 unit/integration tests with mocked clients (93% coverage, CI gate `--cov-fail-under=85`, SentenceTransformer mocked so tests never download models), plus an offline **evaluation framework** (`make eval`) with a golden dataset and LLM-as-a-judge scoring; | GitHub Actions pipeline: lint → test+coverage → Docker build+smoke → kind-based e2e on `main` (auto-skipped when no LLM secret is configured). |
+| 🖥️ **Operator dashboard** | `make dashboard` — Streamlit UI over the audit journal: incident table (Timestamp/Namespace/Severity/Root Cause), severity metrics, and approval cards with `suggested_fix` + "Approve & Apply" for every `requires_approval` incident. With OIDC enabled: JWT login screen, current user/roles in the sidebar, and the approve button rendered only for `sre-admin`/`devops-admin`. |
+| 🧪 **Testing & CI/CD** | 439 unit/integration tests with mocked clients (94% coverage, CI gate `--cov-fail-under=85`, SentenceTransformer mocked so tests never download models), plus an offline **evaluation framework** (`make eval`) with a golden dataset and LLM-as-a-judge scoring; | GitHub Actions pipeline: lint → test+coverage → Docker build+smoke → kind-based e2e on `main` (auto-skipped when no LLM secret is configured). |
 | 🐳 **Containerized** | Multi-stage `python:3.12-slim` image, non-root user, healthcheck, no secrets baked into the image. |
 
 ---
@@ -359,6 +360,145 @@ never limited — Kubernetes must always be able to check the pod.
 Automated proof that the limits work: `make load-test` — a Locust scenario verifying
 429 on `/diagnose` overload (see [Testing → Load Testing](#load-testing-rate-limit-verification)).
 
+## Authentication & Authorization (OIDC)
+
+The API and the operator dashboard support **OIDC authentication with role-based
+access control** (`src/auth.py`). It is **disabled by default**
+(`OIDC_ENABLED=false`): every endpoint behaves exactly as before, so dev
+environments, CI and existing deployments are unaffected. When enabled,
+state-changing endpoints require a valid **JWT** issued by your OIDC provider.
+
+### How it works
+
+```
+┌──────┐  1. sign-in   ┌───────────────────────┐
+│ User │ ────────────▶ │ OIDC Provider          │ Keycloak / Auth0 /
+└──┬───┘               │ (authorization server) │ Azure AD / Okta
+   │  2. JWT           └───────────┬───────────┘
+   │ ◀──────────────────────────── │
+   │                               │ 4. OIDC Discovery + JWKS
+   │ 3. Authorization: Bearer JWT  │    (public keys, cached 300 s)
+   ▼                               ▼
+┌──────────────────────────────────────────────┐
+│ AI DevOps Agent — FastAPI API + Streamlit UI │
+│ verify signature (RS/PS/ES/EdDSA) + iss/aud/ │
+│ exp, then check roles/groups claim (RBAC)    │
+└──────────────────────────────────────────────┘
+```
+
+### What is protected
+
+| Endpoint | Requirement when `OIDC_ENABLED=true` |
+|---|---|
+| `POST /diagnose` | Bearer JWT **+** at least one role from `ALLOWED_ROLES_DIAGNOSE` (default: `sre-user`, `sre-admin`) |
+| `POST /webhook/alertmanager` | Bearer JWT with a role from `ALLOWED_ROLES_WEBHOOK` (default: `alertmanager`, `sre-admin`) **or** header `X-Webhook-Secret` equal to `WEBHOOK_SHARED_SECRET` |
+| `GET /health`, `GET /ready`, `GET /metrics` | **Never protected** — kubelet probes and Prometheus scraping must keep working |
+
+- Missing / invalid / expired token → **401** with `WWW-Authenticate: Bearer`;
+  valid token but insufficient role → **403**.
+- Auth runs *before* the orchestrator bootstrap: an unauthenticated caller can
+  never reach the LLM pipeline (401/403 take precedence over 503).
+- Roles are read from the `roles` **or** `groups` claim (Keycloak / Azure AD /
+  Okta / Auth0 shapes); one match is enough.
+- `WEBHOOK_SHARED_SECRET` covers Alertmanager and similar integrations that
+  cannot sign JWTs; comparison is constant-time (`secrets.compare_digest`).
+  Generate one with `openssl rand -hex 32`.
+
+### Security properties
+
+- **Asymmetric algorithms only** (`RS*`, `PS*`, `ES*`, `EdDSA`) — `HS256` is
+  rejected by design, preventing algorithm-confusion attacks with public keys.
+- **Full claim validation**: `iss`, `aud`, `exp` are essential; the signature
+  is verified against the provider JWKS fetched via OIDC Discovery
+  (`{issuer}/.well-known/openid-configuration` → `jwks_uri`) and cached for
+  **300 s**, so key rotation is picked up automatically.
+- **Fail-closed**: provider unreachable or JWKS broken → `401`, never "open".
+- **No secrets in logs**: tokens and webhook secrets are never logged — only
+  error types and the `sub` claim.
+
+### Configuration (`.env`)
+
+All variables are documented in [`.env.example`](./.env.example):
+
+```bash
+OIDC_ENABLED=true
+OIDC_ISSUER_URL=https://keycloak.example.com/realms/devops
+OIDC_AUDIENCE=ai-agent-devops-api
+ALLOWED_ROLES_DIAGNOSE=["sre-user", "sre-admin"]
+ALLOWED_ROLES_WEBHOOK=["alertmanager", "sre-admin"]
+WEBHOOK_SHARED_SECRET=<openssl rand -hex 32>
+```
+
+`OIDC_ENABLED=true` with an empty issuer or audience is a **fail-fast
+configuration error** at startup (pydantic validator), not a runtime surprise.
+
+**Keycloak** — issuer is the realm URL (`https://keycloak.example.com/realms/devops`).
+Create a client (e.g. `ai-agent-devops-api`), add client roles `sre-user`,
+`sre-admin`, `alertmanager`, and attach a *Client scopes → Role list* mapper so
+roles land in the access-token `roles`/`groups` claim. Set `OIDC_AUDIENCE` to
+the client ID and make sure tokens are requested with `audience=ai-agent-devops-api`.
+
+**Auth0** — issuer `https://<tenant>.auth0.com/`, audience = the *API identifier*
+registered under Applications → APIs. Manage roles via *Auth0 → RBAC → Roles*
+and enable "Add permissions in the Access Token"; map permissions into the
+`roles` claim with an Action (or list your permission names in `ALLOWED_ROLES_*`).
+
+**Azure AD (Entra ID)** — issuer
+`https://login.microsoftonline.com/<tenant-id>/v2.0`. Expose an API
+(App registrations → Expose an API), add **App roles** `sre-user` / `sre-admin` /
+`alertmanager` (they appear in the token's `roles` claim) and set
+`OIDC_AUDIENCE` to the Application (client) ID.
+
+Calling the API:
+
+```bash
+TOKEN=<obtained from your provider: browser SSO, client-credentials, oidc-cli>
+curl -sS -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+  -d '{"namespace": "default", "description": "Pod restarts repeatedly"}' \
+  http://localhost:8000/diagnose
+
+# Alertmanager-style webhook call with the shared secret instead of a JWT:
+curl -sS -H "X-Webhook-Secret: $WEBHOOK_SHARED_SECRET" \
+  -H 'Content-Type: application/json' \
+  -d @alertmanager-payload.json http://localhost:8000/webhook/alertmanager
+```
+
+For Alertmanager itself, put the secret into `http_config.http_headers`:
+
+```yaml
+receivers:
+  - name: ai-agent
+    webhook_configs:
+      - url: http://ai-agent.monitoring.svc:8000/webhook/alertmanager
+        http_headers:
+          X-Webhook-Secret: <WEBHOOK_SHARED_SECRET>   # store in a K8s Secret
+```
+
+### Role model (defaults)
+
+| Role | `POST /diagnose` | `POST /webhook/alertmanager` | Dashboard approvals |
+|---|---|---|---|
+| `sre-user` | ✅ allowed | ❌ 403 | view only |
+| `sre-admin` | ✅ allowed | ✅ allowed | ✅ "Approve & Apply" |
+| `devops-admin` | ❌ 403 (add to `ALLOWED_ROLES_DIAGNOSE` to allow) | ❌ 403 (add to `ALLOWED_ROLES_WEBHOOK` to allow) | ✅ "Approve & Apply" |
+| `alertmanager` (service account) | ❌ 403 | ✅ allowed | — |
+
+To assign roles: create them in your IdP (client roles / App roles / RBAC
+roles), assign to users or service accounts, and make sure the IdP emits them
+in the access-token `roles` or `groups` claim — the agent reads whichever is
+present (`roles` takes precedence).
+
+### Dashboard (Streamlit)
+
+With `OIDC_ENABLED=true` the dashboard shows a **login screen** first: a link
+button to the provider's sign-in page plus a JWT paste field. The token is
+kept in `st.session_state["user_token"]` only — never logged, never persisted.
+The sidebar shows the current user (`sub`) and roles with a **Logout** button.
+The "✅ Approve & Apply" button on approval cards is rendered **only for
+`sre-admin` / `devops-admin`** — roles are decoded client-side from the JWT
+payload (no signature check in the browser; the API remains the actual
+enforcement point). With OIDC disabled the dashboard behaves exactly as before.
+
 ## Security & Policy-as-Code
 
 Application guardrails (`ALLOWED_NAMESPACES`, read-only mode) are the first line of
@@ -522,6 +662,7 @@ tests/
 ├── test_text_utils.py        # truncate_context recursion & guarantees
 ├── test_chaos_test.py        # chaos script logic (mocked k8s + requests)
 ├── test_config.py            # Settings validators: fail-fast on bad LOG_LEVEL/LOG_FORMAT/limits
+├── test_auth.py              # OIDC: real RS256 JWTs vs fake JWKS provider, 401/403, webhook secret, UI login
 ├── test_logger.py            # JSON structured logging + request_id correlation
 ├── test_webhook_alertmanager.py  # Alertmanager payload parsing, 400s, resolved-skip, audit journal
 ├── test_tracing.py           # OTel provider, FastAPI auto-spans, manual tool/LLM spans
@@ -533,7 +674,7 @@ tests/
 ```
 
 - **Unit tests**: every external boundary (Kubernetes API, Prometheus HTTP, LLM HTTP) is mocked — the suite runs offline in ~2 seconds.
-- **Coverage**: `pytest --cov=src --cov-report=xml --cov-fail-under=85` — currently **~93%** (uploaded as a CI artifact every run; the CI fails if coverage drops below 85%).
+- **Coverage**: `pytest --cov=src --cov-report=xml --cov-fail-under=85` — currently **~94%** (uploaded as a CI artifact every run; the CI fails if coverage drops below 85%).
 - **Docs drift guard**: `make docs-check` (и шаг CI после pytest) сверяет числа
   тестов/покрытия в этом README с реальным прогоном — расхождение роняет CI.
 - **Integration (end-to-end)**: `scripts/run_integration_test.sh` spins up a real [kind](https://kind.sigs.k8s.io/) cluster, creates a pod with a bad image tag, runs the agent under uvicorn, sends a real `POST /diagnose`, and asserts the RCA mentions *"image"*/*"pull"* (via `jq`). Idempotent: leftover clusters/pods are removed before each run; cleanup happens even on failure.
@@ -713,6 +854,7 @@ ai_agent_DevOps/
 ├── src/
 │   ├── main.py                  # FastAPI app: /health /ready /diagnose /metrics /webhook/alertmanager
 │   ├── api/models.py            # pydantic contracts: Alertmanager payload -> Incident
+│   ├── auth.py                  # OIDC auth & RBAC: JWT verification (JWKS), FastAPI dependencies
 │   ├── config.py                # pydantic-settings (.env driven)
 │   ├── prompts/sre_system.txt   # system prompt for the LLM (loaded at init, fallback in code)
 │   ├── agent/
@@ -729,7 +871,7 @@ ai_agent_DevOps/
 │       └── text_utils.py        # truncate_context (bounded, JSON-safe)
 ├── charts/ai-agent/             # production Helm chart (v0.1.0): deployment,
 │                                # service, SA/RBAC, configmap, secret, helpers
-└── tests/                       # 368 tests, fully mocked externals
+└── tests/                       # 439 tests, fully mocked externals
 ```
 
 ---

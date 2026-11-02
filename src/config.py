@@ -2,7 +2,7 @@
 
 from functools import lru_cache
 
-from pydantic import field_validator
+from pydantic import field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 # Допустимые значения LOG_LEVEL (fail-fast при старте, а не в рантайме).
@@ -88,6 +88,28 @@ class Settings(BaseSettings):
     max_context_tokens: int = 4000
 
     # ------------------------------------------------------------------
+    # OIDC-аутентификация и ролевая авторизация (RBAC); см. src/auth.py
+    # ------------------------------------------------------------------
+    # false (по умолчанию) — аутентификация полностью отключена: все
+    # эндпоинты ведут себя как раньше (обратная совместимость для dev/CI).
+    oidc_enabled: bool = False
+    # Issuer URL OIDC-провайдера (Keycloak/Auth0/Azure AD/Okta). Используется
+    # для Discovery ({issuer}/.well-known/openid-configuration -> jwks_uri)
+    # и проверки claim `iss` в JWT. Обязателен при OIDC_ENABLED=true.
+    oidc_issuer_url: str = ""
+    # Audience (`aud` claim) — идентификатор этого API, зарегистрированный
+    # в OIDC-провайдере. Обязателен при OIDC_ENABLED=true.
+    oidc_audience: str = ""
+    # Роли для POST /diagnose: claim `roles` или `groups` JWT должен
+    # содержать хотя бы одну роль из списка (иначе 403).
+    allowed_roles_diagnose: list[str] = ["sre-user", "sre-admin"]
+    # Роли для POST /webhook/alertmanager (JWT-путь аутентификации).
+    allowed_roles_webhook: list[str] = ["alertmanager", "sre-admin"]
+    # Shared-секрет вебхука Alertmanager (заголовок X-Webhook-Secret) —
+    # альтернатива JWT для machine-to-machine вызовов. None — способ отключён.
+    webhook_shared_secret: str | None = None
+
+    # ------------------------------------------------------------------
     # Валидация конфигурации (fail-fast при старте приложения)
     # ------------------------------------------------------------------
     @field_validator("log_level")
@@ -125,6 +147,21 @@ class Settings(BaseSettings):
         if value < 256:
             raise ValueError(f"max_context_tokens must be >= 256, got {value}")
         return value
+
+    @model_validator(mode="after")
+    def _validate_oidc_config(self) -> "Settings":
+        """OIDC_ENABLED=true требует непустые OIDC_ISSUER_URL и OIDC_AUDIENCE.
+
+        Fail-fast при старте: включить проверку JWT без issuer/audience —
+        конфигурационная ошибка, а не состояние рантайма.
+        """
+        if self.oidc_enabled and (
+            not self.oidc_issuer_url.strip() or not self.oidc_audience.strip()
+        ):
+            raise ValueError(
+                "OIDC_ENABLED=true requires non-empty OIDC_ISSUER_URL and OIDC_AUDIENCE"
+            )
+        return self
 
     @property
     def llm_api_key(self) -> str | None:

@@ -9,6 +9,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- OIDC authentication and role-based authorization (`src/auth.py`): опциональная
+  JWT-защита `POST /diagnose` и `POST /webhook/alertmanager` (`OIDC_ENABLED`,
+  по умолчанию `false` — полная обратная совместимость). JWT проверяется целиком
+  на стороне API: подпись по JWKS провайдера (OIDC Discovery
+  `{issuer}/.well-known/openid-configuration`, кэш ключей 300 с), обязательные
+  claims `iss`/`aud`/`exp`; разрешены только асимметричные алгоритмы
+  RS/PS/ES/EdDSA (`HS256` отклоняется — защита от algorithm-confusion);
+  fail-closed: невалидный/просроченный токен или недоступный провайдер → `401`
+  (`WWW-Authenticate: Bearer`). RBAC по claim `roles`/`groups`:
+  `ALLOWED_ROLES_DIAGNOSE` (default `["sre-user", "sre-admin"]`) и
+  `ALLOWED_ROLES_WEBHOOK` (default `["alertmanager", "sre-admin"]`),
+  недостаточная роль → `403`; аутентификация выполняется до создания
+  оркестратора (401/403 раньше 503). Вебхук Alertmanager дополнительно
+  принимает shared-секрет в заголовке `X-Webhook-Secret`
+  (`WEBHOOK_SHARED_SECRET`, constant-time сравнение `secrets.compare_digest`) —
+  для интеграций без возможности подписывать JWT. `/health`, `/ready`,
+  `/metrics` не защищаются никогда (kubelet-пробы, Prometheus-scraping).
+  Токены и секреты не попадают в логи. Fail-fast валидация конфигурации:
+  `OIDC_ENABLED=true` без `OIDC_ISSUER_URL`/`OIDC_AUDIENCE` не запускается.
+  Streamlit-дашборд (`ui/dashboard.py`): при включённом OIDC — экран логина
+  (ссылка на провайдера + поле ввода JWT, хранение только в
+  `st.session_state["user_token"]`), пользователь/роли в сайдбаре с кнопкой
+  Logout, а «Approve & Apply» рендерится только для `sre-admin`/`devops-admin`
+  (клиентское декодирование claims без проверки подписи; реальная авторизация —
+  на API). Зависимости: `authlib==1.9.2` + `itsdangerous==2.2.0`; ОТКЛОНЕНИЕ от
+  версий спецификации (authlib 1.3.0, python-jose 3.3.0): authlib 1.3.0 имеет
+  12 advisory pip-audit (исправлены в 1.6.9–1.9.1), python-jose исключён —
+  неисправленный PYSEC-2026-4298 (HS256 algorithm-confusion, fix нет даже в
+  3.5.0) плюс зависимость ecdsa с PYSEC-2026-1325; блокирующий dependency-audit
+  CI не пропустил бы эти пины. Тесты: `tests/test_auth.py` — 71 тест (реальные
+  RS256-JWT против фейкового JWKS-провайдера: подпись/iss/aud/exp, tampering,
+  HS256, unknown kid, fail-closed, кэш JWKS и TTL, 401/403 на HTTP-слое,
+  открытые пробы, webhook-секрет, отсутствие токенов/секретов в логах,
+  UI-логин и gating аппрувов через AppTest). Документация: раздел
+  «Authentication & Authorization (OIDC)» в README.md/README.ru.md (флоу,
+  примеры Keycloak/Auth0/Azure AD, ролевая модель), переменные в `.env.example`.
 - Extended policy guardrail (`src/agent/policies.py`): двухуровневая защита от
   опасных рекомендаций LLM. Уровень 1 — 18 регистронезависимых regex вместо
   4 substring'ов: к `delete`/`drop`/`rm -rf`/`scale 0` добавлены синонимы и
