@@ -15,7 +15,7 @@ AI-агент для диагностики инцидентов в Kubernetes. 
 [![Python 3.12](https://img.shields.io/badge/python-3.12-blue?logo=python&logoColor=white)](https://www.python.org/downloads/)
 [![Docker](https://img.shields.io/badge/docker-multistage%20image-2496ED?logo=docker&logoColor=white)](./Dockerfile)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](./LICENSE)
-[![Tests](https://img.shields.io/badge/tests-368%20passed-brightgreen?logo=pytest&logoColor=white)](#тесты)
+[![Tests](https://img.shields.io/badge/tests-439%20passed-brightgreen?logo=pytest&logoColor=white)](#тесты)
 [![Ruff](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/astral-sh/ruff/main/assets/badge/v2.json)](https://github.com/astral-sh/ruff)
 
 AI-агент для диагностики инцидентов в Kubernetes.
@@ -101,16 +101,29 @@ Alertmanager → /diagnose → IncidentOrchestrator → [K8sTools, PrometheusToo
   маскирование PII/секретов перед отправкой в LLM (`ENABLE_SCRUBBING`: JWT,
   API-ключи, пароли в URL, Bearer-токены, email в логах и событиях заменяются
   на `[REDACTED:<type>]` до выхода контекста за периметр).
+- **Аутентификация и RBAC (OIDC)** — опциональная проверка JWT (`OIDC_ENABLED`,
+  по умолчанию `false` — полная обратная совместимость): `POST /diagnose` и
+  `POST /webhook/alertmanager` принимают Bearer JWT от любого OIDC-провайдера
+  (Keycloak/Auth0/Azure AD/Okta) — подпись проверяется по JWKS провайдера
+  (только асимметричные RS/PS/ES/EdDSA, `HS256` отклоняется), `iss`/`aud`/`exp`
+  обязательны, доступ по ролям из claim `roles`/`groups` (`401`/`403`,
+  fail-closed); вебхук также принимает shared-секрет `X-Webhook-Secret`
+  (constant-time сравнение) для Alertmanager. `/health`, `/ready`, `/metrics`
+  не защищаются никогда. В дашборде — экран логина и аппрув только для
+  админов. См. «Аутентификация и авторизация (OIDC)».
 - **Helm-чарт** — production-ready `charts/ai-agent` (v0.1.0): Deployment с probes
   и non-root securityContext, ClusterIP Service, least-privilege RBAC,
   ConfigMap/Secret из `values.yaml`, `make helm-lint` / `make helm-install`.
 - **Дашборд оператора** — `make dashboard`: Streamlit-UI поверх журнала аудита
   (таблица инцидентов Timestamp/Namespace/Severity/Root Cause, метрики по severity,
   карточки аппрува с `suggested_fix` и кнопкой "Approve & Apply" для инцидентов с
-  `requires_approval=true`); запускается отдельно от FastAPI, кластер не трогает.
-- **Тестирование** — 368 unit/интеграционных тестов (pytest + unittest.mock), покрытие ~93%
+  `requires_approval=true`); при включённом OIDC — экран логина по JWT, пользователь
+  и роли в сайдбаре, кнопка аппрува только для `sre-admin`/`devops-admin`;
+  запускается отдельно от FastAPI, кластер не трогает.
+- **Тестирование** — 439 unit/интеграционных тестов (pytest + unittest.mock), покрытие ~94%
   (гейт в CI `--cov-fail-under=85`): инструменты, оркестратор, LLM-клиент (мок HTTP),
-  FastAPI-эндпоинты (TestClient), конфигурация и логирование, chaos-скрипт.
+  FastAPI-эндпоинты (TestClient), конфигурация и логирование, chaos-скрипт,
+  OIDC-аутентификация (реальные RS256-JWT против фейкового JWKS-провайдера).
 - **DevOps-практики** — многоступенчатый Docker-образ, docker-compose, идемпотентный
   chaos-эксперимент (ImagePullBackOff) как end-to-end проверка качества диагностики.
 - **Evaluation-фреймворк** — `make eval`: золотой датасет инцидентов прогоняется через
@@ -149,6 +162,7 @@ ai_agent_DevOps/
 │   ├── api/
 │   │   └── models.py      # pydantic-контракты: пейлоад Alertmanager -> Incident
 │   ├── config.py          # Загрузка конфигурации из .env
+│   ├── auth.py            # OIDC-аутентификация и RBAC: проверка JWT (JWKS), зависимости FastAPI
 │   ├── agent/
 │   │   ├── orchestrator.py  # Оркестрация шагов диагностики (K8s -> контекст -> LLM -> RCA)
 │   │   ├── policies.py      # 2 уровня политики опасных фиксов (regex-синонимы + kubectl/helm/oc) -> аппрув
@@ -285,6 +299,12 @@ curl http://localhost:8000/health
 | `OTEL_SERVICE_NAME` | `ai-agent-devops`                            | Имя сервиса (`service.name`) в UI Jaeger/Tempo |
 | `ENABLE_HYBRID_RAG` | `true`                                       | Гибридный RAG-поиск (TF-IDF + эмбеддинги); `false` — только TF-IDF |
 | `EMBEDDING_MODEL` | `all-MiniLM-L6-v2`                           | Модель sentence-transformers для векторной ветки гибридного RAG |
+| `OIDC_ENABLED`    | `false`                                        | Аутентификация JWT для `/diagnose` и `/webhook/alertmanager`; `false` — API открыт (обратная совместимость) |
+| `OIDC_ISSUER_URL` | —                                              | Issuer URL OIDC-провайдера (Discovery + проверка `iss`); обязателен при `OIDC_ENABLED=true` |
+| `OIDC_AUDIENCE`   | —                                              | Audience этого API (claim `aud`); обязателен при `OIDC_ENABLED=true` |
+| `ALLOWED_ROLES_DIAGNOSE` | `["sre-user", "sre-admin"]`             | Роли для `POST /diagnose` (claim `roles`/`groups`; JSON-массив) |
+| `ALLOWED_ROLES_WEBHOOK`  | `["alertmanager", "sre-admin"]`           | Роли для `POST /webhook/alertmanager` (JWT-путь) |
+| `WEBHOOK_SHARED_SECRET`  | — (выключено)                             | Shared-секрет вебхука (заголовок `X-Webhook-Secret`, constant-time сравнение) — альтернатива JWT для Alertmanager |
 
 ## Безопасность (guardrails)
 
@@ -496,6 +516,147 @@ SLACK_WEBHOOK_URL=https://hooks.slack.com/services/T000/B000/XXXX
 Автоматизированное доказательство работы лимитов: `make load-test` — Locust-сценарий,
 проверяющий 429 при перегрузке `/diagnose` (см. «Тесты и линтеры → Нагрузочное
 тестирование»).
+
+## Аутентификация и авторизация (OIDC)
+
+API и дашборд оператора поддерживают **OIDC-аутентификацию с ролевой моделью
+доступа (RBAC)** — `src/auth.py`. По умолчанию она **выключена**
+(`OIDC_ENABLED=false`): все эндпоинты работают ровно как раньше — dev-окружения,
+CI и существующие деплои ничего не замечают. При включении изменяющие состояние
+эндпоинты требуют валидный **JWT**, выданный вашим OIDC-провайдером.
+
+### Как это работает
+
+```
+┌───────────┐  1. вход   ┌───────────────────────┐
+│ Пользова- │ ─────────▶ │ OIDC-провайдер         │ Keycloak / Auth0 /
+│ тель      │            │ (authorization server) │ Azure AD / Okta
+└─────┬─────┘            └───────────┬───────────┘
+      │  2. JWT                      │
+      │ ◀─────────────────────────── │
+      │                              │ 4. OIDC Discovery + JWKS
+      │ 3. Authorization: Bearer JWT │    (публичные ключи, кэш 300 с)
+      ▼                              ▼
+┌──────────────────────────────────────────────┐
+│ AI DevOps Agent — FastAPI API + Streamlit UI │
+│ проверка подписи (RS/PS/ES/EdDSA) и iss/aud/ │
+│ exp, затем роли из roles/groups (RBAC)       │
+└──────────────────────────────────────────────┘
+```
+
+### Что защищено
+
+| Эндпоинт | Требование при `OIDC_ENABLED=true` |
+|---|---|
+| `POST /diagnose` | Bearer JWT **+** хотя бы одна роль из `ALLOWED_ROLES_DIAGNOSE` (по умолчанию `sre-user`, `sre-admin`) |
+| `POST /webhook/alertmanager` | Bearer JWT с ролью из `ALLOWED_ROLES_WEBHOOK` (по умолчанию `alertmanager`, `sre-admin`) **или** заголовок `X-Webhook-Secret`, равный `WEBHOOK_SHARED_SECRET` |
+| `GET /health`, `GET /ready`, `GET /metrics` | **Не защищаются никогда** — kubelet-пробы и Prometheus-scraping обязаны работать |
+
+- Отсутствующий / невалидный / просроченный токен → **401** с
+  `WWW-Authenticate: Bearer`; валидный токен, но недостаточная роль → **403**.
+- Аутентификация выполняется *до* создания оркестратора: неаутентифицированный
+  вызов не доберётся до LLM-конвейера (401/403 имеют приоритет над 503).
+- Роли читаются из claim `roles` **или** `groups` (форматы Keycloak / Azure AD /
+  Okta / Auth0); достаточно одного совпадения.
+- `WEBHOOK_SHARED_SECRET` — для Alertmanager и подобных интеграций, которые не
+  умеют подписывать JWT; сравнение constant-time (`secrets.compare_digest`).
+  Сгенерируйте значение командой `openssl rand -hex 32`.
+
+### Свойства безопасности
+
+- **Только асимметричные алгоритмы** (`RS*`, `PS*`, `ES*`, `EdDSA`) — `HS256`
+  отклоняется намеренно: защита от algorithm-confusion (подмены подписи
+  публичным ключом).
+- **Полная валидация claims**: `iss`, `aud`, `exp` обязательны; подпись
+  проверяется по JWKS провайдера, полученному через OIDC Discovery
+  (`{issuer}/.well-known/openid-configuration` → `jwks_uri`) и кэшируемому на
+  **300 с** — ротация ключей подхватывается автоматически.
+- **Fail-closed**: провайдер недоступен или JWKS битый → `401`, а не «открыто».
+- **Никаких секретов в логах**: токены и shared-секреты не логируются — только
+  типы ошибок и claim `sub`.
+
+### Конфигурация (`.env`)
+
+Все переменные описаны в [`.env.example`](./.env.example):
+
+```bash
+OIDC_ENABLED=true
+OIDC_ISSUER_URL=https://keycloak.example.com/realms/devops
+OIDC_AUDIENCE=ai-agent-devops-api
+ALLOWED_ROLES_DIAGNOSE=["sre-user", "sre-admin"]
+ALLOWED_ROLES_WEBHOOK=["alertmanager", "sre-admin"]
+WEBHOOK_SHARED_SECRET=<openssl rand -hex 32>
+```
+
+`OIDC_ENABLED=true` с пустым issuer или audience — **fail-fast ошибка
+конфигурации** при старте (pydantic-валидатор), а не сюрприз в рантайме.
+
+**Keycloak** — issuer это URL realm'а (`https://keycloak.example.com/realms/devops`).
+Создайте клиент (например, `ai-agent-devops-api`), добавьте клиентские роли
+`sre-user`, `sre-admin`, `alertmanager` и подключите маппер *Client scopes →
+Role list*, чтобы роли попадали в claim `roles`/`groups` access-токена.
+`OIDC_AUDIENCE` = client ID; запрашивайте токен с `audience=ai-agent-devops-api`.
+
+**Auth0** — issuer `https://<tenant>.auth0.com/`, audience = *API identifier*,
+зарегистрированный в Applications → APIs. Роли ведите через *Auth0 → RBAC →
+Roles*, включите «Add permissions in the Access Token»; смаппите permissions в
+claim `roles` через Action (или перечислите имена permissions в `ALLOWED_ROLES_*`).
+
+**Azure AD (Entra ID)** — issuer
+`https://login.microsoftonline.com/<tenant-id>/v2.0`. Опубликуйте API
+(App registrations → Expose an API), добавьте **App roles** `sre-user` /
+`sre-admin` / `alertmanager` (они попадут в claim `roles` токена), а
+`OIDC_AUDIENCE` = Application (client) ID.
+
+Вызов API:
+
+```bash
+TOKEN=<получите у провайдера: браузерный SSO, client-credentials, oidc-cli>
+curl -sS -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+  -d '{"namespace": "default", "description": "Pod restarts repeatedly"}' \
+  http://localhost:8000/diagnose
+
+# Вызов вебхука в стиле Alertmanager c shared-секретом вместо JWT:
+curl -sS -H "X-Webhook-Secret: $WEBHOOK_SHARED_SECRET" \
+  -H 'Content-Type: application/json' \
+  -d @alertmanager-payload.json http://localhost:8000/webhook/alertmanager
+```
+
+Самому Alertmanager секрет передаётся через `http_config.http_headers`:
+
+```yaml
+receivers:
+  - name: ai-agent
+    webhook_configs:
+      - url: http://ai-agent.monitoring.svc:8000/webhook/alertmanager
+        http_headers:
+          X-Webhook-Secret: <WEBHOOK_SHARED_SECRET>   # храните в K8s Secret
+```
+
+### Ролевая модель (значения по умолчанию)
+
+| Роль | `POST /diagnose` | `POST /webhook/alertmanager` | Аппрувы в дашборде |
+|---|---|---|---|
+| `sre-user` | ✅ разрешено | ❌ 403 | только просмотр |
+| `sre-admin` | ✅ разрешено | ✅ разрешено | ✅ «Approve & Apply» |
+| `devops-admin` | ❌ 403 (добавьте в `ALLOWED_ROLES_DIAGNOSE`) | ❌ 403 (добавьте в `ALLOWED_ROLES_WEBHOOK`) | ✅ «Approve & Apply» |
+| `alertmanager` (сервисный аккаунт) | ❌ 403 | ✅ разрешено | — |
+
+Назначение ролей: создайте их в своём IdP (client roles / App roles / RBAC
+roles), назначьте пользователям или сервисным аккаунтам и убедитесь, что IdP
+кладёт их в claim `roles` или `groups` access-токена — агент читает то, что
+присутствует (приоритет у `roles`).
+
+### Дашборд (Streamlit)
+
+При `OIDC_ENABLED=true` дашборд сначала показывает **экран логина**: кнопка-
+ссылка на sign-in страницу провайдера и поле ввода JWT. Токен хранится только в
+`st.session_state["user_token"]` — не логируется и не сохраняется на диск. В
+сайдбаре видны текущий пользователь (`sub`) и роли, есть кнопка **Logout**.
+Кнопка «✅ Approve & Apply» в карточках аппрува рендерится **только для
+`sre-admin` / `devops-admin`** — роли декодируются из payload JWT на клиенте
+(без проверки подписи в браузере; фактическая авторизация — на стороне API).
+При выключенном OIDC дашборд ведёт себя точно как раньше.
 
 ## Безопасность и Policy-as-Code
 
@@ -715,10 +876,10 @@ ruff check src tests scripts
 python -m pytest --cov=src --cov-report=xml tests/
 ```
 
-Текущий набор: **368 passed**, покрытие **~93%** (инструменты K8s/Prometheus/логов,
+Текущий набор: **439 passed**, покрытие **~94%** (инструменты K8s/Prometheus/логов,
 оркестратор, LLM-клиент с моками HTTP, FastAPI-эндпоинты через TestClient (включая
 webhook Alertmanager и журнал аудита), валидация конфигурации, JSON-логирование,
-трейсинг OpenTelemetry, chaos-скрипт).
+трейсинг OpenTelemetry, chaos-скрипт, OIDC-аутентификация и RBAC).
 
 ### Нагрузочное тестирование (проверка rate limiting)
 

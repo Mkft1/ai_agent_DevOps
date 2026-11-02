@@ -5,12 +5,18 @@
     make dashboard            # или: streamlit run ui/dashboard.py
 
 Экраны:
+    * OIDC-логин (только при ``OIDC_ENABLED=true``): форма ввода JWT,
+      полученного у провайдера (ссылка на sign-in страницу issuer'а),
+      токен хранится в ``st.session_state["user_token"]`` и НЕ логируется;
     * три большие метрики: Total / Critical / Pending Approvals;
     * таблица инцидентов Time | Namespace | Pod | Severity | Root Cause
       с цветовым кодированием severity (🔴/🟠/🟡/🟢) и читаемым временем;
     * карточки аппрува для инцидентов с ``requires_approval=True``:
       root cause, suggested_fix и кнопка "✅ Approve & Apply"
-      (демо-подтверждение: кластер дашборд НЕ изменяет);
+      (демо-подтверждение: кластер дашборд НЕ изменяет). При включённом
+      OIDC кнопка доступна только ролям ``sre-admin``/``devops-admin``
+      (клиентская расшифровка JWT-claims БЕЗ проверки подписи — настоящая
+      авторизация выполняется API);
     * раскрывающийся блок с сырым журналом аудита.
 
 Данные читаются построчно через ``json`` (JSON Lines); ``pd.read_json`` не
@@ -20,6 +26,8 @@
 
 from __future__ import annotations
 
+import base64
+import binascii
 import json
 import sys
 from datetime import datetime
@@ -30,10 +38,14 @@ import streamlit as st
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from src.config import get_settings  # noqa: E402
+from src.auth import extract_user_roles  # noqa: E402
+from src.config import Settings, get_settings  # noqa: E402
 
 # События аудита, которые считаются диагнозами (строки таблицы).
 DIAGNOSIS_EVENTS = {"diagnose", "alertmanager_diagnose"}
+
+# Роли, которым разрешён аппрув опасных рекомендаций в UI (OIDC-режим).
+ADMIN_ROLES = ("sre-admin", "devops-admin")
 
 TABLE_COLUMNS = ["Time", "Namespace", "Pod", "Severity", "Root Cause"]
 
@@ -145,8 +157,102 @@ def approvals_pending(events: list[dict]) -> list[dict]:
     ]
 
 
-def render_approval_card(index: int, event: dict) -> None:
-    """Карточка опасной рекомендации: root cause, suggested fix, кнопка аппрува."""
+# ----------------------------------------------------------------------
+# OIDC на стороне UI: клиентская расшифровка JWT (БЕЗ проверки подписи).
+# Подпись/iss/aud/exp проверяет API (src/auth.py) — здесь только UX:
+# показать текущего пользователя и скрыть аппрув у не-админов.
+# ----------------------------------------------------------------------
+def decode_jwt_payload(token: str) -> dict:
+    """Расшифровать payload JWT (вторая base64url-часть) в словарь.
+
+    Возвращает ``{}`` для любого нераспарсиваемого значения: пустая строка,
+    меньше трёх частей, не-base64, не-JSON, JSON не-объект. Исключения не
+    наружу — дашборд не должен падать из-за мусора в поле логина.
+    """
+    try:
+        parts = str(token or "").strip().split(".")
+        if len(parts) < 2:
+            return {}
+        segment = parts[1]
+        padded = segment + "=" * (-len(segment) % 4)
+        payload = json.loads(base64.urlsafe_b64decode(padded))
+        return payload if isinstance(payload, dict) else {}
+    except (binascii.Error, UnicodeDecodeError, ValueError):
+        return {}
+
+
+def decode_jwt_roles(token: str) -> list[str]:
+    """Роли пользователя из JWT: claim ``roles`` или ``groups``.
+
+    Использует ту же логику извлечения, что и API (:func:`src.auth.
+    extract_user_roles`), — единый контракт claims на UI и бэкенде.
+    """
+    return extract_user_roles(decode_jwt_payload(token))
+
+
+def current_user_is_admin() -> bool:
+    """True, если у токена в session_state есть роль аппрува (OIDC-режим)."""
+    token = str(st.session_state.get("user_token", ""))
+    return any(role in ADMIN_ROLES for role in decode_jwt_roles(token))
+
+
+def render_login(settings: Settings) -> None:
+    """Форма OIDC-логина: ссылка на провайдера + поле ввода JWT.
+
+    Токен кладётся в ``st.session_state["user_token"]`` (только память
+    вкладки браузера) и нигде не логируется/не сохраняется на диск.
+    """
+    st.title("AI DevOps Agent - Incident Dashboard")
+    st.subheader("🔐 Sign in (OIDC)")
+    st.markdown(
+        "Аутентификация включена (`OIDC_ENABLED=true`). Войдите через вашего "
+        "OIDC-провайдера и вставьте выданный **JWT access token** ниже. Токен "
+        "хранится только в session state этой вкладки."
+    )
+    if settings.oidc_issuer_url:
+        st.link_button("Open OIDC provider sign-in", settings.oidc_issuer_url)
+    with st.form("oidc_login_form"):
+        token = st.text_input(
+            "JWT access token",
+            type="password",
+            key="login_token_input",
+            placeholder="eyJhbGciOi...",
+        )
+        submitted = st.form_submit_button("Sign in")
+    if submitted:
+        if decode_jwt_payload(token):
+            st.session_state["user_token"] = str(token).strip()
+            st.rerun()
+        else:
+            st.error("Invalid JWT: token payload could not be decoded.")
+
+
+def render_user_sidebar(settings: Settings) -> None:
+    """Блок пользователя в сайдбаре: sub, роли, Logout (только OIDC-режим)."""
+    if not settings.oidc_enabled:
+        return
+    token = str(st.session_state.get("user_token", ""))
+    payload = decode_jwt_payload(token)
+    roles = decode_jwt_roles(token)
+    st.sidebar.markdown("---")
+    st.sidebar.markdown(f"**👤 User:** `{payload.get('sub', 'unknown')}`")
+    st.sidebar.caption("roles: " + (", ".join(roles) if roles else "none"))
+    if st.sidebar.button("Logout", key="logout_button"):
+        st.session_state.pop("user_token", None)
+        st.rerun()
+
+
+def render_approval_card(index: int, event: dict, can_approve: bool = True) -> None:
+    """Карточка опасной рекомендации: root cause, suggested fix, кнопка аппрува.
+
+    Args:
+        index: порядковый номер карточки (уникальность ключей виджетов).
+        event: событие журнала аудита с ``requires_approval=True``.
+        can_approve: False — у текущего пользователя нет admin-роли
+            (``sre-admin``/``devops-admin``): кнопка аппрува НЕ рендерится,
+            показывается пояснение. По умолчанию True (OIDC выключен —
+            прежнее поведение).
+    """
     incident = event.get("incident") or {}
     result = event.get("result") or {}
     key = f"approve-{index}-{event.get('ts', '')}"
@@ -162,6 +268,9 @@ def render_approval_card(index: int, event: dict) -> None:
         warnings = result.get("warnings") or []
         if warnings:
             st.caption("Data-collection warnings: " + "; ".join(warnings))
+        if not can_approve:
+            st.info("🔒 Approval requires an admin role (sre-admin / devops-admin).")
+            return
         if st.button("✅ Approve & Apply", key=key):
             # Демо-подтверждение: дашборд не изменяет кластер — apply делает
             # человек вне UI (kubectl/GitOps после dry-run).
@@ -171,13 +280,21 @@ def render_approval_card(index: int, event: dict) -> None:
 
 def main() -> None:
     st.set_page_config(page_title="AI DevOps Agent - Incident Dashboard", layout="wide")
-    st.title("AI DevOps Agent - Incident Dashboard")
 
     settings = get_settings()
+
+    # --- OIDC-логин: до аутентификации журнал не показываем ----------------
+    if settings.oidc_enabled and not st.session_state.get("user_token"):
+        render_login(settings)
+        st.stop()
+
+    st.title("AI DevOps Agent - Incident Dashboard")
+
     audit_path = Path(settings.audit_log_path)
     st.sidebar.markdown(f"**Audit journal:** `{audit_path}`")
     if st.sidebar.button("Refresh"):
         st.cache_data.clear()
+    render_user_sidebar(settings)
 
     events = load_audit_events(audit_path)
     if not events:
@@ -225,8 +342,11 @@ def main() -> None:
     st.subheader(f"Approvals required ({len(pending)})")
     if not pending:
         st.caption("Нет рекомендаций, помеченных политикой как опасные.")
+    # OIDC выключен — прежнее поведение (аппрув доступен всем); включён —
+    # только admin-роли (клиентская расшифровка claims, без проверки подписи).
+    can_approve = (not settings.oidc_enabled) or current_user_is_admin()
     for i, event in enumerate(pending):
-        render_approval_card(i, event)
+        render_approval_card(i, event, can_approve=can_approve)
 
     # --- сырой журнал ------------------------------------------------------
     with st.expander("🔍 View Raw Audit Log", expanded=False):

@@ -45,6 +45,7 @@ from src.agent.orchestrator import (
     NamespaceNotAllowedError,
 )
 from src.api.models import AlertmanagerPayload, AlertmanagerWebhookResponse
+from src.auth import require_role, require_webhook_auth
 from src.config import Settings, get_settings
 from src.utils.audit import log_audit_event
 from src.utils.logger import get_logger, request_id_var, setup_logging
@@ -80,6 +81,19 @@ OpenAI-compatible) → RCA → Report`. Ответ LLM валидируется 
   и ЛЮБЫЕ команды `kubectl`/`helm`/`oc`, кроме read-only (`get`/`describe`/`logs`),
   помечаются `requires_approval: true` и уходят на аппрув человеку в Slack;
 * **Bounded context**: лимиты `MAX_LOG_LINES` / `MAX_CONTEXT_TOKENS` (tiktoken); секреты только из `.env`.
+
+## Аутентификация и авторизация (OIDC)
+По умолчанию отключена (`OIDC_ENABLED=false`) — поведение API полностью
+прежнее (dev/CI). При `OIDC_ENABLED=true` запросы к `POST /diagnose` и
+`POST /webhook/alertmanager` требуют **Bearer JWT** от OIDC-провайдера
+(Keycloak / Auth0 / Azure AD / Okta): проверяются подпись по JWKS
+(асимметричные алгоритмы), `iss`, `aud`, `exp`; авторизация — по ролям из
+claim `roles`/`groups` (`ALLOWED_ROLES_DIAGNOSE`, `ALLOWED_ROLES_WEBHOOK`);
+нет/невалидный токен → `401`, недостаточная роль → `403`. Вебхук Alertmanager
+дополнительно принимает shared-секрет в заголовке `X-Webhook-Secret`
+(`WEBHOOK_SHARED_SECRET`) — для интеграций, которые не умеют подписывать JWT.
+Пробы `/health`, `/ready` и `/metrics` **не защищаются никогда**
+(требования kubelet-probes и Prometheus-scraping).
 
 ## Наблюдаемость
 `/metrics` (Prometheus), structured JSON-логи (`LOG_FORMAT=json`), `X-Request-ID`
@@ -440,20 +454,32 @@ async def ready() -> JSONResponse:
     tags=["Diagnostics"],
     summary="Diagnose Incident",
     description="Accepts incident details and returns an AI-generated Root "
-    "Cause Analysis (RCA) in JSON format.",
+    "Cause Analysis (RCA) in JSON format. When OIDC is enabled "
+    "(`OIDC_ENABLED=true`), requires `Authorization: Bearer <JWT>` signed by "
+    "the configured provider; the token's `roles`/`groups` claim must include "
+    "one of `ALLOWED_ROLES_DIAGNOSE` (missing/invalid token -> 401, "
+    "insufficient role -> 403).",
     response_model=DiagnosisResponse,
 )
 @limiter.limit("5/minute")
 async def diagnose(
     request: Request,
     payload: DiagnoseRequest,
+    user: dict = Depends(require_role(lambda: settings.allowed_roles_diagnose)),
     orchestrator: IncidentOrchestrator = Depends(get_orchestrator),
 ) -> DiagnosisResponse:
     """Принять инцидент и запустить диагностику через IncidentOrchestrator.
 
     Эндпоинт не дублирует логику агента: только валидация входа, вызов
     ``orchestrator.diagnose()`` и форматирование отчёта.
+
+    Аутентификация (при ``OIDC_ENABLED=true``): зависимость ``require_role``
+    проверяет Bearer JWT (подпись/iss/aud/exp) и роль из
+    ``ALLOWED_ROLES_DIAGNOSE`` ДО создания оркестратора — 401/403 имеют
+    приоритет над 503 "LLM is not configured". При ``OIDC_ENABLED=false``
+    зависимость прозрачно возвращает ``ANONYMOUS_USER`` (совместимость).
     """
+    logger.info("Diagnose requested by subject %r", user.get("sub"))
     incident = payload.to_incident()
     try:
         diagnosis_dict = await orchestrator.adiagnose(incident)
@@ -490,13 +516,18 @@ async def diagnose(
     tags=["Webhooks"],
     summary="Alertmanager webhook",
     description="Webhook receiver for Prometheus Alertmanager. Parses alerts "
-    "and triggers diagnosis automatically.",
+    "and triggers diagnosis automatically. When OIDC is enabled, accepts "
+    "either a Bearer JWT whose roles match `ALLOWED_ROLES_WEBHOOK` or a "
+    "shared secret in the `X-Webhook-Secret` header (compared in constant "
+    "time against `WEBHOOK_SHARED_SECRET`) for integrations that cannot "
+    "sign JWTs.",
     response_model=AlertmanagerWebhookResponse,
 )
 @limiter.limit("30/minute")
 async def webhook_alertmanager(
     request: Request,
     payload: AlertmanagerPayload,
+    user: dict = Depends(require_webhook_auth),
     orchestrator: IncidentOrchestrator = Depends(get_orchestrator),
 ) -> AlertmanagerWebhookResponse:
     """Webhook для Alertmanager: диагностика всех firing-алертов пейлоада.
@@ -508,7 +539,13 @@ async def webhook_alertmanager(
     в :meth:`IncidentOrchestrator.diagnose`. Resolved-алерты пропускаются.
     Ошибки парсинга JSON/схемы -> 400 (см. ``request_validation_handler``).
     Каждое событие пишется в журнал аудита (``src/utils/audit.py``).
+
+    Аутентификация (при ``OIDC_ENABLED=true``): ``require_webhook_auth`` —
+    Bearer JWT с ролью из ``ALLOWED_ROLES_WEBHOOK`` ИЛИ заголовок
+    ``X-Webhook-Secret`` с ``WEBHOOK_SHARED_SECRET``; иначе 401/403 до
+    обработки алертов. При ``OIDC_ENABLED=false`` вебхук открыт (как раньше).
     """
+    logger.info("Alertmanager webhook called by subject %r", user.get("sub"))
     firing = payload.firing_alerts
     skipped = len(payload.alerts) - len(firing)
     if not firing:
