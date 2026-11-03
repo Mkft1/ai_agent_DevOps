@@ -9,6 +9,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- FinOps-метрики стоимости LLM: `llm_tokens_total{type="input"|"output"}`
+  (Counter, оценочное число токенов; грубая оценка 1 токен ≈ 4 символа) и
+  `llm_cost_estimate_usd` (Counter, оценочная суммарная стоимость LLM-запросов
+  в USD) в `src/utils/metrics.py`. `IncidentOrchestrator._record_llm_cost`
+  вызывается после каждого успешного LLM-запроса: input-токены =
+  (user_prompt + system_prompt) / 4, output-токены = llm_raw / 4, стоимость =
+  input/1000 × `LLM_COST_PER_1K_INPUT_TOKENS` + output/1000 ×
+  `LLM_COST_PER_1K_OUTPUT_TOKENS`. Цены по умолчанию — Qwen-max ($0.01/$0.03 за
+  1K токенов), настраиваются через env (`src/config.py`, `.env.example`;
+  fail-fast на отрицательные значения, 0 — для бесплатных локальных моделей).
+  Значения также логируются на INFO. В README EN/RU — секция
+  «Observability / Наблюдаемость» с подразделом «LLM Cost Monitoring /
+  Мониторинг стоимости LLM»: описание метрик, PromQL-запросы (суточная
+  стоимость, токены по типам, стоимость на диагностику) и текстовый макет
+  Grafana-дашборда «LLM FinOps». 15 новых тестов (`tests/test_metrics.py`):
+  формула стоимости, labels, кастомные/дефолтные цены, env-конфигурация,
+  интеграция с diagnose (инкремент после успешного запроса, отсутствие
+  начислений при сбое LLM).
 - Slack Interactive Buttons для аппрува опасных рекомендаций (двусторонняя
   интеграция): `_notify_slack_approval` теперь отправляет **Block Kit**-сообщение —
   секция с контекстом инцидента (namespace/pod/root cause/suggested fix/incident

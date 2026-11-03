@@ -33,7 +33,9 @@ from src.utils.logger import get_logger
 from src.utils.metrics import (
     inc_approval_request,
     inc_diagnose_request,
+    inc_llm_cost_estimate,
     inc_llm_fallback,
+    inc_llm_tokens,
     inc_scrubbed_items,
     observe_diagnose_duration,
 )
@@ -64,6 +66,11 @@ RAG_TOP_K = 2
 
 # Таймаут POST-запроса в Slack incoming webhook, секунд.
 SLACK_TIMEOUT_SECONDS = 5.0
+
+# FinOps: грубая оценка токенов для метрик стоимости LLM — 1 токен ≈ 4 символа.
+# Точный tiktoken-подсчёт ответа провайдера недоступен, поэтому для бюджета
+# достаточно стабильной приближённой оценки (input = промты, output = ответ).
+CHARS_PER_TOKEN = 4
 
 # Fallback-версия системного промта senior SRE (используется, если файл
 # src/prompts/sre_system.txt отсутствует или нечитаем — см. load_system_prompt).
@@ -641,6 +648,8 @@ class IncidentOrchestrator:
                 )
                 span.set_attribute("llm.ok", True)
                 span.set_attribute("llm.response_chars", len(llm_raw or ""))
+                # FinOps: токены и стоимость запроса — в Prometheus-метрики.
+                self._record_llm_cost(user_prompt, llm_raw or "")
             except Exception as exc:
                 span.record_exception(exc)
                 span.set_status(StatusCode.ERROR, str(exc))
@@ -781,6 +790,38 @@ class IncidentOrchestrator:
                 total,
                 TOKEN_SOFT_LIMIT,
             )
+
+    def _record_llm_cost(self, user_prompt: str, llm_raw: str) -> None:
+        """FinOps: оценить токены и стоимость завершившегося LLM-запроса.
+
+        Грубая оценка: 1 токен ≈ :data:`CHARS_PER_TOKEN` (4) символа — этого
+        достаточно для бюджетного мониторинга (точный tiktoken-подсчёт ответа
+        провайдера недоступен):
+
+        * input tokens  = (len(user_prompt) + len(SYSTEM_PROMPT)) / 4;
+        * output tokens = len(llm_raw) / 4;
+        * cost, USD     = input_tokens / 1000 * LLM_COST_PER_1K_INPUT_TOKENS
+                        + output_tokens / 1000 * LLM_COST_PER_1K_OUTPUT_TOKENS.
+
+        Инкрементирует метрики ``llm_tokens_total{type=input|output}`` и
+        ``llm_cost_estimate_usd`` (цены настраиваются через env — см.
+        src/config.py). Вызывается только после успешного ответа LLM.
+        """
+        input_tokens = (len(user_prompt) + len(SYSTEM_PROMPT)) // CHARS_PER_TOKEN
+        output_tokens = len(llm_raw) // CHARS_PER_TOKEN
+        inc_llm_tokens("input", input_tokens)
+        inc_llm_tokens("output", output_tokens)
+        cost_usd = (
+            input_tokens / 1000 * self.settings.llm_cost_per_1k_input_tokens
+            + output_tokens / 1000 * self.settings.llm_cost_per_1k_output_tokens
+        )
+        inc_llm_cost_estimate(cost_usd)
+        logger.info(
+            "LLM cost estimate: input_tokens=%d, output_tokens=%d, cost_usd=%.6f",
+            input_tokens,
+            output_tokens,
+            cost_usd,
+        )
 
     # ------------------------------------------------------------------
     # Взаимодействие с LLM: запрос, валидация, retry, fallback

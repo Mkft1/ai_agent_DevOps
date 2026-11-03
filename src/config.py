@@ -96,6 +96,13 @@ class Settings(BaseSettings):
     # (точный подсчёт tiktoken cl100k_base; см. src/utils/text_utils.py)
     max_context_tokens: int = 4000
 
+    # FinOps: оценка стоимости LLM-запросов (метрики llm_tokens_total и
+    # llm_cost_estimate_usd). Цены в USD за 1K токенов; по умолчанию — цены
+    # Qwen-max. Адаптируйте под свою модель (OpenAI/Claude/vLLM); для
+    # локальных моделей без тарификации можно выставить 0.
+    llm_cost_per_1k_input_tokens: float = 0.01
+    llm_cost_per_1k_output_tokens: float = 0.03
+
     # ------------------------------------------------------------------
     # OIDC-аутентификация и ролевая авторизация (RBAC); см. src/auth.py
     # ------------------------------------------------------------------
@@ -155,6 +162,14 @@ class Settings(BaseSettings):
         """MAX_CONTEXT_TOKENS: не меньше 256 токенов (иначе контекст бесполезен)."""
         if value < 256:
             raise ValueError(f"max_context_tokens must be >= 256, got {value}")
+        return value
+
+    @field_validator("llm_cost_per_1k_input_tokens", "llm_cost_per_1k_output_tokens")
+    @classmethod
+    def _validate_llm_cost(cls, value: float) -> float:
+        """LLM_COST_PER_1K_*: цена не может быть отрицательной (FinOps-метрика)."""
+        if value < 0:
+            raise ValueError(f"LLM cost per 1K tokens must be >= 0, got {value}")
         return value
 
     @model_validator(mode="after")

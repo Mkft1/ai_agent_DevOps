@@ -32,12 +32,12 @@ The agent is strictly **read-only by default**: it never mutates the cluster (`E
 | 🛡️ **Guardrails** | Namespace allow-list (`ALLOWED_NAMESPACES`), log-size cap (`MAX_LOG_LINES`), context-size cap in tokens (`MAX_CONTEXT_TOKENS`, tiktoken), read-only mode (`ENABLE_WRITE_ACTIONS`), **two-level dangerous-action policy** (destructive patterns — `delete`/`drop`/`rm -rf`/`scale 0` and paraphrases like `remove the pod`, `terminate all instances`, `set replicas to 0`, `kubectl apply -f`, `chmod 777` — plus ANY non-read-only `kubectl`/`helm`/`oc` command are flagged `requires_approval: true` and routed to a human via Slack), cluster-level **Policy-as-Code**: least-privilege RBAC + Kyverno ClusterPolicies in `manifests/`, and **PII/secret scrubbing before LLM calls** (`ENABLE_SCRUBBING`: JWTs, API keys, passwords in URLs, Bearer tokens and emails in logs/events are masked as `[REDACTED:<type>]` before the context leaves the perimeter). All configurable via `.env`, nothing hardcoded. |
 | 🔐 **Authentication & RBAC (OIDC)** | Optional JWT auth (`OIDC_ENABLED`, default `false` = full backward compatibility): `POST /diagnose` and `POST /webhook/alertmanager` require a Bearer JWT from any OIDC provider (Keycloak/Auth0/Azure AD/Okta) — signature verified against the provider JWKS (RS/PS/ES/EdDSA only, `HS256` rejected), `iss`/`aud`/`exp` enforced, roles from the `roles`/`groups` claim (`401`/`403`, fail-closed); the webhook also accepts a constant-time-compared `X-Webhook-Secret` for Alertmanager. `/health`, `/ready`, `/metrics` stay open for probes/scraping. Dashboard login + admin-only approvals included. See [Authentication & Authorization](#authentication--authorization-oidc). |
 | 🩹 **Graceful degradation** | If any data source fails (K8s API down, Prometheus unreachable, empty logs), the agent records a warning in the report and continues diagnosing with whatever data it has — it never crashes the pipeline. |
-| 📊 **Observability** | `/metrics` endpoint (`prometheus-fastapi-instrumentator`) + custom counters/histograms: `diagnose_requests_total`, `diagnose_duration_seconds`, `k8s_api_errors_total`, `llm_fallback_total`, `scrubbed_items_total`, `policy_approval_required_total`. `X-Request-ID` correlation (echoed/generated per request), optional structured JSON logging (`LOG_FORMAT=json`) for Loki/CloudWatch, an append-only audit journal (`AUDIT_LOG_PATH`, JSON Lines) of every diagnosis, and **OpenTelemetry distributed tracing** (auto HTTP spans + manual spans per K8s/Prometheus/logs/RAG/LLM call, OTLP export to Jaeger/Tempo). |
+| 📊 **Observability** | `/metrics` endpoint (`prometheus-fastapi-instrumentator`) + custom counters/histograms: `diagnose_requests_total`, `diagnose_duration_seconds`, `k8s_api_errors_total`, `llm_fallback_total`, `scrubbed_items_total`, `policy_approval_required_total`, plus **LLM cost metrics for FinOps** (`llm_tokens_total{type=input\|output}`, `llm_cost_estimate_usd` — budget tracking and alert-storm cost analysis, see [LLM Cost Monitoring](#llm-cost-monitoring)). `X-Request-ID` correlation (echoed/generated per request), optional structured JSON logging (`LOG_FORMAT=json`) for Loki/CloudWatch, an append-only audit journal (`AUDIT_LOG_PATH`, JSON Lines) of every diagnosis, and **OpenTelemetry distributed tracing** (auto HTTP spans + manual spans per K8s/Prometheus/logs/RAG/LLM call, OTLP export to Jaeger/Tempo). |
 | 🚨 **Alertmanager webhook** | `POST /webhook/alertmanager` accepts the standard Alertmanager payload, diagnoses every `firing` alert (namespace/pod from labels, text from `annotations.summary`/`description`), skips `resolved`, and answers `400` on malformed payloads. |
 | 🔁 **Chaos self-test** | `scripts/chaos_test.py` creates an ImagePullBackOff pod, asks the agent to diagnose it, asserts the RCA mentions "image"/"pull", and cleans up. Idempotent. |
 | ☸️ **Helm chart** | Production-ready `charts/ai-agent` (v0.1.0): Deployment with probes & non-root securityContext, ClusterIP Service, least-privilege RBAC, ConfigMap/Secret from `values.yaml`, `make helm-lint` / `make helm-install`. |
 | 🖥️ **Operator dashboard** | `make dashboard` — Streamlit UI over the audit journal: incident table (Timestamp/Namespace/Severity/Root Cause), severity metrics, and approval cards with `suggested_fix` + "Approve & Apply" for every `requires_approval` incident. With OIDC enabled: JWT login screen, current user/roles in the sidebar, and the approve button rendered only for `sre-admin`/`devops-admin`. |
-| 🧪 **Testing & CI/CD** | 465 unit/integration tests with mocked clients (93% coverage, CI gate `--cov-fail-under=85`, SentenceTransformer mocked so tests never download models), plus an offline **evaluation framework** (`make eval`) with a golden dataset and LLM-as-a-judge scoring; | GitHub Actions pipeline: lint → test+coverage → Docker build+smoke → kind-based e2e on `main` (auto-skipped when no LLM secret is configured). |
+| 🧪 **Testing & CI/CD** | 480 unit/integration tests with mocked clients (93% coverage, CI gate `--cov-fail-under=85`, SentenceTransformer mocked so tests never download models), plus an offline **evaluation framework** (`make eval`) with a golden dataset and LLM-as-a-judge scoring; | GitHub Actions pipeline: lint → test+coverage → Docker build+smoke → kind-based e2e on `main` (auto-skipped when no LLM secret is configured). |
 | 🐳 **Containerized** | Multi-stage `python:3.12-slim` image, non-root user, healthcheck, no secrets baked into the image. |
 
 ---
@@ -674,6 +674,76 @@ The same endpoint works with Tempo/OpenTelemetry Collector — anything speaking
 
 ---
 
+## Observability
+
+Besides tracing (above) and the standard HTTP metrics from
+`prometheus-fastapi-instrumentator`, the agent exports custom business counters at
+`/metrics` (`src/utils/metrics.py`): `diagnose_requests_total`,
+`diagnose_duration_seconds`, `k8s_api_errors_total`, `llm_fallback_total`,
+`scrubbed_items_total`, `policy_approval_required_total`, `approval_requests_total` —
+plus **LLM cost metrics for FinOps** described below.
+
+### LLM Cost Monitoring
+
+The business needs predictable LLM spend: during an alert storm every incident
+triggers an LLM call, and costs multiply. After **each successful LLM call**,
+`IncidentOrchestrator._record_llm_cost` estimates tokens and increments two counters:
+
+| Metric | Type | Labels | Meaning |
+|--------|------|--------|---------|
+| `llm_tokens_total` | Counter | `type` = `input` \| `output` | Estimated tokens processed: `input` = system prompt + diagnosis context (`user_prompt`), `output` = LLM response (`llm_raw`). Rough estimate: **1 token ≈ 4 chars**. |
+| `llm_cost_estimate_usd` | Counter | — | Estimated cumulative LLM spend, USD: `(input_tokens / 1000 × LLM_COST_PER_1K_INPUT_TOKENS) + (output_tokens / 1000 × LLM_COST_PER_1K_OUTPUT_TOKENS)`. |
+
+Prices default to **Qwen-max** (`$0.01` per 1K input tokens, `$0.03` per 1K output
+tokens) and are configured via env so you can adapt them to any model
+(OpenAI/Claude/vLLM; set `0` for free local models):
+
+```bash
+LLM_COST_PER_1K_INPUT_TOKENS=0.01
+LLM_COST_PER_1K_OUTPUT_TOKENS=0.03
+```
+
+> **Note:** `prometheus_client` exposes counter series with the `_total` suffix, so
+> in PromQL the series is `llm_cost_estimate_usd_total` (metric name stays
+> `llm_cost_estimate_usd`).
+
+**PromQL for dashboards** — daily LLM spend run-rate (USD/day):
+
+```promql
+sum(rate(llm_cost_estimate_usd[1h])) * 3600 * 24
+```
+
+(with the exposition suffix: `sum(rate(llm_cost_estimate_usd_total[1h])) * 3600 * 24`)
+
+Other useful queries:
+
+```promql
+sum by (type) (rate(llm_tokens_total[5m]))                                        # tokens/s: input vs output
+sum(increase(llm_cost_estimate_usd_total[30d]))                                   # spend over 30 days
+sum(rate(llm_cost_estimate_usd_total[1h])) / sum(rate(diagnose_requests_total[1h]))  # average cost per diagnosis
+```
+
+**Grafana dashboard (text layout — "LLM FinOps")**:
+
+1. **Row "Spend"** — three Stat panels: *LLM cost, last 24h*
+   (`sum(increase(llm_cost_estimate_usd_total[24h]))`, unit `currencyUSD`, thresholds
+   green/yellow/red against your daily budget), *Projected monthly spend*
+   (24h value × 30), *Avg cost per diagnosis* (the ratio query above).
+2. **Row "Trend"** — Time series panel with the daily run-rate query
+   `sum(rate(llm_cost_estimate_usd_total[1h])) * 3600 * 24` (legend: `USD/day`), plus
+   a Grafana **alert rule** on it (e.g. `> $50/day`) routed to the same Slack channel
+   used for approvals — an alert storm becomes visible as a cost spike immediately.
+3. **Row "Tokens"** — stacked Time series `sum by (type) (rate(llm_tokens_total[5m]))`:
+   a growing output/input ratio means the model became more verbose (a hint to tune
+   the prompt or the max-context settings).
+
+Counters only increase; failed LLM calls (exception, no response) do **not** accrue
+cost. The same values are logged per call at INFO
+(`LLM cost estimate: input_tokens=..., output_tokens=..., cost_usd=...`) for quick
+grep-based audits without Prometheus.
+
+---
+
 ## Security & Guardrails
 
 All limits are configuration-driven (see table above), enforced **before** any cluster call:
@@ -928,7 +998,7 @@ ai_agent_DevOps/
 │       └── text_utils.py        # truncate_context (bounded, JSON-safe)
 ├── charts/ai-agent/             # production Helm chart (v0.1.0): deployment,
 │                                # service, SA/RBAC, configmap, secret, helpers
-└── tests/                       # 465 tests, fully mocked externals
+└── tests/                       # 480 tests, fully mocked externals
 ```
 
 ---
