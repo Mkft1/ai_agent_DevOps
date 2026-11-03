@@ -14,6 +14,7 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](./LICENSE)
 [![Docker](https://img.shields.io/badge/docker-multistage-2496ED?logo=docker&logoColor=white)](./Dockerfile)
 [![Ruff](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/astral-sh/ruff/main/assets/badge/v2.json)](https://github.com/astral-sh/ruff)
+[![Tests](https://img.shields.io/badge/tests-480%20passed-brightgreen?logo=pytest&logoColor=white)](#testing)
 
 An LLM-powered SRE agent that diagnoses Kubernetes incidents end-to-end. It ingests alerts via a REST API, correlates live signals — pod status, Kubernetes events, Prometheus metrics, container logs — grounds the analysis with TF-IDF retrieval over local runbooks (RAG), and returns a structured **Root Cause Analysis (RCA)** plus a human-readable report ready for Slack/Telegram.
 
@@ -119,10 +120,10 @@ cp .env.example .env
 | `PROMETHEUS_URL` | `http://localhost:9090` | Base URL of your Prometheus instance. |
 | `LOG_LEVEL` | `INFO` | Application log level (`DEBUG` also logs prompts/LLM responses, without secrets). |
 | `QWEN_API_KEY` / `OPENAI_API_KEY` | — | LLM API key (`QWEN_API_KEY` takes precedence). Never hardcoded, only via env. |
-| `LLM_BASE_URL` | DashScope compatible-mode | OpenAI-compatible endpoint (`.../v1` suffix optional). |
+| `LLM_BASE_URL` | DashScope compatible-mode | Base URL of the OpenAI-compatible LLM API (Qwen/DashScope, vLLM, Ollama, LocalAI). The client appends `/v1/chat/completions` itself — specify it **without** the `/v1` suffix. |
 | `LLM_MODEL` | `qwen-max` | Chat model name — swap freely (gpt-4o-mini, qwen-plus, ...) without code changes. |
 | `CORS_ORIGINS` | `["*"]` | Allowed CORS origins (JSON list, e.g. `["http://localhost:3000"]`). |
-| `ALLOWED_NAMESPACES` | `["default"]` | Namespaces the agent may inspect; anything else → HTTP 403. |
+| `ALLOWED_NAMESPACES` | `["default"]` | Namespaces the agent may inspect; anything else → HTTP 403. `["*"]` is an explicit debug wildcard (allow all). |
 | `MAX_LOG_LINES` | `200` | Hard cap on `tail_lines` for log retrieval. |
 | `MAX_CONTEXT_TOKENS` | `4000` | Max size of the serialized LLM context **in tokens** (precise tiktoken `cl100k_base` count); longest fields (logs) are truncated with `... [truncated to fit token limit]`. |
 | `ENABLE_WRITE_ACTIONS` | `false` | Read-only mode. No write path exists in the codebase today. |
@@ -134,6 +135,19 @@ cp .env.example .env
 | `OTEL_SERVICE_NAME` | `ai-agent-devops` | `service.name` resource attribute shown in Jaeger/Tempo. |
 | `ENABLE_HYBRID_RAG` | `true` | Hybrid retrieval (TF-IDF + embeddings). `false` = pure TF-IDF. |
 | `EMBEDDING_MODEL` | `all-MiniLM-L6-v2` | sentence-transformers model for the vector branch of hybrid RAG. |
+| `ENABLE_SCRUBBING` | `true` | Mask PII/secrets (JWT, API keys, URL passwords, Bearer tokens, emails) in pod logs and K8s events as `[REDACTED:<type>]` **before** the context is sent to the LLM. Set `false` only for trusted local models. |
+| `REDACT_IPS` | `false` | Additionally mask IPv4 addresses (`[REDACTED:ip]`). Default `false` — IPs are essential for network diagnosis. |
+| `RATE_LIMIT_REDIS_URL` | — (in-memory) | Redis URL for a rate-limit store shared across API replicas; unset = per-process `MemoryStorage`. |
+| `SLACK_SIGNING_SECRET` | — (dev mode) | Slack app Signing Secret: validates `X-Slack-Signature` on `POST /webhook/slack-interactivity` (mandatory in production; without it the endpoint accepts unsigned payloads with a WARNING). |
+| `SLACK_APP_TOKEN` | — (disabled) | App-Level Token (`xapp-...`) — optional, reserved for Socket Mode. |
+| `OIDC_ENABLED` | `false` | JWT authentication for `/diagnose` and `/webhook/alertmanager`; `false` = API open (backward compatible). |
+| `OIDC_ISSUER_URL` | — | Issuer URL of the OIDC provider (Discovery + `iss` check); required when `OIDC_ENABLED=true`. |
+| `OIDC_AUDIENCE` | — | Audience of this API (`aud` claim); required when `OIDC_ENABLED=true`. |
+| `ALLOWED_ROLES_DIAGNOSE` | `["sre-user", "sre-admin"]` | Roles allowed to call `POST /diagnose` (`roles`/`groups` claim; JSON list). |
+| `ALLOWED_ROLES_WEBHOOK` | `["alertmanager", "sre-admin"]` | Roles allowed to call `POST /webhook/alertmanager` (JWT path). |
+| `WEBHOOK_SHARED_SECRET` | — (disabled) | Shared secret for the webhook (`X-Webhook-Secret` header, constant-time compare) — a JWT alternative for Alertmanager. |
+| `LLM_COST_PER_1K_INPUT_TOKENS` | `0.01` | FinOps: price per 1K input tokens, USD (defaults = Qwen-max). Set `0` for free local models (vLLM/Ollama). |
+| `LLM_COST_PER_1K_OUTPUT_TOKENS` | `0.03` | FinOps: price per 1K output tokens, USD. Set `0` for free local models. |
 
 ### 2. Run locally
 
@@ -359,6 +373,17 @@ curl -s -X POST http://localhost:8000/diagnose \
   }
 }
 ```
+
+The script exits `0` when the RCA mentions *image*/*pull* and `1` otherwise
+(options: `--agent-url http://localhost:8000 --wait 10 --namespace default`).
+It is **idempotent**: a leftover pod from a previous run is deleted first, and
+cleanup happens even on failure.
+
+> ⚠️ The chaos **script** performs cluster writes (create/delete pod) **on behalf
+> of the human operator** — the agent itself stays read-only
+> (`ENABLE_WRITE_ACTIONS=false`). Run the experiment in an isolated/test cluster
+> (kind/minikube), not in shared production. The script logic is unit-tested with
+> mocks (`tests/test_chaos_test.py`).
 
 ### Alertmanager integration
 
@@ -761,11 +786,22 @@ The same endpoint works with Tempo/OpenTelemetry Collector — anything speaking
 ## Observability
 
 Besides tracing (above) and the standard HTTP metrics from
-`prometheus-fastapi-instrumentator`, the agent exports custom business counters at
-`/metrics` (`src/utils/metrics.py`): `diagnose_requests_total`,
-`diagnose_duration_seconds`, `k8s_api_errors_total`, `llm_fallback_total`,
-`scrubbed_items_total`, `policy_approval_required_total`, `approval_requests_total` —
-plus **LLM cost metrics for FinOps** described below.
+`prometheus-fastapi-instrumentator`, the agent exports custom business metrics at
+`/metrics` (declared in `src/utils/metrics.py`):
+
+| Metric | Type | Labels | Meaning |
+|--------|------|--------|---------|
+| `diagnose_requests_total` | Counter | namespace, severity | number of completed diagnoses |
+| `diagnose_duration_seconds` | Histogram | namespace | duration of `IncidentOrchestrator.diagnose` |
+| `k8s_api_errors_total` | Counter | method | Kubernetes API errors inside tools |
+| `llm_fallback_total` | Counter | — | fallback diagnoses (invalid JSON after retry) |
+| `scrubbed_items_total` | Counter | type | secrets/PII masked before the LLM call |
+| `approval_requests_total` | Counter | — | dangerous-fix approval requests sent to Slack |
+| `policy_approval_required_total` | Counter | — | guardrail "approval required" verdicts (dangerous pattern or kubectl/helm/oc) |
+| `llm_tokens_total` | Counter | type (input/output) | estimated LLM tokens (1 token ≈ 4 chars) |
+| `llm_cost_estimate_usd` | Counter | — | estimated LLM spend, USD (FinOps) |
+
+The last two are the **LLM cost metrics for FinOps**, described below.
 
 ### LLM Cost Monitoring
 
@@ -835,10 +871,11 @@ All limits are configuration-driven (see table above), enforced **before** any c
 1. **Namespace allow-list** — requests for namespaces outside `ALLOWED_NAMESPACES` fail fast with `"Namespace not allowed"` (HTTP 403); no API calls are made.
 2. **Read-only by design** — with `ENABLE_WRITE_ACTIONS=false` the agent only reads data and *suggests* fixes. There is no delete/exec/apply code path in the repository; the flag guards future action-proposing features.
 3. **Bounded context** — log tails capped by `MAX_LOG_LINES`; the whole LLM context is iteratively trimmed to `MAX_CONTEXT_TOKENS` by precise tiktoken counting (longest values keep their tail — the freshest log lines — and are marked `... [truncated to fit token limit]`), guaranteeing no context-window overflow on any provider.
-4. **No secrets anywhere** — API keys come exclusively from `.env` (never committed, excluded from the Docker image via `.dockerignore`); prompt/response logging at DEBUG never includes auth headers.
-5. **Graceful degradation** — a failing tool produces a warning in the report ("K8s API unavailable, using only Prometheus metrics"), not a crash; even a missing kubeconfig at startup only degrades K8s/log tools to empty results, and an unconfigured LLM key yields an actionable `503` (or stub mode via `LLM_OFFLINE=true`), never a bare `500`.
-6. **Non-root container** — the runtime image runs as `appuser` (UID 10001) with a read-only kubeconfig mount.
-7. **PII/secret scrubbing before LLM calls** — pod logs and Kubernetes events are masked (`[REDACTED:<type>]`) before the context is serialized for the external LLM provider; see [Data Privacy & PII Scrubbing](#data-privacy--pii-scrubbing) below.
+4. **CORS allow-list** — cross-origin browser calls are governed by `CORS_ORIGINS` (default `["*"]` is dev-only). In production restrict it to your UI's origins (e.g. `["https://alerts.example.com"]`) so arbitrary third-party sites cannot call `/diagnose`.
+5. **No secrets anywhere** — API keys come exclusively from `.env` (never committed, excluded from the Docker image via `.dockerignore`); prompt/response logging at DEBUG never includes auth headers.
+6. **Graceful degradation** — a failing tool produces a warning in the report ("K8s API unavailable, using only Prometheus metrics"), not a crash; even a missing kubeconfig at startup only degrades K8s/log tools to empty results, and an unconfigured LLM key yields an actionable `503` (or stub mode via `LLM_OFFLINE=true`), never a bare `500`. See [Graceful Degradation](#graceful-degradation-tool-failure-resilience) below.
+7. **Non-root container** — the runtime image runs as `appuser` (UID 10001) with a read-only kubeconfig mount.
+8. **PII/secret scrubbing before LLM calls** — pod logs and Kubernetes events are masked (`[REDACTED:<type>]`) before the context is serialized for the external LLM provider; see [Data Privacy & PII Scrubbing](#data-privacy--pii-scrubbing) below.
 
 ### Data Privacy & PII Scrubbing
 
@@ -857,6 +894,25 @@ Container logs and Kubernetes events routinely carry secrets, and the diagnosis 
 - **Disabling**: `ENABLE_SCRUBBING=false` turns masking into a pure passthrough — only do this for trusted local models (e.g. Ollama inside the cluster). Default is `true`; this is a hard requirement for enterprise compliance review.
 - **Observability**: every masked item increments the Prometheus counter `scrubbed_items_total{type="jwt|api_key|password|bearer|email|ip"}` — a sudden spike shows what kind of secrets are circulating in your workloads.
 
+### Graceful Degradation (tool-failure resilience)
+
+The agent never aborts a diagnosis because one data source is unavailable:
+
+* If the **K8s API is down** (`get_pods` raised or returned empty with a logged error), the orchestrator does **not** stop: the report gains the warning `K8s API unavailable, using only Prometheus metrics`, the target pod is taken from the alert (`pod_name`), and the diagnosis continues on Prometheus metrics (CPU/memory) and logs alone; K8s events are not queried in this mode.
+* Prometheus/log failures are recorded as separate warnings and the RCA is built from whatever data is available; with no data at all the LLM honestly reports insufficient information (`severity="unknown"`).
+* If the **kubeconfig is missing at startup**, `K8sTools`/`LogsTools` do not crash the app: clients are marked unavailable (`available is False`), methods return empty results with a logged error and the `k8s_api_errors_total` metric.
+* If **no LLM key is set**, `/diagnose` returns an honest `503` with a hint ("set QWEN_API_KEY or OPENAI_API_KEY … or LLM_OFFLINE=true") instead of a bare `500`; with `LLM_OFFLINE=true` the deterministic `LLMClientStub` is used.
+* All warnings are visible in the `/diagnose` response (`warnings`) and in the text report.
+
+### Production Hardening (high-load resilience)
+
+* **Async I/O (`httpx`)** — Slack approval notifications and the Prometheus readiness check (`GET /-/ready`) use `httpx.AsyncClient` with short timeouts (5 s / 3 s) instead of blocking `requests` calls: during an alert storm a synchronous HTTP call would occupy every FastAPI threadpool worker and stall the whole API, while async I/O keeps the event loop free even when Slack/Prometheus is slow or down. The remaining sync clients (Kubernetes, Prometheus queries, LLM) are offloaded via `asyncio.to_thread`, so the event loop never blocks.
+* **Thread-safe audit log (`filelock`)** — every append to `audit.jsonl` runs under a `FileLock`: concurrent requests across threads/processes (uvicorn workers, FastAPI threadpool) cannot interleave JSONL lines — each audit record is atomic and the journal stays machine-readable. A lock timeout (10 s) is logged as an audit error and never fails the HTTP request itself.
+
+### Prompts & LLM Model
+
+The senior-SRE system prompt lives in `src/prompts/sre_system.txt` and can be edited without touching code. If the file is missing or empty, the orchestrator logs an error and uses the built-in fallback prompt (the app never crashes). The LLM model is swapped with a single environment variable: `LLM_MODEL=qwen-max` (or any model of your OpenAI-compatible provider + `LLM_BASE_URL`).
+
 ---
 
 ## Testing
@@ -874,6 +930,7 @@ tests/
 ├── test_config.py            # Settings validators: fail-fast on bad LOG_LEVEL/LOG_FORMAT/limits
 ├── test_auth.py              # OIDC: real RS256 JWTs vs fake JWKS provider, 401/403, webhook secret, UI login
 ├── test_slack_interactivity.py  # Slack Block Kit buttons, /webhook/slack-interactivity, X-Slack-Signature
+├── test_metrics.py           # LLM FinOps metrics: llm_tokens_total, llm_cost_estimate_usd, cost formula, env prices
 ├── test_logger.py            # JSON structured logging + request_id correlation
 ├── test_webhook_alertmanager.py  # Alertmanager payload parsing, 400s, resolved-skip, audit journal
 ├── test_tracing.py           # OTel provider, FastAPI auto-spans, manual tool/LLM spans
@@ -881,15 +938,22 @@ tests/
 ├── test_scrubber.py          # PII/secret masking: patterns, false positives, config, orchestrator wiring
 ├── test_evaluate.py          # eval harness: dataset schema, judge parsing, exit codes
 ├── test_dashboard.py         # audit journal parsing, table build, approval filter
+├── test_helm_chart.py        # Helm chart: structure, values.yaml, lint/template invariants
+├── test_manifests.py         # RBAC manifests & Kyverno ClusterPolicies
+├── test_openapi_metadata.py  # OpenAPI metadata: tags, endpoint descriptions
+├── test_readme_assets.py     # README assets: images exist, visual preview table
+├── test_repo_standards.py    # repo standards: LICENSE, PR/issue templates, CHANGELOG format
+├── test_docs_metrics.py      # drift-guard: README test/coverage numbers vs pytest reality
 └── test_api.py               # FastAPI TestClient: /health /ready /diagnose /metrics, CORS, errors, X-Request-ID
 ```
 
-- **Unit tests**: every external boundary (Kubernetes API, Prometheus HTTP, LLM HTTP) is mocked — the suite runs offline in ~2 seconds.
+- **Unit tests**: every external boundary (Kubernetes API, Prometheus HTTP, LLM HTTP) is mocked — the suite runs fully offline (no cluster, no network, no LLM calls, models never downloaded).
 - **Coverage**: `pytest --cov=src --cov-report=xml --cov-fail-under=85` — currently **~93%** (uploaded as a CI artifact every run; the CI fails if coverage drops below 85%).
-- **Docs drift guard**: `make docs-check` (и шаг CI после pytest) сверяет числа
-  тестов/покрытия в этом README с реальным прогоном — расхождение роняет CI.
+- **Docs drift guard**: `make docs-check` (and a CI step after pytest) verifies the
+  test-count/coverage numbers in this README against a real pytest run — any drift
+  fails CI.
 - **Integration (end-to-end)**: `scripts/run_integration_test.sh` spins up a real [kind](https://kind.sigs.k8s.io/) cluster, creates a pod with a bad image tag, runs the agent under uvicorn, sends a real `POST /diagnose`, and asserts the RCA mentions *"image"*/*"pull"* (via `jq`). Idempotent: leftover clusters/pods are removed before each run; cleanup happens even on failure.
-- **CI jobs** (GitHub Actions, target 5-6 min): `lint` and `helm` run **in parallel**; `test` (pytest **-n auto** via pytest-xdist, coverage gate ≥85%, docs drift-guard) needs only `lint`; on push to `main`/dispatch, `build` (Docker + smoke, needs [test, helm], BuildKit gha-cache `mode=max` + pip cache-mounts; NOT run on PRs) and `integration-test` (kind e2e, needs only test, runs **parallel to build**, gracefully skipped without `QWEN_API_KEY`/`OPENAI_API_KEY` secret) finish the pipeline. PRs run lint+helm+test+dependency-audit for fast feedback; `[skip ci]` in a commit title skips the run. Security layer: `dependency-audit` (pip-audit, blocking on runtime `requirements.txt`, dev-deps report-only) runs parallel to tests, and `security-scan` (Hadolint + Trivy image scan, `CRITICAL,HIGH` fail-fast, cached Trivy DB) runs after build parallel to e2e; both are skippable via repo variable `SKIP_SECURITY_SCAN=true`.
+- **CI jobs** (GitHub Actions; a full `main` pipeline typically takes **~8-9 minutes**, a PR run ~6 minutes): `lint` and `helm` run **in parallel**; `test` (pytest **-n auto** via pytest-xdist, coverage gate ≥85%, docs drift-guard) needs only `lint`; on push to `main`/dispatch, `build` (Docker + smoke, needs [test, helm], BuildKit gha-cache `mode=max` + pip cache-mounts; NOT run on PRs) and `integration-test` (kind e2e, needs only test, runs **parallel to build**, gracefully skipped without `QWEN_API_KEY`/`OPENAI_API_KEY` secret) finish the pipeline. PRs run lint+helm+test+dependency-audit for fast feedback; `[skip ci]` in a commit title skips the run. Security layer: `dependency-audit` (pip-audit, blocking on runtime `requirements.txt`, dev-deps report-only) runs parallel to tests, and `security-scan` (Hadolint + Trivy image scan, `CRITICAL,HIGH` fail-fast, cached Trivy DB) runs after build parallel to e2e; both are skippable via repo variable `SKIP_SECURITY_SCAN=true`.
 
 ### Load Testing (rate-limit verification)
 
@@ -1001,9 +1065,9 @@ If the audit journal does not exist yet, the dashboard shows a warning with hint
 | [`docs/OPERATIONS.md`](./docs/OPERATIONS.md) | **On-call engineers** | Incident response flow for `severity: critical` and safe-fix verification, handling `warnings` (degraded data sources), adding runbooks, updating the golden dataset, troubleshooting (LLM 429, embedding model load failures) |
 | [`docs/runbooks/`](./docs/runbooks/) | SRE knowledge base | 8 peer-reviewed runbooks retrieved by the agent's hybrid RAG |
 | [`CONTRIBUTING.md`](./CONTRIBUTING.md) | Developers | Dev environment, tests/lint rules, PR process |
-| [`CHANGELOG.md`](./CHANGELOG.md) | Everyone | Keep a Changelog: что вошло в каждый релиз |
-| [`.github/pull_request_template.md`](./.github/pull_request_template.md) | Contributors | Чек-лист PR: тесты, линтер, docs, тесты на новую логику |
-| [`README.ru.md`](./README.ru.md) | Русскоязычная версия | Полная синхронная версия этого README |
+| [`CHANGELOG.md`](./CHANGELOG.md) | Everyone | Keep a Changelog: what went into each release |
+| [`.github/pull_request_template.md`](./.github/pull_request_template.md) | Contributors | PR checklist: tests, linter, docs, tests for new logic |
+| [`README.ru.md`](./README.ru.md) | Russian speakers | Full synchronized Russian version of this README |
 
 ## Contributing
 
@@ -1044,11 +1108,13 @@ pytest --cov=src tests/               # all tests must pass
 
 ```
 ai_agent_DevOps/
-├── .github/workflows/ci.yml     # lint → test → build → integration-test (kind)
+├── .github/workflows/ci.yml     # CI: lint + helm → test → build + integration-test (kind) + security scans
 ├── Dockerfile                   # multi-stage (base/builder/runtime), CPU-only torch, non-root, healthcheck
 ├── docker-compose.yml           # local stack: agent + kubeconfig/.env mounts
-├── Makefile                     # dev shortcuts: install/lint/test/run/docker-build/chaos/e2e
-├── docs/runbooks/               # RAG knowledge base: 8 runbooks (OOMKilled, ImagePullBackOff, CrashLoop, DNS, NodeNotReady, PVCPending, CreateContainerConfigError, Evicted)
+├── Makefile                     # dev shortcuts: install/lint/test/run/docker-build/chaos/e2e/eval/dashboard/docs-check
+├── docs/
+│   ├── assets/                  # demo assets (dashboard/swagger previews, demo.gif placeholder)
+│   └── runbooks/                # RAG knowledge base: 8 runbooks (OOMKilled, ImagePullBackOff, CrashLoop, DNS, NodeNotReady, PVCPending, CreateContainerConfigError, Evicted)
 ├── eval/
 │   ├── golden_dataset.json      # golden incidents: expected root cause + runbook
 │   └── evaluate.py              # LLM-as-a-judge harness (make eval), no cluster needed
@@ -1060,6 +1126,9 @@ ai_agent_DevOps/
 │   └── dashboard.py             # Streamlit operator UI over audit.jsonl (make dashboard)
 ├── scripts/
 │   ├── chaos_test.py            # ImagePullBackOff chaos experiment vs /diagnose
+│   ├── load_test.py             # Locust load scenario: rate-limit (429) verification
+│   ├── check_docs_metrics.py    # README metrics drift-guard (make docs-check, CI step)
+│   ├── verify_ci_cache.sh       # empirical CI cache-stability verification
 │   ├── run_integration_test.sh  # kind-based end-to-end test
 │   └── kind/cluster.yaml        # kind cluster config
 ├── src/

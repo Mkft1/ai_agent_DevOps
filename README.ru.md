@@ -8,17 +8,29 @@
 
 <h1 align="center">ИИ-агент для диагностики инцидентов в K8s</h1>
 
-
-AI-агент для диагностики инцидентов в Kubernetes. Русская и английская ([README.md](./README.md)) версии синхронизированы и описывают актуальное состояние проекта; англоязычная версия дополнительно содержит Mermaid-диаграмму архитектуры и раздел архитектурных решений.
-
 [![CI](https://github.com/Mkft1/ai_agent_DevOps/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/Mkft1/ai_agent_DevOps/actions/workflows/ci.yml)
-[![Python 3.12](https://img.shields.io/badge/python-3.12-blue?logo=python&logoColor=white)](https://www.python.org/downloads/)
-[![Docker](https://img.shields.io/badge/docker-multistage%20image-2496ED?logo=docker&logoColor=white)](./Dockerfile)
+![Coverage](https://img.shields.io/badge/coverage-93%25-brightgreen)
+![Python](https://img.shields.io/badge/python-3.12-blue?logo=python&logoColor=white)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](./LICENSE)
-[![Tests](https://img.shields.io/badge/tests-480%20passed-brightgreen?logo=pytest&logoColor=white)](#тесты)
+[![Docker](https://img.shields.io/badge/docker-multistage-2496ED?logo=docker&logoColor=white)](./Dockerfile)
 [![Ruff](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/astral-sh/ruff/main/assets/badge/v2.json)](https://github.com/astral-sh/ruff)
+[![Tests](https://img.shields.io/badge/tests-480%20passed-brightgreen?logo=pytest&logoColor=white)](#тесты-и-линтеры-локально)
 
-AI-агент для диагностики инцидентов в Kubernetes.
+LLM-агент для SRE, который диагностирует инциденты Kubernetes end-to-end: принимает
+алерты через REST API, коррелирует живые сигналы — статусы подов, события Kubernetes,
+метрики Prometheus, логи контейнеров, — опирается на гибридный RAG-поиск по локальным
+runbook'ам (TF-IDF + эмбеддинги) и возвращает структурированный **Root Cause Analysis
+(RCA)** плюс человекочитаемый отчёт, готовый для Slack/Telegram.
+
+Агент строго **read-only по умолчанию**: он никогда не изменяет кластер
+(`ENABLE_WRITE_ACTIONS=false`), поэтому его безопасно подключать к продуктовым
+alert-пайплайнам.
+
+Русская и английская ([README.md](./README.md)) версии синхронизированы и описывают
+актуальное состояние проекта; англоязычная версия дополнительно содержит
+Mermaid-диаграмму архитектуры.
+
+---
 
 ## Архитектура
 
@@ -67,6 +79,21 @@ AI-агент для диагностики инцидентов в Kubernetes.
 ```
 Alertmanager → /diagnose → IncidentOrchestrator → [K8sTools, PrometheusTools, LogsTools] → RunbookRAG(docs) → LLM → RCA → Report
 ```
+
+## Архитектурные решения
+
+Несколько осознанных компромиссов, о которых стоит знать:
+
+1. **Гибридный RAG (TF-IDF + локальные эмбеддинги) вместо векторной БД.** Runbook'ов мало (несколько Markdown-файлов), поэтому поиск работает полностью in-process **без внешней инфраструктуры** — ни embeddings API, ни сайдкара Chroma/Qdrant. Точное совпадение терминов (scikit-learn TF-IDF) сочетается с семантическим поиском (эмбеддинги sentence-transformers `all-MiniLM-L6-v2`, косинусная близость) по формуле `0.5 × tfidf + 0.5 × cosine` — золотой стандарт гибридного поиска: синонимы и перефразировки находятся даже без пересечения ключевых слов. Индекс пересобирается in-process при старте; добавление знания — это просто новый `.md`-файл в `docs/runbooks/`. Если модель эмбеддингов не удалось установить/скачать, `RunbookRAG` молча деградирует до чистого TF-IDF (`ENABLE_HYBRID_RAG=false` отключает векторную ветку принудительно).
+2. **FastAPI + pydantic-settings.** FastAPI даёт асинхронную обработку запросов, автоматическую OpenAPI-документацию (`/docs` Swagger UI) и валидацию запросов/ответов из коробки; pydantic-модели делают контракт инцидента (`Incident`, `Diagnosis`) явным и тестируемым, а вся конфигурация управляется через env одним классом `Settings`.
+3. **Строгий JSON-ответ с pydantic-валидацией, одним retry и честным fallback.** Вместо доверия свободному тексту LLM системный промт требует фиксированную JSON-схему; невалидный ответ запускает одну корректирующую попытку, затем детерминированный fallback-диагноз (`severity="unknown"`) — пайплайн никогда не возвращает мусор и не падает из-за модели.
+4. **Read-only по умолчанию + graceful degradation.** Агент предлагает фиксы, а не выполняет их (`ENABLE_WRITE_ACTIONS=false`); любой сбой источника данных становится предупреждением в отчёте, а не исключением — безопасно подключать напрямую к продуктовым alert-пайплайнам.
+5. **OpenAI-совместимый клиент поверх чистого HTTP (requests + tenacity).** Без привязки к тяжёлым SDK: работает с Qwen/DashScope, OpenAI или любым self-hosted шлюзом сменой двух переменных окружения (`LLM_BASE_URL`, `LLM_MODEL`).
+6. **Многоступенчатая сборка Docker (base → builder → runtime).** Безопасность и размер: runtime-образ — чистый `python:3.12-slim` только с установленными пакетами и `src/` — без компиляторов, pip-кэша, истории репозитория, тестов/документации; запуск от non-root `appuser` (UID 10001). `requirements.txt` отдельным слоем сохраняет тяжёлый слой зависимостей в кэше между правками кода, а `cache-to: type=gha,mode=min` в CI экспортирует только финальные слои — загрузка кэша остаётся маленькой.
+7. **CPU-only PyTorch в образе.** Агент строит эмбеддинги runbook'ов через sentence-transformers — он никогда не обучается и не использует GPU. Установка `torch` из `https://download.pytorch.org/whl/cpu` **до** `requirements.txt` фиксирует CPU-wheel (~200 МБ) и не даёт `sentence-transformers` подтянуть CUDA-сборку (+2 ГБ драйверов/библиотек): меньше образ, быстрее CI, идентичный инференс.
+8. **Production-hardening: асинхронный I/O + аудит под файловой блокировкой.** Уведомления Slack и проверка готовности Prometheus (`GET /-/ready`) используют `httpx.AsyncClient` с короткими таймаутами (5 с / 3 с) вместо блокирующих вызовов `requests`: при alert-шторме синхронный HTTP-вызов занял бы все worker-потоки threadpool FastAPI и остановил весь API, а асинхронный I/O оставляет event loop свободным, даже если Slack/Prometheus тормозит или недоступен (остальные sync-клиенты — Kubernetes, запросы Prometheus, LLM — вынесены в `asyncio.to_thread`, event loop не блокируется никогда). Каждая дописка в журнал аудита (`audit.jsonl`) выполняется под `filelock` (`FileLock`): конкурентные запросы в разных потоках/процессах (uvicorn-workers, threadpool FastAPI) не могут перемешать JSON-строки — каждая запись атомарна и машиночитаема; таймаут блокировки (10 с) логируется как ошибка аудита и никогда не роняет сам HTTP-запрос.
+
+---
 
 ## Что демонстрирует проект
 
@@ -159,7 +186,7 @@ ai_agent_DevOps/
 ├── .env.example
 ├── .github/
 │   └── workflows/
-│       └── ci.yml         # CI: lint (ruff) -> test (pytest+cov) -> build (Docker, no push)
+│       └── ci.yml         # CI: lint + helm → test → build + integration-test (kind) + security-сканы
 ├── src/
 │   ├── main.py            # Точка входа FastAPI: /health /ready /diagnose /metrics /webhook/alertmanager /webhook/slack-interactivity
 │   ├── api/
@@ -197,13 +224,16 @@ ai_agent_DevOps/
 ├── docs/
 │   ├── assets/              # демо-ассеты (placeholder под будущий demo.gif)
 │   └── runbooks/            # RAG-база: 8 runbook'ов (OOMKilled, ImagePullBackOff, CrashLoop, DNS, NodeNotReady, PVCPending, CreateContainerConfigError, Evicted)
-├── tests/
+├── tests/                   # 480 тестов, все внешние зависимости замокированы
 ├── scripts/
 │   ├── chaos_test.py      # chaos-эксперимент: ImagePullBackOff -> /diagnose (идемпотентный)
+│   ├── load_test.py       # Locust-сценарий: проверка rate limiting (429)
+│   ├── check_docs_metrics.py  # drift-guard метрик README (make docs-check, шаг CI)
+│   ├── verify_ci_cache.sh # эмпирическая проверка стабильности кэширования в CI
 │   ├── run_integration_test.sh  # e2e-тест на kind-кластере (создание/диагностика/очистка)
 │   └── kind/
 │       └── cluster.yaml   # конфигурация kind-кластера для интеграционного теста
-├── Makefile               # dev-команды: install/lint/test/run/docker-build/chaos/e2e
+├── Makefile               # dev-команды: install/lint/test/run/docker-build/chaos/e2e/eval/dashboard/docs-check
 ├── Dockerfile             # multi-stage (base/builder/runtime), CPU-only torch, non-root, healthcheck
 ├── docker-compose.yml     # локальный запуск сервиса agent (порт 8000)
 ├── .dockerignore          # .git/.env/tests/.venv/__pycache__ не попадают в образ
@@ -244,6 +274,8 @@ make eval          # python eval/evaluate.py (quality-гейт LLM-as-a-judge)
 make dashboard     # streamlit run ui/dashboard.py (UI оператора на :8501)
 make docs-check    # python scripts/check_docs_metrics.py (README vs pytest)
 ```
+
+Makefile — только обёртка для удобства: он не меняет и не заменяет CI/CD.
 
 ### В Docker
 
@@ -369,13 +401,15 @@ QWEN_API_KEY=localai
 | `LOG_LEVEL`       | `INFO`                                         | Уровень логирования: DEBUG / INFO / WARNING / ERROR / CRITICAL  |
 | `OPENAI_API_KEY`  | —                                              | Ключ OpenAI (если используете OpenAI-совместимый API)           |
 | `QWEN_API_KEY`    | —                                              | Ключ Qwen/DashScope (приоритетнее `OPENAI_API_KEY`)             |
-| `LLM_BASE_URL`    | `https://dashscope.aliyuncs.com/compatible-mode` | Base URL LLM-API (OpenAI-совместимый: Qwen, vLLM, Ollama...)  |
+| `LLM_BASE_URL`    | `https://dashscope.aliyuncs.com/compatible-mode` | Base URL LLM-API (OpenAI-совместимый: Qwen, vLLM, Ollama, LocalAI). Клиент сам добавляет `/v1/chat/completions` — указывайте **без** суффикса `/v1` |
 | `LLM_MODEL`       | `qwen-max`                                     | Имя модели LLM                                                  |
 | `ALLOWED_NAMESPACES` | `["default"]`                               | Guardrail: список namespace'ов, к которым агенту разрешён доступ (JSON-массив или через запятую; `["*"]` — разрешить всё) |
 | `MAX_LOG_LINES`   | `200`                                          | Guardrail: максимум строк лога, забираемых у пода               |
 | `ENABLE_WRITE_ACTIONS` | `false`                                   | Guardrail: разрешить агенту write-действия (по умолчанию только чтение) |
 | `CORS_ORIGINS`    | `[\"*\"]`                                      | Список разрешённых CORS origins (JSON-массив). Для прода задайте явно, напр. `[\"http://localhost:3000\"]` |
 | `MAX_CONTEXT_TOKENS` | `4000`                                     | Максимальный размер контекста, передаваемого в LLM, **в токенах** (точный подсчёт tiktoken `cl100k_base`); самые длинные поля обрезаются с пометкой `... [truncated to fit token limit]` |
+| `ENABLE_SCRUBBING` | `true`                                        | Маскировать PII/секреты (JWT, API-ключи, пароли в URL, Bearer-токены, email) в логах подов и K8s-событиях как `[REDACTED:<type>]` **до** отправки контекста в LLM; `false` — только для доверенных локальных моделей |
+| `REDACT_IPS`      | `false`                                        | Дополнительно маскировать IPv4-адреса (`[REDACTED:ip]`); по умолчанию `false` — IP критичны для сетевой диагностики |
 | `LOG_FORMAT`      | `text`                                         | Формат логов: `text` (человекочитаемый) или `json` (structured logging для Loki/CloudWatch) |
 | `LLM_OFFLINE`     | `false`                                        | Демо/оффлайн-режим: без LLM-ключа `/diagnose` отвечает stub-диагнозом вместо честного `503`; в проде держите `false` |
 | `AUDIT_LOG_PATH`  | `audit.jsonl`                                  | Append-only журнал аудита (JSON Lines): по одной JSON-строке на диагностику / guardrail-отклонение / webhook-батч |
@@ -386,12 +420,15 @@ QWEN_API_KEY=localai
 | `OTEL_SERVICE_NAME` | `ai-agent-devops`                            | Имя сервиса (`service.name`) в UI Jaeger/Tempo |
 | `ENABLE_HYBRID_RAG` | `true`                                       | Гибридный RAG-поиск (TF-IDF + эмбеддинги); `false` — только TF-IDF |
 | `EMBEDDING_MODEL` | `all-MiniLM-L6-v2`                           | Модель sentence-transformers для векторной ветки гибридного RAG |
+| `RATE_LIMIT_REDIS_URL` | — (in-memory)                            | Redis URL для общего хранилища rate-limit-счётчиков между репликами API; без значения — `MemoryStorage` в каждом процессе |
 | `OIDC_ENABLED`    | `false`                                        | Аутентификация JWT для `/diagnose` и `/webhook/alertmanager`; `false` — API открыт (обратная совместимость) |
 | `OIDC_ISSUER_URL` | —                                              | Issuer URL OIDC-провайдера (Discovery + проверка `iss`); обязателен при `OIDC_ENABLED=true` |
 | `OIDC_AUDIENCE`   | —                                              | Audience этого API (claim `aud`); обязателен при `OIDC_ENABLED=true` |
 | `ALLOWED_ROLES_DIAGNOSE` | `["sre-user", "sre-admin"]`             | Роли для `POST /diagnose` (claim `roles`/`groups`; JSON-массив) |
 | `ALLOWED_ROLES_WEBHOOK`  | `["alertmanager", "sre-admin"]`           | Роли для `POST /webhook/alertmanager` (JWT-путь) |
 | `WEBHOOK_SHARED_SECRET`  | — (выключено)                             | Shared-секрет вебхука (заголовок `X-Webhook-Secret`, constant-time сравнение) — альтернатива JWT для Alertmanager |
+| `LLM_COST_PER_1K_INPUT_TOKENS` | `0.01`                              | FinOps: цена за 1K input-токенов, USD (по умолчанию — цены Qwen-max); `0` для бесплатных локальных моделей (vLLM/Ollama) |
+| `LLM_COST_PER_1K_OUTPUT_TOKENS` | `0.03`                             | FinOps: цена за 1K output-токенов, USD; `0` для бесплатных локальных моделей |
 
 ## Безопасность (guardrails)
 
@@ -427,6 +464,15 @@ QWEN_API_KEY=localai
    данных в LLM: пароли, JWT, API-ключи, Bearer-токены и email в логах подов и
    K8s-событиях заменяются на `[REDACTED:<type>]` **до** сериализации контекста
    для внешнего провайдера. Подробности — в подразделе ниже.
+7. **Секреты только через `.env`** — API-ключи никогда не коммитятся и не попадают
+   в Docker-образ (`.dockerignore`); логирование промтов/ответов на DEBUG не
+   включает auth-заголовки.
+8. **Non-root контейнер** — runtime-образ работает от `appuser` (UID 10001)
+   с read-only монтированием kubeconfig.
+9. **Graceful degradation** — сбой инструмента превращается в предупреждение
+   в отчёте, а не в падение; отсутствие kubeconfig деградирует K8s/логи до пустых
+   результатов, отсутствие LLM-ключа даёт честный `503` (или stub при
+   `LLM_OFFLINE=true`). Подробности — в подразделе ниже.
 
 ### Приватность данных и маскирование PII (Data Privacy & PII Scrubbing)
 
@@ -512,6 +558,48 @@ OpenAI-совместимого провайдера + `LLM_BASE_URL`).
 
 Все HTTP-ответы несут заголовок `X-Request-ID` (входящий эхом либо сгенерированный) —
 он же попадает в JSON-логи (`LOG_FORMAT=json`) для корреляции запросов и логов.
+Swagger UI доступен на `/docs`. CORS открыт для всех origins (dev-режим;
+в production ограничьте список через `CORS_ORIGINS`).
+
+### Пример: `POST /diagnose`
+
+Запрос:
+
+```bash
+curl -s -X POST http://localhost:8000/diagnose \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "namespace": "default",
+    "pod_name": "payments-api-7d9f4b-x2kq",
+    "description": "Pod payments-api restarts repeatedly, alert: ContainerOOMKilling"
+  }'
+```
+
+Ответ (фрагмент — получен реальным пайплайном оркестратора; здесь использована
+детерминированная заглушка LLM, чтобы не тратить API-токены):
+
+```json
+{
+  "diagnosis": {
+    "root_cause": "Container 'payments-api' is being OOMKilled: working set (~488 MiB) has reached the 512Mi memory limit; the batch allocation at 09:40:55 triggers a cgroup OOM kill (3 restarts, matching Warning events).",
+    "evidence": [
+      "container_memory_working_set_bytes = 511705088 bytes (~488 MiB) vs limit 512Mi",
+      "Pod status shows 5 restarts; last state reason: OOMKilled",
+      "K8s Warning event 'OOMKilling' for pod/payments-api-7d9f4b-x2kq",
+      "Logs: 'fatal error: runtime: out of memory' right before container exit",
+      "Runbook oom_killed.md: raise memory limit or cap batch size"
+    ],
+    "suggested_fix": "Increase the container memory limit to 1Gi (kubectl patch) and cap the batch buffer size via PAYMENTS_BATCH_MB=128; then roll the deployment and watch restarts drop to zero.",
+    "severity": "high",
+    "warnings": []
+  },
+  "report": "🟠 *Incident: diagnosis* (severity: high)\n*Namespace:* `default`, *Pod:* `payments-api-7d9f4b-x2kq`\n..."
+}
+```
+
+Обратите внимание: последнее свидетельство приходит из **runbook'а, найденного
+RAG** (`oom_killed.md`) — он извлекается автоматически по статусу пода и строкам
+логов, а не хардкодится.
 
 ### Интеграция с Alertmanager
 
@@ -656,7 +744,7 @@ SLACK_WEBHOOK_URL=https://hooks.slack.com/services/T000/B000/XXXX
 `RATE_LIMIT_REDIS_URL` — общий счётчик между репликами API). Превышение →
 **429** с `{"detail": "Rate limit exceeded. Please retry later."}` и заголовком
 `Retry-After`. Пробы `/health` и `/ready` не ограничены никогда — Kubernetes
-обязан всегда мог проверять под.
+должен всегда иметь возможность проверять под.
 Автоматизированное доказательство работы лимитов: `make load-test` — Locust-сценарий,
 проверяющий 429 при перегрузке `/diagnose` (см. «Тесты и линтеры → Нагрузочное
 тестирование»).
@@ -860,6 +948,22 @@ make eval                # или: python eval/evaluate.py --min-score 4.0
   **и** hit-rate = 100%; 1 = качество ниже порога (regression-гейт перед правками
   промптов/ранбуков/моделей); 2 = ошибка окружения (нет LLM-ключа, битый датасет).
 
+```
+==============================================================================
+                 EVALUATION REPORT — LLM-as-a-judge (golden dataset)
+==============================================================================
+ CASE (runbook)             JUDGE 1-5  RUNBOOK  ACTUAL ROOT CAUSE
+------------------------------------------------------------------------------
+ oom_killed.md                    5/5  ✅       Container OOMKilled: memory limit…
+ image_pull_backoff.md            5/5  ✅       Image pull failure: manifest un…
+ crash_loop.md                    4/5  ✅       CrashLoopBackOff: missing DATABASE…
+------------------------------------------------------------------------------
+ Average judge score : 4.67 / 5  (порог: 4.0)
+ Runbook hit-rate    : 100%  (3/3)
+ Verdict             : ✅ PASS
+==============================================================================
+```
+
 Требуется LLM-ключ (`QWEN_API_KEY`/`OPENAI_API_KEY`); для судьи можно указать ту же
 или более сильную модель через `LLM_BASE_URL`/`LLM_MODEL`.
 
@@ -889,7 +993,7 @@ incident.diagnose            (incident.namespace, incident.severity, incident.wa
   без него спаны собираются in-process и никуда не отправляются (CI/оффлайн без
   внешних эффектов).
 
-#### Локально с Jaeger
+### Локально с Jaeger
 
 ```bash
 make jaeger          # или: docker run -d --name jaeger -p 16686:16686 -p 4317:4317 jaegertracing/all-in-one:latest
@@ -918,17 +1022,6 @@ curl -s -X POST localhost:8000/diagnose -H 'Content-Type: application/json' \
 | `policy_approval_required_total` | Counter | —                   | вердикты guardrail «требуется аппрув» (опасный паттерн или kubectl/helm/oc) |
 | `llm_tokens_total`             | Counter   | type (input/output) | оценочное число токенов LLM (1 токен ≈ 4 символа)    |
 | `llm_cost_estimate_usd`        | Counter   | —                     | оценочная стоимость LLM-запросов, USD (FinOps)       |
-
-Пример запроса:
-
-```bash
-curl -X POST http://localhost:8000/diagnose \
-  -H 'Content-Type: application/json' \
-  -d '{"namespace": "prod", "pod_name": "web-1", "description": "Pod restarts alert"}'
-# -> {"diagnosis": {root_cause, evidence, suggested_fix, severity, ...}, "report": "..."}
-```
-
-Swagger UI доступен на `/docs`. CORS открыт для всех origins (dev-режим).
 
 ## Наблюдаемость
 
@@ -1089,6 +1182,44 @@ ruff check src tests scripts
 python -m pytest --cov=src --cov-report=xml tests/
 ```
 
+Дерево тестов (все внешние границы — K8s API, Prometheus HTTP, LLM HTTP —
+замоканы; прогон полностью офлайновый, без кластера, сети и вызовов LLM):
+
+```
+tests/
+├── test_k8s_tools.py         # моки клиента K8s (pods/events/deployments/nodes, пути ApiException)
+├── test_prometheus_tools.py  # моки HTTP: успех, таймауты, 5xx, парсинг
+├── test_logs_tools.py        # моки read_namespaced_pod_log
+├── test_orchestrator.py      # полный пайплайн с моками, graceful degradation, guardrails
+├── test_llm_integration.py   # LLMClient: ретраи (429/5xx), валидация JSON, fallback
+├── test_rag.py               # RunbookRAG на fixture md-файлах + интеграция с оркестратором
+├── test_text_utils.py        # рекурсия и гарантии truncate_context
+├── test_chaos_test.py        # логика chaos-скрипта (моки k8s + requests)
+├── test_config.py            # валидаторы Settings: fail-fast на bad LOG_LEVEL/LOG_FORMAT/limits
+├── test_auth.py              # OIDC: реальные RS256-JWT против фейкового JWKS-провайдера, 401/403, webhook-секрет, логин UI
+├── test_slack_interactivity.py  # кнопки Slack Block Kit, /webhook/slack-interactivity, X-Slack-Signature
+├── test_metrics.py           # FinOps-метрики LLM: llm_tokens_total, llm_cost_estimate_usd, формула стоимости, цены из env
+├── test_logger.py            # JSON-логирование + корреляция request_id
+├── test_webhook_alertmanager.py  # парсинг пейлоада Alertmanager, 400, resolved-skip, журнал аудита
+├── test_tracing.py           # OTel-провайдер, авто-спаны FastAPI, ручные спаны инструментов/LLM
+├── test_policies.py          # политика опасных фиксов, Slack-аппрув, fallback без webhook
+├── test_scrubber.py          # маскирование PII/секретов: паттерны, false positives, конфиг, wiring оркестратора
+├── test_evaluate.py          # eval-harness: схема датасета, парсинг судьи, exit-коды
+├── test_dashboard.py         # парсинг журнала аудита, построение таблицы, фильтр аппрувов
+├── test_helm_chart.py        # Helm-чарт: структура, values.yaml, инварианты lint/template
+├── test_manifests.py         # RBAC-манифесты и Kyverno ClusterPolicies
+├── test_openapi_metadata.py  # OpenAPI-метаданные: теги, описания эндпоинтов
+├── test_readme_assets.py     # ассеты README: изображения, визуальная таблица превью
+├── test_repo_standards.py    # стандарты репозитория: LICENSE, шаблоны PR/issue, формат CHANGELOG
+├── test_docs_metrics.py      # drift-guard: числа тестов/покрытия в README vs реальность pytest
+└── test_api.py               # FastAPI TestClient: /health /ready /diagnose /metrics, CORS, ошибки, X-Request-ID
+```
+
+- **Покрытие**: `pytest --cov=src --cov-report=xml --cov-fail-under=85` — сейчас **~93%**
+  (загружается как CI-артефакт каждый прогон; CI падает при покрытии ниже 85%).
+- **Docs drift guard**: `make docs-check` (и шаг CI после pytest) сверяет числа
+  тестов/покрытия в README с реальным прогоном — расхождение роняет CI.
+
 Текущий набор: **480 passed**, покрытие **~93%** (инструменты K8s/Prometheus/логов,
 оркестратор, LLM-клиент с моками HTTP, FastAPI-эндпоинты через TestClient (включая
 webhook Alertmanager и журнал аудита), валидация конфигурации, JSON-логирование,
@@ -1132,7 +1263,8 @@ make load-test   # терминал 2 — locust headless: 10 пользоват
 
 Workflow [`.github/workflows/ci.yml`](.github/workflows/ci.yml) запускается на
 `push` и `pull_request` в `main` (плюс ручной `workflow_dispatch`). Топология
-параллельная (цель 5-6 минут): `lint` и `helm` стартуют одновременно, `test`
+параллельная (полный пайплайн в `main` обычно занимает **~8-9 минут**, прогон
+для PR — ~6 минут): `lint` и `helm` стартуют одновременно, `test`
 (pytest **-n auto**, xdist) ждёт только `lint`; на push в `main`/dispatch
 `build` (нужны [test, helm]; на PR не запускается) и `integration-test`
 (нужен только test, идёт параллельно с build) завершают пайплайн:
@@ -1277,6 +1409,7 @@ make dashboard           # или: streamlit run ui/dashboard.py
 | [`CONTRIBUTING.md`](./CONTRIBUTING.md) | Разработчики | Окружение разработки, правила тестов/линта, процесс PR |
 | [`CHANGELOG.md`](./CHANGELOG.md) | Всем | Keep a Changelog: что вошло в каждый релиз |
 | [`.github/pull_request_template.md`](./.github/pull_request_template.md) | Контрибьюторам | Чек-лист PR: тесты, линтер, docs, тесты на новую логику |
+| [`README.md`](./README.md) | Англоязычная версия | Полная синхронная версия этого README на английском |
 
 ## Лицензия
 
@@ -1284,4 +1417,35 @@ MIT — см. [LICENSE](./LICENSE).
 
 ## Как внести вклад
 
-См. [CONTRIBUTING.md](./CONTRIBUTING.md).
+См. также [CONTRIBUTING.md](./CONTRIBUTING.md).
+
+### Окружение разработки
+
+```bash
+python -m venv .venv && source .venv/bin/activate
+pip install -r requirements-dev.txt   # runtime-зависимости + ruff, pytest, pytest-cov, httpx
+```
+
+### Перед открытием PR
+
+```bash
+ruff check src tests scripts          # линтер (конфиг в pyproject.toml)
+pytest --cov=src tests/               # все тесты должны пройти
+```
+
+### Правила проекта
+
+- Следуйте Git flow этого репозитория: сначала синхронизация с `main` (`git fetch origin main && git rebase origin/main`), одна feature-ветка на задачу, чистые диффы.
+- Держите агента **read-only**, если задача явно не добавляет защищённые write-действия.
+- Новые настройки проходят через `src/config.py` (pydantic-settings) + `.env.example` — никогда не хардкодить.
+- Каждый новый метод инструмента обязан глотать `ApiException`/HTTP-ошибки и возвращать пустой результат + залогированное предупреждение (принцип graceful degradation).
+
+### Добавление нового runbook'а (RAG)
+
+1. Создайте `docs/runbooks/<ваш_инцидент>.md` — используйте существующие файлы как шаблон: `Symptoms`, `Root causes`, `How to fix` (с копируемыми командами `kubectl`), `Prevention`.
+2. Пишите естественно — TF-IDF-индекс пересобирается при старте, регистрация не нужна.
+3. Проверьте поиск:
+   ```bash
+   python -c "from src.agent.rag import RunbookRAG; print([t.splitlines()[0] for t in RunbookRAG().find_relevant('your sample error text')])"
+   ```
+4. Опционально добавьте keyword-assert в `tests/test_rag.py`.
