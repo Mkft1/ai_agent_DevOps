@@ -13,6 +13,7 @@ from __future__ import annotations
 import asyncio
 import json
 import time
+import uuid
 from pathlib import Path
 from typing import Any, Protocol, runtime_checkable
 
@@ -137,12 +138,20 @@ class Diagnosis(BaseModel):
     """Выходной диагноз: RCA от LLM плюс сырые данные для отладки.
 
     Attributes:
+        incident_id: уникальный идентификатор инцидента (12 hex-символов,
+            ``uuid.uuid4().hex[:12]``). Коррелирует Slack-аппрув (кнопки
+            ``approve:<incident_id>`` / ``reject:<incident_id>`` ->
+            ``POST /webhook/slack-interactivity``) с записями журнала аудита.
         requires_approval: True, если ``suggested_fix`` распознан политикой
             (:func:`~src.agent.policies.check_policy`) как опасное действие —
             оператор должен явно approve'ить рекомендацию (Slack-уведомление
             при настроенном ``SLACK_WEBHOOK_URL``).
     """
 
+    incident_id: str = Field(
+        default_factory=lambda: uuid.uuid4().hex[:12],
+        description="Уникальный ID инцидента (12 hex): корреляция Slack-аппрува и аудита",
+    )
     root_cause: str = ""
     evidence: list[str] = Field(default_factory=list)
     suggested_fix: str = ""
@@ -654,7 +663,7 @@ class IncidentOrchestrator:
         result.requires_approval = check_policy(result.suggested_fix, self.settings)
         if result.requires_approval:
             inc_approval_request()
-            await self._notify_slack_approval(result.suggested_fix)
+            await self._notify_slack_approval(result, incident)
 
         logger.info(
             "Diagnosis complete: severity=%s, warnings=%d, requires_approval=%s",
@@ -664,8 +673,18 @@ class IncidentOrchestrator:
         )
         return result.model_dump()
 
-    async def _notify_slack_approval(self, suggested_fix: str) -> None:
+    async def _notify_slack_approval(self, result: Diagnosis, incident: Incident) -> None:
         """Отправить запрос аппрува опасной рекомендации в Slack (incoming webhook).
+
+        Сообщение — Slack **Block Kit**: секция с контекстом инцидента
+        (namespace/pod/root cause/suggested fix/incident_id) и блок действий с
+        кнопками **✅ Approve** (style=primary) и **❌ Reject** (style=danger).
+        ``value`` кнопок содержит ``approve:<incident_id>`` /
+        ``reject:<incident_id>``: клик отправляется Slack'ом на
+        ``POST /webhook/slack-interactivity`` (см. ``src/main.py``), где
+        решение инженера пишется в журнал аудита — аппрув без выхода из Slack.
+        Поле ``text`` — fallback для push-уведомлений (и обратная совместимость
+        с текстовым форматом).
 
         Асинхронно (``httpx.AsyncClient``, timeout 5 c): не блокирует event loop
         FastAPI во время alert-штормов. Graceful degradation: без
@@ -675,20 +694,62 @@ class IncidentOrchestrator:
         webhook = self.settings.slack_webhook_url
         message = (
             "⚠️ Action Required: Agent suggests dangerous fix: "
-            f"{suggested_fix}. Approve or Reject?"
+            f"{result.suggested_fix}. Approve or Reject?"
         )
         if not webhook:
             logger.warning(
                 "Dangerous fix requires human approval but SLACK_WEBHOOK_URL is "
                 "not set — approval request NOT sent (fix: %.300s)",
-                suggested_fix,
+                result.suggested_fix,
             )
             return
+        payload = {
+            "text": message,
+            "blocks": [
+                {
+                    "type": "section",
+                    "text": {
+                        "type": "mrkdwn",
+                        "text": (
+                            "⚠️ *Dangerous fix detected*\n"
+                            f"*Namespace:* `{incident.namespace}`\n"
+                            f"*Pod:* `{incident.pod_name or 'n/a'}`\n"
+                            f"*Root cause:* {result.root_cause or 'n/a'}\n"
+                            f"*Suggested fix:* `{result.suggested_fix}`\n"
+                            f"*Incident ID:* `{result.incident_id}`"
+                        ),
+                    },
+                },
+                {
+                    "type": "actions",
+                    "elements": [
+                        {
+                            "type": "button",
+                            "text": {"type": "plain_text", "text": "✅ Approve"},
+                            "style": "primary",
+                            "action_id": f"approve_{result.incident_id}",
+                            "value": f"approve:{result.incident_id}",
+                        },
+                        {
+                            "type": "button",
+                            "text": {"type": "plain_text", "text": "❌ Reject"},
+                            "style": "danger",
+                            "action_id": f"reject_{result.incident_id}",
+                            "value": f"reject:{result.incident_id}",
+                        },
+                    ],
+                },
+            ],
+        }
         try:
             async with httpx.AsyncClient(timeout=SLACK_TIMEOUT_SECONDS) as client:
-                resp = await client.post(webhook, json={"text": message})
+                resp = await client.post(webhook, json=payload)
                 resp.raise_for_status()
-            logger.info("Slack approval request sent (HTTP %s)", resp.status_code)
+            logger.info(
+                "Slack approval request sent (HTTP %s, incident %s)",
+                resp.status_code,
+                result.incident_id,
+            )
         except Exception as exc:  # noqa: BLE001 - Slack недоступен не роняет диагноз
             logger.error("Failed to send Slack approval request: %s", exc)
 

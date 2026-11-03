@@ -9,6 +9,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Slack Interactive Buttons для аппрува опасных рекомендаций (двусторонняя
+  интеграция): `_notify_slack_approval` теперь отправляет **Block Kit**-сообщение —
+  секция с контекстом инцидента (namespace/pod/root cause/suggested fix/incident
+  ID) и кнопки **✅ Approve** (style=primary) / **❌ Reject** (style=danger) с
+  `value = approve:<incident_id>` / `reject:<incident_id>`; поле `text` сохраняет
+  прежний текстовый формат (push-уведомления, обратная совместимость). Новое поле
+  `Diagnosis.incident_id` (`uuid4().hex[:12]`, default_factory) коррелирует
+  Slack-решение с записью аудита диагностики (`incident_id` добавлен в
+  `_RESULT_FIELDS` журнала аудита). Новый эндпоинт
+  `POST /webhook/slack-interactivity` (src/main.py): парсит form-поле `payload`
+  Slack Interactive Components, извлекает `actions[0].value`, пишет событие аудита
+  `slack_approve`/`slack_reject` (incident_id, действие, пользователь, канал) и
+  отвечает `200 Approved`/`Rejected`; ошибки парсинга → `400`, неизвестное
+  действие → `400`. Валидация `X-Slack-Signature` по официальной схеме Slack
+  (HMAC-SHA256 `v0:{timestamp}:{body}`, constant-time сравнение, replay-окно
+  5 минут) при заданном `SLACK_SIGNING_SECRET`; невалидная подпись → `401`; без
+  секрета — dev-режим с WARNING. Конфигурация: `SLACK_SIGNING_SECRET` и
+  `SLACK_APP_TOKEN` (Socket Mode, зарезервирован) в `src/config.py` и
+  `.env.example`; rate limit эндпоинта 30/мин. Токены/секреты не логируются.
+  Тесты: `tests/test_slack_interactivity.py` — 26 тестов (структура Block Kit,
+  incident_id формат/уникальность/roundtrip, approve/reject + аудит, 400-ветки,
+  подпись: неверная/чужая/устаревшая/подменённое тело → 401, dev-режим,
+  корреляция incident_id в аудите диагностики). Документация: подразделы
+  «Interactive Approval Buttons (Slack)» / «Интерактивные кнопки аппрува (Slack)»
+  в README.md/README.ru.md (настройка Slack App: Incoming Webhooks,
+  Interactivity & Shortcuts Request URL, Signing Secret, Event Subscriptions),
+  строка эндпоинта в API-таблицах. Примечание: транспорт уведомления —
+  `httpx.AsyncClient` (как в существующем коде), а не `requests` из текста
+  задачи — тесты мокают фактический транспорт.
 - OIDC authentication and role-based authorization (`src/auth.py`): опциональная
   JWT-защита `POST /diagnose` и `POST /webhook/alertmanager` (`OIDC_ENABLED`,
   по умолчанию `false` — полная обратная совместимость). JWT проверяется целиком

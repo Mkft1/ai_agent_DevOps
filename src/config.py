@@ -53,6 +53,15 @@ class Settings(BaseSettings):
     # None (по умолчанию) — уведомление не отправляется, в логах WARNING.
     slack_webhook_url: str | None = None
 
+    # Signing Secret Slack-приложения (Basic Information -> App Credentials):
+    # проверка подписи X-Slack-Signature входящих запросов от Interactive
+    # Components (кнопки Approve/Reject) на POST /webhook/slack-interactivity.
+    # None (по умолчанию) — подпись НЕ проверяется (dev-режим, WARNING в логах).
+    slack_signing_secret: str | None = None
+    # App-Level Token Slack (xapp-...) — опционально, зарезервирован для
+    # Socket Mode (приём событий без публичного URL). В HTTP-режиме не используется.
+    slack_app_token: str | None = None
+
     # RAG: гибридный поиск (TF-IDF + векторные эмбеддинги sentence-transformers).
     # При недоступности модели агент молча деградирует до чистого TF-IDF.
     enable_hybrid_rag: bool = True

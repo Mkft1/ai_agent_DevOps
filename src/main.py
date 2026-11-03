@@ -12,16 +12,19 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import hmac
 import json
 import os
 import time
 import uuid
+from urllib.parse import parse_qs
 
 import httpx
 from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, PlainTextResponse
 from opentelemetry import trace
 from opentelemetry.exporter.otlp.proto.grpc.trace_exporter import OTLPSpanExporter
 from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
@@ -114,7 +117,9 @@ OPENAPI_TAGS = [
     },
     {
         "name": "Webhooks",
-        "description": "Приёмники внешних систем алертинга (Prometheus Alertmanager).",
+        "description": "Приёмники внешних систем: Prometheus Alertmanager "
+        "(автодиагностика алертов) и Slack Interactive Components (кнопки "
+        "Approve/Reject для опасных рекомендаций).",
     },
 ]
 
@@ -599,6 +604,120 @@ async def webhook_alertmanager(
     return AlertmanagerWebhookResponse(
         processed=len(diagnoses), skipped=skipped, diagnoses=diagnoses
     )
+
+
+# ----------------------------------------------------------------------
+# Slack Interactive Components: кнопки ✅ Approve / ❌ Reject из Block Kit
+# сообщения (см. IncidentOrchestrator._notify_slack_approval) приходят сюда.
+# ----------------------------------------------------------------------
+# Максимальный возраст X-Slack-Request-Timestamp (защита от replay-атак).
+SLACK_SIGNATURE_MAX_AGE_SECONDS = 300
+
+
+def _verify_slack_signature(body: bytes, timestamp: str, signature: str, secret: str) -> bool:
+    """Проверить ``X-Slack-Signature`` по официальному алгоритму Slack.
+
+    Base string: ``v0:{timestamp}:{body}``; ожидаемая подпись — ``v0=`` +
+    hexdigest HMAC-SHA256(signing_secret, base). Replay-защита: отметка
+    времени не старше :data:`SLACK_SIGNATURE_MAX_AGE_SECONDS` (5 минут).
+    Сравнение constant-time (:func:`hmac.compare_digest`).
+    """
+    try:
+        ts_value = int(timestamp)
+    except (TypeError, ValueError):
+        return False
+    if abs(time.time() - ts_value) > SLACK_SIGNATURE_MAX_AGE_SECONDS:
+        return False
+    if not signature.startswith("v0="):
+        return False
+    base_string = f"v0:{timestamp}:{body.decode('utf-8')}"
+    digest = hmac.new(
+        secret.encode("utf-8"), base_string.encode("utf-8"), hashlib.sha256
+    ).hexdigest()
+    return hmac.compare_digest(f"v0={digest}", signature)
+
+
+@app.post(
+    "/webhook/slack-interactivity",
+    tags=["Webhooks"],
+    summary="Slack interactive approval",
+    description="Receiver for Slack Interactive Components (Block Kit buttons). "
+    "Parses the `payload` form field, extracts `actions[0].value` "
+    "(`approve:<incident_id>` / `reject:<incident_id>`), writes the engineer's "
+    "decision to the audit journal and answers 200 `Approved`/`Rejected`. "
+    "When `SLACK_SIGNING_SECRET` is set, the request must carry a valid "
+    "`X-Slack-Signature` (HMAC-SHA256 `v0`, 5-minute replay window); an "
+    "invalid or missing signature returns 401.",
+)
+@limiter.limit("30/minute")
+async def slack_interactivity(request: Request) -> PlainTextResponse:
+    """Обработать клик по кнопке Approve/Reject в Slack-сообщении.
+
+    Контракт Slack: POST ``application/x-www-form-urlencoded`` с полем
+    ``payload`` (JSON). Ответ 200 с коротким текстом — Slack показывает его
+    инженеру. Верификация подписи: :func:`_verify_slack_signature` —
+    обязательна при заданном ``SLACK_SIGNING_SECRET``; без секрета запрос
+    принимается в dev-режиме (WARNING в логах). Каждое решение пишется в
+    журнал аудита (``slack_approve`` / ``slack_reject``) с ``incident_id``
+    (из value кнопки) и пользователем Slack. Тело запроса и секреты не
+    логируются.
+    """
+    current: Settings = get_settings()
+    body = await request.body()
+    secret = current.slack_signing_secret
+    if secret:
+        if not _verify_slack_signature(
+            body,
+            request.headers.get("X-Slack-Request-Timestamp", ""),
+            request.headers.get("X-Slack-Signature", ""),
+            secret,
+        ):
+            logger.warning("Slack interactivity: X-Slack-Signature validation failed")
+            raise HTTPException(status_code=401, detail="Invalid Slack signature")
+    else:
+        logger.warning(
+            "SLACK_SIGNING_SECRET is not set — accepting unsigned Slack payload "
+            "(dev mode; set the secret in production)"
+        )
+
+    form = parse_qs(body.decode("utf-8"))
+    raw_payload = (form.get("payload") or [None])[0]
+    if not raw_payload:
+        raise HTTPException(status_code=400, detail="Missing Slack 'payload' form field")
+    try:
+        payload = json.loads(raw_payload)
+    except json.JSONDecodeError as exc:
+        raise HTTPException(status_code=400, detail="Malformed Slack payload JSON") from exc
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=400, detail="Malformed Slack payload JSON")
+
+    actions = payload.get("actions") or []
+    if not isinstance(actions, list) or not actions or not isinstance(actions[0], dict):
+        raise HTTPException(status_code=400, detail="Slack payload contains no actions")
+    value = str(actions[0].get("value", ""))
+    action, _, incident_id = value.partition(":")
+    action = action.strip().lower()
+    if action not in ("approve", "reject"):
+        logger.warning("Slack interactivity: unsupported action value")
+        raise HTTPException(status_code=400, detail="Unsupported Slack action")
+
+    user = payload.get("user") or {}
+    slack_user = str(user.get("username") or user.get("id") or "unknown")
+    channel = str((payload.get("channel") or {}).get("id") or "")
+    log_audit_event(
+        f"slack_{action}",
+        {
+            "incident_id": incident_id,
+            "action": action,
+            "slack_user": slack_user,
+            "channel": channel,
+        },
+        {},
+    )
+    logger.info(
+        "Slack interactivity: incident %s %s by %s", incident_id or "n/a", action, slack_user
+    )
+    return PlainTextResponse("Approved" if action == "approve" else "Rejected")
 
 
 if __name__ == "__main__":

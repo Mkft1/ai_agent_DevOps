@@ -15,7 +15,7 @@ AI-агент для диагностики инцидентов в Kubernetes. 
 [![Python 3.12](https://img.shields.io/badge/python-3.12-blue?logo=python&logoColor=white)](https://www.python.org/downloads/)
 [![Docker](https://img.shields.io/badge/docker-multistage%20image-2496ED?logo=docker&logoColor=white)](./Dockerfile)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](./LICENSE)
-[![Tests](https://img.shields.io/badge/tests-439%20passed-brightgreen?logo=pytest&logoColor=white)](#тесты)
+[![Tests](https://img.shields.io/badge/tests-465%20passed-brightgreen?logo=pytest&logoColor=white)](#тесты)
 [![Ruff](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/astral-sh/ruff/main/assets/badge/v2.json)](https://github.com/astral-sh/ruff)
 
 AI-агент для диагностики инцидентов в Kubernetes.
@@ -120,10 +120,11 @@ Alertmanager → /diagnose → IncidentOrchestrator → [K8sTools, PrometheusToo
   `requires_approval=true`); при включённом OIDC — экран логина по JWT, пользователь
   и роли в сайдбаре, кнопка аппрува только для `sre-admin`/`devops-admin`;
   запускается отдельно от FastAPI, кластер не трогает.
-- **Тестирование** — 439 unit/интеграционных тестов (pytest + unittest.mock), покрытие ~94%
+- **Тестирование** — 465 unit/интеграционных тестов (pytest + unittest.mock), покрытие ~93%
   (гейт в CI `--cov-fail-under=85`): инструменты, оркестратор, LLM-клиент (мок HTTP),
   FastAPI-эндпоинты (TestClient), конфигурация и логирование, chaos-скрипт,
-  OIDC-аутентификация (реальные RS256-JWT против фейкового JWKS-провайдера).
+  OIDC-аутентификация (реальные RS256-JWT против фейкового JWKS-провайдера),
+  Slack Interactive Buttons (Block Kit, подпись X-Slack-Signature).
 - **DevOps-практики** — многоступенчатый Docker-образ, docker-compose, идемпотентный
   chaos-эксперимент (ImagePullBackOff) как end-to-end проверка качества диагностики.
 - **Evaluation-фреймворк** — `make eval`: золотой датасет инцидентов прогоняется через
@@ -158,7 +159,7 @@ ai_agent_DevOps/
 │   └── workflows/
 │       └── ci.yml         # CI: lint (ruff) -> test (pytest+cov) -> build (Docker, no push)
 ├── src/
-│   ├── main.py            # Точка входа FastAPI: /health /ready /diagnose /metrics /webhook/alertmanager
+│   ├── main.py            # Точка входа FastAPI: /health /ready /diagnose /metrics /webhook/alertmanager /webhook/slack-interactivity
 │   ├── api/
 │   │   └── models.py      # pydantic-контракты: пейлоад Alertmanager -> Incident
 │   ├── config.py          # Загрузка конфигурации из .env
@@ -294,7 +295,9 @@ curl http://localhost:8000/health
 | `LOG_FORMAT`      | `text`                                         | Формат логов: `text` (человекочитаемый) или `json` (structured logging для Loki/CloudWatch) |
 | `LLM_OFFLINE`     | `false`                                        | Демо/оффлайн-режим: без LLM-ключа `/diagnose` отвечает stub-диагнозом вместо честного `503`; в проде держите `false` |
 | `AUDIT_LOG_PATH`  | `audit.jsonl`                                  | Append-only журнал аудита (JSON Lines): по одной JSON-строке на диагностику / guardrail-отклонение / webhook-батч |
-| `SLACK_WEBHOOK_URL` | — (выключено)                          | Incoming webhook для аппрува опасных рекомендаций; без значения — WARNING в логах, `requires_approval` всё равно выставляется |
+| `SLACK_WEBHOOK_URL` | — (выключено)                          | Incoming webhook для аппрува опасных рекомендаций (Block Kit с кнопками Approve/Reject); без значения — WARNING в логах, `requires_approval` всё равно выставляется |
+| `SLACK_SIGNING_SECRET` | — (dev-режим)                         | Signing Secret Slack-приложения: проверка `X-Slack-Signature` на `POST /webhook/slack-interactivity` (обязательно для production) |
+| `SLACK_APP_TOKEN` | — (выключено)                              | App-Level Token (`xapp-...`) — опционально, зарезервирован для Socket Mode |
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | — (выключено)                   | OTLP/gRPC endpoint экспорта трейсов, напр. `http://localhost:4317` (Jaeger); без значения спаны не экспортируются |
 | `OTEL_SERVICE_NAME` | `ai-agent-devops`                            | Имя сервиса (`service.name`) в UI Jaeger/Tempo |
 | `ENABLE_HYBRID_RAG` | `true`                                       | Гибридный RAG-поиск (TF-IDF + эмбеддинги); `false` — только TF-IDF |
@@ -421,6 +424,7 @@ OpenAI-совместимого провайдера + `LLM_BASE_URL`).
 | GET   | `/metrics`  | Prometheus-метрики (HTTP + кастомные метрики агента)            |
 | POST  | `/diagnose` | Приём инцидента и запуск диагностики через оркестратор          |
 | POST  | `/webhook/alertmanager` | Webhook Alertmanager: диагностика firing-алертов → `{processed, skipped, diagnoses}`; `400` на невалидном пейлоаде |
+| POST  | `/webhook/slack-interactivity` | Приёмник Slack Interactive Components: клик по кнопке Approve/Reject (`actions[0].value` = `approve:<incident_id>` / `reject:<incident_id>`) → запись в аудит + `200 Approved`/`Rejected`; при заданном `SLACK_SIGNING_SECRET` проверяет `X-Slack-Signature` (иначе `401`) |
 
 Все HTTP-ответы несут заголовок `X-Request-ID` (входящий эхом либо сгенерированный) —
 он же попадает в JSON-логи (`LOG_FORMAT=json`) для корреляции запросов и логов.
@@ -484,12 +488,16 @@ namespace пропускается (`skipped++`, событие `guardrail_rejec
    `/webhook/alertmanager`, в журнале аудита и строкой 🔔 в отчёте для мессенджеров —
    и инкрементирует Prometheus-счётчик `policy_approval_required_total`.
 4. При настроенном `SLACK_WEBHOOK_URL` агент отправляет запрос аппрува
-   во incoming webhook:
+   во incoming webhook — **Block Kit-сообщение с кнопками ✅ Approve / ❌ Reject**
+   (fallback-поле `text` сохраняет прежний текстовый формат для push-уведомлений):
 
    ```
    ⚠️ Action Required: Agent suggests dangerous fix: kubectl delete pod bad-pod -n default. Approve or Reject?
    ```
 
+   Клик по кнопке Slack доставляет на `POST /webhook/slack-interactivity`,
+   и решение инженера попадает в журнал аудита — см.
+   [Интерактивные кнопки аппрува](#интерактивные-кнопки-аппрува-slack).
    Без webhook'а агент пишет `WARNING` в логи (аппрув в диагнозе всё равно
    требуется) и не падает; недоступность Slack диагностику тоже не роняет —
    ошибка отправки только логируется.
@@ -504,6 +512,58 @@ SLACK_WEBHOOK_URL=https://hooks.slack.com/services/T000/B000/XXXX
 и read-only-команды CLI (`kubectl get pods`, `kubectl describe pod`,
 `kubectl logs`) гейт не проходят: `requires_approval: false`, сообщение в Slack
 не отправляется.
+
+### Интерактивные кнопки аппрува (Slack)
+
+Запрос аппрува — не простой текст, а **Block Kit**-сообщение с контекстом
+инцидента и двумя кнопками: инженер принимает решение **не выходя из Slack**:
+
+> ⚠️ *Dangerous fix detected*
+> *Namespace:* `default`  ·  *Pod:* `payments-api-7d9f4b-x2kq`
+> *Root cause:* Container OOMKilled
+> *Suggested fix:* `kubectl delete pod payments-api-7d9f4b-x2kq -n default`
+> *Incident ID:* `3f9a1c7b0d42`
+>
+> `[ ✅ Approve ]`  `[ ❌ Reject ]`
+
+Кнопки несут `value = approve:<incident_id>` / `reject:<incident_id>`, где
+`incident_id` — `uuid4().hex[:12]`, поле модели `Diagnosis`; тот же ID пишется
+в запись журнала аудита о диагностике, поэтому клик всегда коррелируется с
+инцидентом. Slack доставляет клик как `POST /webhook/slack-interactivity`
+(`application/x-www-form-urlencoded`, поле `payload`). Эндпоинт парсит
+`actions[0].value`, пишет событие аудита `slack_approve` / `slack_reject`
+(ID инцидента, действие, пользователь Slack, канал) и отвечает `200` с текстом
+`Approved` / `Rejected` — его Slack показывает нажавшему.
+
+**Валидация запросов** — по официальной схеме Slack: `X-Slack-Signature` =
+`v0=` + HMAC-SHA256(`SLACK_SIGNING_SECRET`, `v0:{X-Slack-Request-Timestamp}:{body}`),
+сравнение constant-time, replay-окно 5 минут (устаревшие отметки времени
+отклоняются). Неверная/отсутствующая/подменённая подпись → `401`. Без
+`SLACK_SIGNING_SECRET` эндпоинт работает в dev-режиме (принимает неподписанные
+запросы с `WARNING` в логах) — **в production секрет обязателен**.
+
+**Настройка Slack App (одноразово):**
+
+1. [api.slack.com/apps](https://api.slack.com/apps) → **Create New App** → *From scratch*.
+2. **Incoming Webhooks** → *Activate* → *Add New Webhook to Workspace* → выберите
+   канал дежурных → скопируйте URL в `SLACK_WEBHOOK_URL` (`.env`) — сюда агент
+   шлёт запросы аппрува.
+3. **Interactivity & Shortcuts** → *Enable Interactivity*; **Request URL**:
+   `https://<agent-host>/webhook/slack-interactivity` — URL должен быть доступен
+   со стороны Slack (для локальной разработки опубликуйте его через
+   ngrok/cloudflared-туннель).
+4. **Basic Information → App Credentials → Signing Secret** → скопируйте в
+   `SLACK_SIGNING_SECRET` (`.env`); в кластере храните оба значения в K8s Secret.
+5. **Event Subscriptions** для кнопок **не требуются** (Slack сам шлёт payload
+   `block_actions` на Request URL); включайте, только если нужны события
+   сообщений. Deployment без публичного URL (Socket Mode) зарезервирован через
+   `SLACK_APP_TOKEN` (`xapp-…`).
+
+Каждое решение фиксируется в журнале аудита (`AUDIT_LOG_PATH`):
+
+```json
+{"ts": "2026-11-02T12:00:00+00:00", "event_type": "slack_approve", "incident": {"incident_id": "3f9a1c7b0d42", "action": "approve", "slack_user": "sre-ivan", "channel": "C42"}, "result": {}}
+```
 
 ### Rate limiting (защита квот LLM и API от alert-штормов)
 
@@ -876,10 +936,11 @@ ruff check src tests scripts
 python -m pytest --cov=src --cov-report=xml tests/
 ```
 
-Текущий набор: **439 passed**, покрытие **~94%** (инструменты K8s/Prometheus/логов,
+Текущий набор: **465 passed**, покрытие **~93%** (инструменты K8s/Prometheus/логов,
 оркестратор, LLM-клиент с моками HTTP, FastAPI-эндпоинты через TestClient (включая
 webhook Alertmanager и журнал аудита), валидация конфигурации, JSON-логирование,
-трейсинг OpenTelemetry, chaos-скрипт, OIDC-аутентификация и RBAC).
+трейсинг OpenTelemetry, chaos-скрипт, OIDC-аутентификация и RBAC,
+Slack Interactive Buttons).
 
 ### Нагрузочное тестирование (проверка rate limiting)
 

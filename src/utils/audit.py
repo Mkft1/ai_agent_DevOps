@@ -34,7 +34,16 @@ LOCK_TIMEOUT_SECONDS = 10.0
 
 # Из диагноза в журнал пишем только ключевые поля: полный ``raw_data``
 # (метры килобайт метрик/логов) раздул бы журнал и дублировал контекст LLM.
-_RESULT_FIELDS = ("root_cause", "severity", "suggested_fix", "warnings", "requires_approval")
+# ``incident_id`` — корреляция с событиями Slack-аппрува (slack_approve/
+# slack_reject пишут тот же ID из value кнопок).
+_RESULT_FIELDS = (
+    "incident_id",
+    "root_cause",
+    "severity",
+    "suggested_fix",
+    "warnings",
+    "requires_approval",
+)
 
 
 def audit_log_path() -> Path:
