@@ -9,7 +9,7 @@
 <h1 align="center">K8s Incident Diagnosis AI Agent</h1>
 
 [![CI](https://github.com/Mkft1/ai_agent_DevOps/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/Mkft1/ai_agent_DevOps/actions/workflows/ci.yml)
-![Coverage](https://img.shields.io/badge/coverage-94%25-brightgreen)
+![Coverage](https://img.shields.io/badge/coverage-93%25-brightgreen)
 ![Python](https://img.shields.io/badge/python-3.12-blue?logo=python&logoColor=white)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](./LICENSE)
 [![Docker](https://img.shields.io/badge/docker-multistage-2496ED?logo=docker&logoColor=white)](./Dockerfile)
@@ -37,7 +37,7 @@ The agent is strictly **read-only by default**: it never mutates the cluster (`E
 | 🔁 **Chaos self-test** | `scripts/chaos_test.py` creates an ImagePullBackOff pod, asks the agent to diagnose it, asserts the RCA mentions "image"/"pull", and cleans up. Idempotent. |
 | ☸️ **Helm chart** | Production-ready `charts/ai-agent` (v0.1.0): Deployment with probes & non-root securityContext, ClusterIP Service, least-privilege RBAC, ConfigMap/Secret from `values.yaml`, `make helm-lint` / `make helm-install`. |
 | 🖥️ **Operator dashboard** | `make dashboard` — Streamlit UI over the audit journal: incident table (Timestamp/Namespace/Severity/Root Cause), severity metrics, and approval cards with `suggested_fix` + "Approve & Apply" for every `requires_approval` incident. With OIDC enabled: JWT login screen, current user/roles in the sidebar, and the approve button rendered only for `sre-admin`/`devops-admin`. |
-| 🧪 **Testing & CI/CD** | 439 unit/integration tests with mocked clients (94% coverage, CI gate `--cov-fail-under=85`, SentenceTransformer mocked so tests never download models), plus an offline **evaluation framework** (`make eval`) with a golden dataset and LLM-as-a-judge scoring; | GitHub Actions pipeline: lint → test+coverage → Docker build+smoke → kind-based e2e on `main` (auto-skipped when no LLM secret is configured). |
+| 🧪 **Testing & CI/CD** | 465 unit/integration tests with mocked clients (93% coverage, CI gate `--cov-fail-under=85`, SentenceTransformer mocked so tests never download models), plus an offline **evaluation framework** (`make eval`) with a golden dataset and LLM-as-a-judge scoring; | GitHub Actions pipeline: lint → test+coverage → Docker build+smoke → kind-based e2e on `main` (auto-skipped when no LLM secret is configured). |
 | 🐳 **Containerized** | Multi-stage `python:3.12-slim` image, non-root user, healthcheck, no secrets baked into the image. |
 
 ---
@@ -214,6 +214,7 @@ docker compose up --build
 | `GET` | `/ready` | Checks K8s API + Prometheus reachability → `200` or `503`. |
 | `POST` | `/diagnose` | Accepts an incident, returns `{diagnosis, report}`. |
 | `POST` | `/webhook/alertmanager` | Alertmanager webhook: diagnoses firing alerts, returns `{processed, skipped, diagnoses}`; `400` on invalid JSON/schema. |
+| `POST` | `/webhook/slack-interactivity` | Slack Interactive Components receiver: `actions[0].value` (`approve:<incident_id>` / `reject:<incident_id>`) → audit event + `200 Approved`/`Rejected`; `X-Slack-Signature` validated when `SLACK_SIGNING_SECRET` is set (`401` otherwise). |
 | `GET` | `/metrics` | Prometheus exposition format (HTTP + custom metrics). |
 
 All responses carry an `X-Request-ID` header (echoed when provided by the client/LB, generated otherwise); the same id appears in JSON logs (`LOG_FORMAT=json`) for request/log correlation.
@@ -328,13 +329,17 @@ Before an operator acts on them, a role-based policy gate runs
    `POST /webhook/alertmanager` responses, in the audit journal and as a 🔔 line
    in the Slack/Telegram report) and increments the `policy_approval_required_total`
    Prometheus counter.
-4. If `SLACK_WEBHOOK_URL` is configured, the agent posts an approval request to an
-   incoming webhook:
+4. If `SLACK_WEBHOOK_URL` is configured, the agent posts an approval request to the
+   incoming webhook as a **Block Kit message with ✅ Approve / ❌ Reject buttons**
+   (the `text` fallback keeps the classic plain format for push notifications):
 
    ```
    ⚠️ Action Required: Agent suggests dangerous fix: kubectl delete pod bad-pod -n default. Approve or Reject?
    ```
 
+   Button clicks are delivered by Slack to `POST /webhook/slack-interactivity`,
+   and the engineer's decision lands in the audit journal — see
+   [Interactive Approval Buttons](#interactive-approval-buttons-slack).
    Without the webhook the agent logs a `WARNING` (approval still required in the
    diagnosis) — it never crashes. A Slack outage also cannot break diagnosis:
    send failures are logged and the response is returned as usual.
@@ -348,6 +353,57 @@ SLACK_WEBHOOK_URL=https://hooks.slack.com/services/T000/B000/XXXX
 Safe recommendations (raise limits, fix image tags, add probes...) and read-only
 CLI commands (`kubectl get pods`, `kubectl describe pod`, `kubectl logs`) skip the
 gate: `requires_approval: false`, no Slack message.
+
+### Interactive Approval Buttons (Slack)
+
+The approval request is not plain text — it is a **Block Kit** message with the
+incident context and two buttons, so the engineer decides **without leaving Slack**:
+
+> ⚠️ *Dangerous fix detected*
+> *Namespace:* `default`  ·  *Pod:* `payments-api-7d9f4b-x2kq`
+> *Root cause:* Container OOMKilled
+> *Suggested fix:* `kubectl delete pod payments-api-7d9f4b-x2kq -n default`
+> *Incident ID:* `3f9a1c7b0d42`
+>
+> `[ ✅ Approve ]`  `[ ❌ Reject ]`
+
+The buttons carry `value = approve:<incident_id>` / `reject:<incident_id>`, where
+`incident_id` is `uuid4().hex[:12]` — a field of `Diagnosis`, also written into
+the audit-journal record of the diagnosis, so a click is always correlatable
+with the incident. Slack delivers the click as `POST /webhook/slack-interactivity`
+(`application/x-www-form-urlencoded`, field `payload`). The endpoint parses
+`actions[0].value`, writes a `slack_approve` / `slack_reject` audit event
+(incident id, action, Slack user, channel) and answers `200` with `Approved` /
+`Rejected` — Slack shows that text to the person who clicked.
+
+**Request validation** follows the official Slack scheme: `X-Slack-Signature` =
+`v0=` + HMAC-SHA256(`SLACK_SIGNING_SECRET`, `v0:{X-Slack-Request-Timestamp}:{body}`),
+compared in constant time, with a 5-minute replay window (stale timestamps are
+rejected). Invalid, missing, or tampered signatures → `401`. Without
+`SLACK_SIGNING_SECRET` the endpoint runs in dev mode (accepts unsigned payloads
+with a `WARNING` log) — **set the secret in production**.
+
+**Slack App setup (one-time):**
+
+1. [api.slack.com/apps](https://api.slack.com/apps) → **Create New App** → *From scratch*.
+2. **Incoming Webhooks** → *Activate* → *Add New Webhook to Workspace* → pick the
+   ops channel → copy the URL into `SLACK_WEBHOOK_URL` (`.env`) — this is where
+   the agent posts approval requests.
+3. **Interactivity & Shortcuts** → *Enable Interactivity*; **Request URL**:
+   `https://<agent-host>/webhook/slack-interactivity` — the URL must be reachable
+   from Slack (for local development expose it via an ngrok/cloudflared tunnel).
+4. **Basic Information → App Credentials → Signing Secret** → copy it into
+   `SLACK_SIGNING_SECRET` (`.env`); in a cluster keep both values in a K8s Secret.
+5. **Event Subscriptions** are *not required* for buttons (Slack posts
+   `block_actions` payloads straight to the Request URL); enable them only if you
+   also need message events. A Socket Mode deployment (no public URL) is
+   anticipated via `SLACK_APP_TOKEN` (`xapp-…`).
+
+Every decision is recorded in the audit journal (`AUDIT_LOG_PATH`):
+
+```json
+{"ts": "2026-11-02T12:00:00+00:00", "event_type": "slack_approve", "incident": {"incident_id": "3f9a1c7b0d42", "action": "approve", "slack_user": "sre-ivan", "channel": "C42"}, "result": {}}
+```
 
 ### Rate limiting (alert-storm / financial DoS protection)
 
@@ -663,6 +719,7 @@ tests/
 ├── test_chaos_test.py        # chaos script logic (mocked k8s + requests)
 ├── test_config.py            # Settings validators: fail-fast on bad LOG_LEVEL/LOG_FORMAT/limits
 ├── test_auth.py              # OIDC: real RS256 JWTs vs fake JWKS provider, 401/403, webhook secret, UI login
+├── test_slack_interactivity.py  # Slack Block Kit buttons, /webhook/slack-interactivity, X-Slack-Signature
 ├── test_logger.py            # JSON structured logging + request_id correlation
 ├── test_webhook_alertmanager.py  # Alertmanager payload parsing, 400s, resolved-skip, audit journal
 ├── test_tracing.py           # OTel provider, FastAPI auto-spans, manual tool/LLM spans
@@ -674,7 +731,7 @@ tests/
 ```
 
 - **Unit tests**: every external boundary (Kubernetes API, Prometheus HTTP, LLM HTTP) is mocked — the suite runs offline in ~2 seconds.
-- **Coverage**: `pytest --cov=src --cov-report=xml --cov-fail-under=85` — currently **~94%** (uploaded as a CI artifact every run; the CI fails if coverage drops below 85%).
+- **Coverage**: `pytest --cov=src --cov-report=xml --cov-fail-under=85` — currently **~93%** (uploaded as a CI artifact every run; the CI fails if coverage drops below 85%).
 - **Docs drift guard**: `make docs-check` (и шаг CI после pytest) сверяет числа
   тестов/покрытия в этом README с реальным прогоном — расхождение роняет CI.
 - **Integration (end-to-end)**: `scripts/run_integration_test.sh` spins up a real [kind](https://kind.sigs.k8s.io/) cluster, creates a pod with a bad image tag, runs the agent under uvicorn, sends a real `POST /diagnose`, and asserts the RCA mentions *"image"*/*"pull"* (via `jq`). Idempotent: leftover clusters/pods are removed before each run; cleanup happens even on failure.
@@ -852,7 +909,7 @@ ai_agent_DevOps/
 │   ├── run_integration_test.sh  # kind-based end-to-end test
 │   └── kind/cluster.yaml        # kind cluster config
 ├── src/
-│   ├── main.py                  # FastAPI app: /health /ready /diagnose /metrics /webhook/alertmanager
+│   ├── main.py                  # FastAPI app: /health /ready /diagnose /metrics /webhook/alertmanager /webhook/slack-interactivity
 │   ├── api/models.py            # pydantic contracts: Alertmanager payload -> Incident
 │   ├── auth.py                  # OIDC auth & RBAC: JWT verification (JWKS), FastAPI dependencies
 │   ├── config.py                # pydantic-settings (.env driven)
@@ -871,7 +928,7 @@ ai_agent_DevOps/
 │       └── text_utils.py        # truncate_context (bounded, JSON-safe)
 ├── charts/ai-agent/             # production Helm chart (v0.1.0): deployment,
 │                                # service, SA/RBAC, configmap, secret, helpers
-└── tests/                       # 439 tests, fully mocked externals
+└── tests/                       # 465 tests, fully mocked externals
 ```
 
 ---
