@@ -21,6 +21,14 @@
                                  замаскированных чувствительных элементов
                                  (jwt/api_key/password/bearer/email/ip) перед
                                  отправкой данных в LLM.
+    llm_tokens_total             (Counter,   type)                — оценочное
+                                 число токенов LLM (type=input: промт+контекст,
+                                 type=output: ответ); грубая оценка 1 токен ≈
+                                 4 символа.
+    llm_cost_estimate_usd        (Counter)                        — оценочная
+                                 суммарная стоимость LLM-запросов в USD
+                                 (FinOps): tokens/1000 * цена за 1K токенов
+                                 (LLM_COST_PER_1K_{INPUT,OUTPUT}_TOKENS).
 """
 
 from __future__ import annotations
@@ -85,6 +93,20 @@ SCRUBBED_ITEMS_TOTAL = Counter(
     ["type"],
 )
 
+LLM_TOKENS_TOTAL = Counter(
+    "llm_tokens_total",
+    "Estimated total number of LLM tokens processed by the agent "
+    "(rough estimate: 1 token ~= 4 chars), by direction: "
+    "input (system prompt + context) / output (LLM response)",
+    ["type"],
+)
+
+LLM_COST_ESTIMATE_USD = Counter(
+    "llm_cost_estimate_usd",
+    "Estimated cumulative cost of LLM calls in USD (FinOps): "
+    "tokens/1000 * LLM_COST_PER_1K_{INPUT,OUTPUT}_TOKENS",
+)
+
 
 # ----------------------------------------------------------------------
 # Хелперы инкрементирования (не падают при любых входных данных)
@@ -137,3 +159,29 @@ def inc_scrubbed_items(item_type: str | None, amount: int = 1) -> None:
     if amount <= 0:
         return
     SCRUBBED_ITEMS_TOTAL.labels(type=_label(item_type)).inc(amount)
+
+
+def inc_llm_tokens(token_type: str | None, amount: int) -> None:
+    """Увеличить счётчик токенов LLM по направлению (input/output).
+
+    Args:
+        token_type: направление токенов — ``input`` (системный промт +
+            контекст) или ``output`` (ответ LLM); пустые значения
+            нормализуются к ``unknown``.
+        amount: оценочное число токенов (<= 0 игнорируется).
+    """
+    if amount <= 0:
+        return
+    LLM_TOKENS_TOTAL.labels(type=_label(token_type)).inc(amount)
+
+
+def inc_llm_cost_estimate(usd: float) -> None:
+    """Увеличить оценку суммарной стоимости LLM-запросов (FinOps).
+
+    Args:
+        usd: стоимость запроса в USD; неположительные значения игнорируются
+            (счётчик Prometheus не должен уменьшаться).
+    """
+    if usd <= 0:
+        return
+    LLM_COST_ESTIMATE_USD.inc(usd)

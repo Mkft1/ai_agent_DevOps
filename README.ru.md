@@ -15,7 +15,7 @@ AI-агент для диагностики инцидентов в Kubernetes. 
 [![Python 3.12](https://img.shields.io/badge/python-3.12-blue?logo=python&logoColor=white)](https://www.python.org/downloads/)
 [![Docker](https://img.shields.io/badge/docker-multistage%20image-2496ED?logo=docker&logoColor=white)](./Dockerfile)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](./LICENSE)
-[![Tests](https://img.shields.io/badge/tests-465%20passed-brightgreen?logo=pytest&logoColor=white)](#тесты)
+[![Tests](https://img.shields.io/badge/tests-480%20passed-brightgreen?logo=pytest&logoColor=white)](#тесты)
 [![Ruff](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/astral-sh/ruff/main/assets/badge/v2.json)](https://github.com/astral-sh/ruff)
 
 AI-агент для диагностики инцидентов в Kubernetes.
@@ -84,9 +84,11 @@ Alertmanager → /diagnose → IncidentOrchestrator → [K8sTools, PrometheusToo
   LLM-ключа даёт честный `503` с подсказкой (или stub-режим при `LLM_OFFLINE=true`) — не `500`.
 - **Наблюдаемость** — `X-Request-ID` в каждом ответе (эхо входящего или сгенерированный),
   структурированное JSON-логирование (`LOG_FORMAT=json`) с корреляцией по `request_id`,
-  append-only журнал аудита (`AUDIT_LOG_PATH`, JSON Lines) и **распределённый трейсинг
+  append-only журнал аудита (`AUDIT_LOG_PATH`, JSON Lines), **распределённый трейсинг
   OpenTelemetry**: авто-спаны на каждый HTTP-запрос плюс ручные спаны на каждый вызов
-  K8s/Prometheus/логов/RAG/LLM с экспортом по OTLP в Jaeger/Tempo.
+  K8s/Prometheus/логов/RAG/LLM с экспортом по OTLP в Jaeger/Tempo, и **метрики
+  стоимости LLM для FinOps** (`llm_tokens_total`, `llm_cost_estimate_usd` — бюджет
+  и анализ затрат при alert-штормах, см. «Мониторинг стоимости LLM»).
 - **Интеграция с Alertmanager** — `POST /webhook/alertmanager` принимает стандартный
   пейлоад (version/status/alerts), диагностирует каждый `firing`-алерт (namespace и pod
   из `labels`, текст из `annotations.summary`/`description`), пропускает `resolved`
@@ -120,7 +122,7 @@ Alertmanager → /diagnose → IncidentOrchestrator → [K8sTools, PrometheusToo
   `requires_approval=true`); при включённом OIDC — экран логина по JWT, пользователь
   и роли в сайдбаре, кнопка аппрува только для `sre-admin`/`devops-admin`;
   запускается отдельно от FastAPI, кластер не трогает.
-- **Тестирование** — 465 unit/интеграционных тестов (pytest + unittest.mock), покрытие ~93%
+- **Тестирование** — 480 unit/интеграционных тестов (pytest + unittest.mock), покрытие ~93%
   (гейт в CI `--cov-fail-under=85`): инструменты, оркестратор, LLM-клиент (мок HTTP),
   FastAPI-эндпоинты (TestClient), конфигурация и логирование, chaos-скрипт,
   OIDC-аутентификация (реальные RS256-JWT против фейкового JWKS-провайдера),
@@ -832,6 +834,8 @@ curl -s -X POST localhost:8000/diagnose -H 'Content-Type: application/json' \
 | `scrubbed_items_total`       | Counter   | type                  | замаскированные секреты/PII перед отправкой в LLM |
 | `approval_requests_total`    | Counter   | —                     | запросы аппрува опасных фиксов, отправленные в Slack |
 | `policy_approval_required_total` | Counter | —                   | вердикты guardrail «требуется аппрув» (опасный паттерн или kubectl/helm/oc) |
+| `llm_tokens_total`             | Counter   | type (input/output) | оценочное число токенов LLM (1 токен ≈ 4 символа)    |
+| `llm_cost_estimate_usd`        | Counter   | —                     | оценочная стоимость LLM-запросов, USD (FinOps)       |
 
 Пример запроса:
 
@@ -843,6 +847,73 @@ curl -X POST http://localhost:8000/diagnose \
 ```
 
 Swagger UI доступен на `/docs`. CORS открыт для всех origins (dev-режим).
+
+## Наблюдаемость
+
+Помимо трейсинга (выше) и стандартных HTTP-метрик `prometheus-fastapi-instrumentator`,
+агент экспортирует в `/metrics` кастомные бизнес-счётчики (`src/utils/metrics.py`,
+полная таблица — в подразделе [Метрики (`/metrics`)](#метрики-metrics)) и **метрики
+стоимости LLM для FinOps** — см. ниже.
+
+### Мониторинг стоимости LLM
+
+Бизнесу нужна предсказуемость затрат на LLM: при alert-шторме каждый инцидент
+запускает вызов модели, и стоимость растёт кратно. После **каждого успешного
+LLM-запроса** `IncidentOrchestrator._record_llm_cost` оценивает токены и
+инкрементирует два счётчика:
+
+| Метрика | Тип | Labels | Смысл |
+|---------|-----|--------|-------|
+| `llm_tokens_total` | Counter | `type` = `input` \| `output` | Оценочное число токенов: `input` = системный промт + контекст диагностики (`user_prompt`), `output` = ответ LLM (`llm_raw`). Грубая оценка: **1 токен ≈ 4 символа**. |
+| `llm_cost_estimate_usd` | Counter | — | Оценочная суммарная стоимость LLM-запросов, USD: `(input_tokens / 1000 × LLM_COST_PER_1K_INPUT_TOKENS) + (output_tokens / 1000 × LLM_COST_PER_1K_OUTPUT_TOKENS)`. |
+
+Цены по умолчанию — **Qwen-max** (`$0.01` за 1K input-токенов, `$0.03` за 1K
+output-токенов); настраиваются через env под любую модель (OpenAI/Claude/vLLM;
+для бесплатных локальных моделей выставьте `0`):
+
+```bash
+LLM_COST_PER_1K_INPUT_TOKENS=0.01
+LLM_COST_PER_1K_OUTPUT_TOKENS=0.03
+```
+
+> **Примечание:** `prometheus_client` экспонирует серии счётчиков с суффиксом
+> `_total`, поэтому в PromQL серия называется `llm_cost_estimate_usd_total`
+> (имя метрики при этом — `llm_cost_estimate_usd`).
+
+**Пример Prometheus-запроса для дашборда** — суточная стоимость (USD/день):
+
+```promql
+sum(rate(llm_cost_estimate_usd[1h])) * 3600 * 24
+```
+
+(с экспо-суффиксом: `sum(rate(llm_cost_estimate_usd_total[1h])) * 3600 * 24`)
+
+Другие полезные запросы:
+
+```promql
+sum by (type) (rate(llm_tokens_total[5m]))                                        # токены/с: input и output
+sum(increase(llm_cost_estimate_usd_total[30d]))                                   # расходы за 30 дней
+sum(rate(llm_cost_estimate_usd_total[1h])) / sum(rate(diagnose_requests_total[1h]))  # средняя стоимость диагностики
+```
+
+**Grafana-дашборд (текстовое описание — «LLM FinOps»)**:
+
+1. **Ряд «Расходы»** — три Stat-панели: *стоимость LLM за 24ч*
+   (`sum(increase(llm_cost_estimate_usd_total[24h]))`, unit `currencyUSD`, пороги
+   зелёный/жёлтый/красный от дневного бюджета), *прогноз за месяц* (значение за
+   24ч × 30), *средняя стоимость диагностики* (запрос-отношение выше).
+2. **Ряд «Динамика»** — Time series с суточным run-rate
+   `sum(rate(llm_cost_estimate_usd_total[1h])) * 3600 * 24` (легенда: `USD/день`) и
+   **alert-правилом** Grafana (например, `> $50/день`) в тот же Slack-канал, куда
+   приходят аппрувы, — alert-шторм сразу виден как всплеск стоимости.
+3. **Ряд «Токены»** — stacked Time series `sum by (type) (rate(llm_tokens_total[5m]))`:
+   рост отношения output/input означает, что модель стала многословнее (повод
+   подкрутить промт или лимиты контекста).
+
+Счётчики только растут; при сбое LLM (исключение, нет ответа) стоимость **не**
+начисляется. Те же значения логируются на каждый вызов на уровне INFO
+(`LLM cost estimate: input_tokens=..., output_tokens=..., cost_usd=...`) — быстрый
+аудит по логам без Prometheus.
 
 ## RAG по runbook'ам
 
@@ -936,7 +1007,7 @@ ruff check src tests scripts
 python -m pytest --cov=src --cov-report=xml tests/
 ```
 
-Текущий набор: **465 passed**, покрытие **~93%** (инструменты K8s/Prometheus/логов,
+Текущий набор: **480 passed**, покрытие **~93%** (инструменты K8s/Prometheus/логов,
 оркестратор, LLM-клиент с моками HTTP, FastAPI-эндпоинты через TestClient (включая
 webhook Alertmanager и журнал аудита), валидация конфигурации, JSON-логирование,
 трейсинг OpenTelemetry, chaos-скрипт, OIDC-аутентификация и RBAC,
