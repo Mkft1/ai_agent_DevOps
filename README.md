@@ -206,6 +206,90 @@ docker compose up --build
 
 ---
 
+## Local LLM Integration (On-Premise)
+
+Many enterprises forbid sending incident data to external APIs (Qwen/OpenAI).
+The agent speaks the OpenAI-compatible HTTP protocol
+(`POST {LLM_BASE_URL}/v1/chat/completions`), so any local LLM gateway works:
+point `LLM_BASE_URL` at it, set `LLM_MODEL` and put any non-empty key into
+`QWEN_API_KEY` — no code changes, data never leaves your perimeter.
+
+> **Note:** `LLMClient` appends `/v1/chat/completions` itself — specify
+> `LLM_BASE_URL` **without** the `/v1` suffix (the default DashScope value
+> `https://dashscope.aliyuncs.com/compatible-mode` follows the same rule).
+
+### vLLM (recommended for production)
+
+```bash
+# Run vLLM with the Qwen2.5-7B-Instruct model
+docker run --gpus all -p 8000:8000 vllm/vllm-openai:latest \
+  --model Qwen/Qwen2.5-7B-Instruct \
+  --max-model-len 4096 \
+  --api-key your-secret-key
+```
+
+```bash
+# .env for the agent
+LLM_BASE_URL=http://localhost:8000
+LLM_MODEL=Qwen/Qwen2.5-7B-Instruct
+QWEN_API_KEY=your-secret-key
+```
+
+PagedAttention + continuous batching give the best throughput under alert
+storms; `--max-model-len 4096` matches the agent's `MAX_CONTEXT_TOKENS=4000`.
+
+### Ollama (simple, for dev/test)
+
+```bash
+ollama run qwen2.5:7b-instruct
+```
+
+```bash
+# .env for the agent
+LLM_BASE_URL=http://localhost:11434
+LLM_MODEL=qwen2.5:7b-instruct
+QWEN_API_KEY=ollama
+```
+
+The OpenAI-compatible endpoint is built into Ollama; the key is not verified —
+any non-empty value works (`ollama`).
+
+### LocalAI (vLLM alternative)
+
+```bash
+docker run -p 8080:8080 localai/localai:latest qwen2.5:7b-instruct
+```
+
+```bash
+# .env for the agent
+LLM_BASE_URL=http://localhost:8080
+LLM_MODEL=qwen2.5:7b-instruct
+QWEN_API_KEY=localai
+```
+
+### Performance Considerations
+
+* **GPU**: 7B+ models need an NVIDIA GPU (A100/V100 class for stable latency);
+  CPU-only inference works but is an order of magnitude slower.
+* **Latency** per diagnosis request (7B-Instruct): vLLM ~2-5 s, Ollama ~5-15 s.
+* **Recommendation**: vLLM for production, Ollama for dev/test.
+* Local models are free — set `LLM_COST_PER_1K_INPUT_TOKENS=0` and
+  `LLM_COST_PER_1K_OUTPUT_TOKENS=0` so the FinOps counter
+  `llm_cost_estimate_usd` stops accruing cost (see
+  [LLM Cost Monitoring](#llm-cost-monitoring)).
+
+### Security Benefits
+
+* **Data stays inside the perimeter**: pod logs, K8s events and metrics are
+  never sent to external APIs.
+* **Compliance-friendly**: fully meets on-premise data-processing requirements
+  (no third-party processor); combine with `ENABLE_SCRUBBING=true` for
+  defense in depth.
+* **No external dependency**: provider quotas, keys and outages no longer
+  affect the agent; it works in air-gapped networks.
+
+---
+
 ## API
 
 | Method | Path | Description |

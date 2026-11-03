@@ -276,6 +276,88 @@ curl http://localhost:8000/health
 # {"status":"ok"}
 ```
 
+## Локальные LLM (On-Premise)
+
+Многие enterprise-компании запрещают отправку данных во внешние API
+(Qwen/OpenAI). Агент работает по OpenAI-совместимому протоколу
+(`POST {LLM_BASE_URL}/v1/chat/completions`), поэтому подходит любой локальный
+LLM-шлюз: укажите `LLM_BASE_URL`, задайте `LLM_MODEL` и любой непустой ключ в
+`QWEN_API_KEY` — изменения в коде не требуются, данные не покидают контур.
+
+> **Важно:** `LLMClient` сам добавляет `/v1/chat/completions` — указывайте
+> `LLM_BASE_URL` **без** суффикса `/v1` (значение по умолчанию
+> `https://dashscope.aliyuncs.com/compatible-mode` подчиняется тому же правилу).
+
+### vLLM (рекомендуется для production)
+
+```bash
+# Запуск vLLM с моделью Qwen2.5-7B-Instruct
+docker run --gpus all -p 8000:8000 vllm/vllm-openai:latest \
+  --model Qwen/Qwen2.5-7B-Instruct \
+  --max-model-len 4096 \
+  --api-key your-secret-key
+```
+
+```bash
+# .env для агента
+LLM_BASE_URL=http://localhost:8000
+LLM_MODEL=Qwen/Qwen2.5-7B-Instruct
+QWEN_API_KEY=your-secret-key
+```
+
+PagedAttention + continuous batching дают максимальную пропускную способность
+при alert-штормах; `--max-model-len 4096` согласуется с `MAX_CONTEXT_TOKENS=4000`.
+
+### Ollama (просто, для dev/test)
+
+```bash
+ollama run qwen2.5:7b-instruct
+```
+
+```bash
+# .env для агента
+LLM_BASE_URL=http://localhost:11434
+LLM_MODEL=qwen2.5:7b-instruct
+QWEN_API_KEY=ollama
+```
+
+OpenAI-совместимый эндпоинт встроен в Ollama; ключ не проверяется — подойдёт
+любое непустое значение (`ollama`).
+
+### LocalAI (альтернатива vLLM)
+
+```bash
+docker run -p 8080:8080 localai/localai:latest qwen2.5:7b-instruct
+```
+
+```bash
+# .env для агента
+LLM_BASE_URL=http://localhost:8080
+LLM_MODEL=qwen2.5:7b-instruct
+QWEN_API_KEY=localai
+```
+
+### Производительность
+
+* **GPU**: модели 7B+ требуют NVIDIA GPU (класса A100/V100 для стабильной
+  задержки); инференс на CPU работает, но на порядок медленнее.
+* **Задержка** на запрос диагностики (7B-Instruct): vLLM ~2-5 с, Ollama ~5-15 с.
+* **Рекомендация**: vLLM для production, Ollama для dev/test.
+* Локальные модели бесплатны — выставьте `LLM_COST_PER_1K_INPUT_TOKENS=0` и
+  `LLM_COST_PER_1K_OUTPUT_TOKENS=0`, чтобы FinOps-метрика
+  `llm_cost_estimate_usd` не начисляла стоимость (см.
+  [«Мониторинг стоимости LLM»](#мониторинг-стоимости-llm)).
+
+### Преимущества безопасности
+
+* **Данные не покидают контур компании**: логи подов, события и метрики K8s
+  не отправляются во внешние API.
+* **Соответствие compliance**: полностью удовлетворяет требованиям к обработке
+  данных внутри контура (без стороннего обработчика); комбинируйте с
+  `ENABLE_SCRUBBING=true` для защиты в глубину.
+* **Нет зависимости от внешних API**: квоты, ключи и аварии провайдера больше
+  не влияют на агента; работа в изолированных (air-gapped) сетях.
+
 ## Переменные окружения
 
 Все настройки читаются из `.env` (см. `.env.example`) через pydantic-settings. Ключи API храните только в `.env` — в репозиторий и в Docker-образ они не попадают.
